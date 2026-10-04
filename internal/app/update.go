@@ -108,10 +108,11 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 			return err
 		}
 		t := in.Target(true)
+		ops := newPkgOps(t, fam, d, lg)
 		steps = append(steps,
 			ui.Step{Label: "Refreshing " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
 				rootfs.InstallSelf(in.Rootfs) // the in-distro helper matches this binary
-				if err := t.Run(ctx, fam.Update, nil, func(l string) { r.Line(l) }); err != nil {
+				if err := ops.update(ctx, r); err != nil {
 					return pkgErr("Couldn't reach the package servers", err)
 				}
 				// Before the upgrade, also on installs made before it existed:
@@ -131,7 +132,7 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 				if n == 0 {
 					return ui.Skip("already up to date")
 				}
-				if err := pkgRun(ctx, t, fam, fam.Upgrade, n, r); err != nil {
+				if err := ops.run(ctx, fam.Upgrade, n, r); err != nil {
 					return pkgErr("Couldn't update "+d.Name, err)
 				}
 				t.Run(ctx, fam.Clean, nil, nil)

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -33,7 +34,8 @@ type installReport struct {
 	step       string // the running step; on failure, the one that failed
 	sent       bool
 	started    time.Time
-	err        error // the failure, for its telemetry class
+	err        error  // the failure, for its telemetry class
+	outcome    string // ok, but not a new install: already_installed
 }
 
 // amArgs is the am command line for status "ok" or "fail", or nil when
@@ -51,6 +53,9 @@ func (r *installReport) amArgs(status string) []string {
 	if r.modded {
 		a = append(a, "--ez", "modded", "true")
 	}
+	if r.outcome != "" && status == "ok" { // the app reads it only with ok
+		a = append(a, "--es", "outcome", r.outcome)
+	}
 	return append(a, "--es", "version", Version)
 }
 
@@ -67,8 +72,20 @@ func (r *installReport) send(status string) {
 	r.sent = true
 	props := map[string]any{"ok": status == "ok", "distro": r.distro, "de": r.de, "modded": r.modded,
 		"duration_ms": time.Since(r.started).Milliseconds()}
+	if r.outcome != "" {
+		props["outcome"] = r.outcome
+	}
 	if status != "ok" {
 		props["step"], props["error_class"] = r.step, telemetry.ErrorClass(r.err)
+		var ue *ui.UserError
+		if errors.As(r.err, &ue) {
+			if ue.Kind != "" {
+				props["error_kind"] = ue.Kind
+			}
+			if ue.Detail != "" {
+				props["error_detail"] = ue.Detail
+			}
+		}
 	}
 	telemetry.Send("install_result", props)
 	if id := os.Getenv("ANDRONIX_INSTALL_ID"); id != "" && !installIDRe.MatchString(id) {

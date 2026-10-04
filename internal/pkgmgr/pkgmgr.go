@@ -312,6 +312,86 @@ func RewriteSources(root, from, to string) error {
 	return nil
 }
 
+// RewriteBase points the sources from one base URL to another. Unlike
+// RewriteSources it matches whole bases: http://deb.debian.org/debian
+// leaves http://deb.debian.org/debian-security alone.
+func RewriteBase(root, from, to string) error {
+	if from == "" || from == to {
+		return nil
+	}
+	var files []string
+	for _, g := range []string{"etc/apt/sources.list", "etc/apt/sources.list.d/*.list", "etc/apt/sources.list.d/*.sources",
+		"etc/yum.repos.d/*.repo", "etc/pacman.d/mirrorlist", "etc/apk/repositories", "etc/xbps.d/*.conf", "usr/share/xbps.d/*.conf"} {
+		m, _ := filepath.Glob(filepath.Join(root, g))
+		files = append(files, m...)
+	}
+	found := false
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		out, n := replaceBase(string(b), from, to)
+		if n == 0 {
+			continue
+		}
+		found = true
+		if err := write(root, strings.TrimPrefix(f, root+"/"), out, 0o644); err != nil {
+			return err
+		}
+	}
+	if !found {
+		return fmt.Errorf("no source uses %s", from)
+	}
+	return nil
+}
+
+// SourcesUse reports whether any package source uses base.
+func SourcesUse(root, base string) bool {
+	for _, g := range []string{"etc/apt/sources.list", "etc/apt/sources.list.d/*.list", "etc/apt/sources.list.d/*.sources",
+		"etc/yum.repos.d/*.repo", "etc/pacman.d/mirrorlist", "etc/apk/repositories", "etc/xbps.d/*.conf", "usr/share/xbps.d/*.conf"} {
+		m, _ := filepath.Glob(filepath.Join(root, g))
+		for _, f := range m {
+			if b, err := os.ReadFile(f); err == nil {
+				if _, n := replaceBase(string(b), base, ""); n > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// replaceBase replaces from where it isn't followed by a letter, digit or
+// '-' (the start of a longer path segment).
+func replaceBase(s, from, to string) (string, int) {
+	var b strings.Builder
+	n := 0
+	for {
+		i := strings.Index(s, from)
+		if i < 0 {
+			b.WriteString(s)
+			return b.String(), n
+		}
+		end := i + len(from)
+		next := byte(' ')
+		if end < len(s) {
+			next = s[end]
+		}
+		b.WriteString(s[:i])
+		if strings.HasSuffix(from, "/") || !(next == '-' || next >= 'a' && next <= 'z' || next >= 'A' && next <= 'Z' || next >= '0' && next <= '9') {
+			b.WriteString(to)
+			n++
+		} else {
+			b.WriteString(from)
+		}
+		s = s[end:]
+	}
+}
+
+// WriteFile writes a config file into the rootfs.
+func WriteFile(root, rel, content string) error { return write(root, rel, content, 0o644) }
+
 // NoSnap pins snapd away (Ubuntu): snaps can't run under proot.
 func NoSnap(root string) error {
 	return write(root, "etc/apt/preferences.d/no-snap",

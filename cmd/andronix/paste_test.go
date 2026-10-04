@@ -23,6 +23,10 @@ func TestUnglue(t *testing.T) {
 		{"install --edition ubuntu-xfce --token k=K&e=1&h=abcexport ANDRONIX_INSTALL_ID=0123456789abcdef",
 			"install --edition ubuntu-xfce --token k=K&e=1&h=abc", true},
 		{"install --edition ubuntu-xfce --token k=K&e=1&h=abcexport", "install --edition ubuntu-xfce --token k=K&e=1&h=abcexport", false},
+		// a typo glued to export (seen in telemetry): the typo stays for the
+		// installer to forgive (xfc -> XFCE)
+		{"install debian --de xfcexport", "install debian --de xfc", true},
+		{"install debiaexport ANDRONIX_INSTALL_ID=0123456789abcdef", "install debia", true},
 		// no paste: untouched
 		{"install debian --de xfce --yes", "install debian --de xfce --yes", false},
 		{"install debian --de nosuchexport", "install debian --de nosuchexport", false},

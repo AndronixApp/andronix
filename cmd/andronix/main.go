@@ -35,6 +35,9 @@ type args struct {
 	rest  []string
 }
 
+// valueFlags are the flags that take the next argument as their value.
+var valueFlags = map[string]bool{"de": true, "desktop": true, "wm": true, "user": true, "token": true, "to": true, "profile": true, "manifest": true, "edition": true, "channel": true, "message": true, "open": true}
+
 func parse(in []string, withValue map[string]bool) args {
 	a := args{flags: map[string]string{}}
 	for i := 0; i < len(in); i++ {
@@ -184,7 +187,7 @@ func main() {
 	if len(all) > 0 && !strings.HasPrefix(all[0], "-") {
 		cmd, all = all[0], all[1:]
 	}
-	a := parse(all, map[string]bool{"de": true, "desktop": true, "wm": true, "user": true, "token": true, "to": true, "profile": true, "manifest": true, "edition": true, "channel": true, "message": true, "open": true})
+	a := parse(all, valueFlags)
 	if a.has("yes") {
 		ui.Yes = true
 	}

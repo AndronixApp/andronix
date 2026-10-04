@@ -2,6 +2,24 @@
 
 Changes to the `andronix` installer and the free distro images it installs. The app, the website and the docs have their own release notes. See https://docs.andronix.app for how to use the installer.
 
+## 2.0.3 (2026-10-05)
+
+### Installs that get through
+
+- **Package downloads retry and switch mirrors.** When the package servers can't be reached, the installer waits and tries again, then moves to another mirror: Ubuntu, Debian, Kali and Void each have verified fallbacks. A refresh where only some sources fail goes on with the ones that answered.
+- **Common package-manager problems are repaired, not reported.** An interrupted dpkg is finished, corrupt or stale package lists are fetched again, broken dependencies are fixed, and a phone with a wrong clock no longer fails apt's date checks.
+- **Clearer messages when it still fails.** The error now says what went wrong (the server didn't answer, the phone ran out of space, Android stopped the install) and what to do about it.
+
+### Commands you type
+
+- **Small typos are forgiven.** A distro or desktop name with a typo, or cut short, is used with a note: `andronix install debia --de xfc` installs Debian with XFCE. Commands that delete something (like `remove`) only suggest the name, they never act on a guess.
+- **`plasma` means KDE Plasma.** GNOME, Cinnamon and other desktops Andronix doesn't offer now say so, with the list of desktops you can choose.
+
+### Already installed
+
+- **Installing what's already there isn't an error any more.** If another edition of the same distro is installed (the free one, and you run a Modded command), the installer asks whether to keep it or replace it; from the app it explains both ways and ends normally. The Andronix app is told, so it can offer to reinstall.
+- **A reinstall never deletes your distro for nothing.** A Modded reinstall whose download link has expired stops before deleting anything.
+
 ## 2.0.2 (2026-10-04)
 
 ### Downloads

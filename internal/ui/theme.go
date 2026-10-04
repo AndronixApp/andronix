@@ -408,6 +408,10 @@ type UserError struct {
 	// Class names the kind of failure for telemetry (download,
 	// package_manager, ...); empty means a slug of Title.
 	Class string
+	// Kind and Detail say why, for telemetry: a short token (network_dns,
+	// hash_mismatch, ...) and the error line, cleaned of URLs, paths and
+	// addresses.
+	Kind, Detail string
 }
 
 func (e *UserError) Error() string {

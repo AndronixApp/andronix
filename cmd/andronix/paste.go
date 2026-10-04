@@ -73,10 +73,10 @@ func known(s string) bool {
 	if knownFlags[s] {
 		return true
 	}
-	if _, err := conf.ResolveDistro(s); err == nil {
+	if _, _, err := conf.ForgiveDistro(s); err == nil {
 		return true
 	}
-	if _, _, err := conf.ResolveDesktopCompat(s); err == nil {
+	if _, _, err := conf.ForgiveDesktop(s); err == nil {
 		return true
 	}
 	_, err := conf.ResolveEdition(s)
@@ -87,7 +87,7 @@ func known(s string) bool {
 func knownValue(flag, s string) bool {
 	switch flag {
 	case "--de", "--desktop", "--wm":
-		_, _, err := conf.ResolveDesktopCompat(s)
+		_, _, err := conf.ForgiveDesktop(s) // "xfcexport": xfc, then xfce
 		return err == nil
 	case "--edition":
 		_, err := conf.ResolveEdition(s)

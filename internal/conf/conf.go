@@ -93,6 +93,18 @@ func (d *Distro) UpstreamTarball(arch string) string {
 // upstream tarball (kernel, firmware, network daemons).
 func (d *Distro) UpstreamRemove() []string { return d.raw.List("DISTRO_UPSTREAM_REMOVE") }
 
+// MirrorFallbacks is DISTRO_MIRROR_FALLBACK: groups split by ";", each the
+// base URL the image's sources use, then the mirrors to switch to, in order.
+func (d *Distro) MirrorFallbacks() [][]string {
+	var out [][]string
+	for _, g := range strings.Split(d.raw.Get("DISTRO_MIRROR_FALLBACK"), ";") {
+		if f := strings.Fields(g); len(f) >= 2 {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // MirrorFor is DISTRO_MIRROR_<arch>: the package mirror to use, if any.
 func (d *Distro) MirrorFor(arch string) string { return d.raw.Get("DISTRO_MIRROR_" + arch) }
 
@@ -313,6 +325,15 @@ func ResolveDesktop(name string) (*Desktop, error) {
 	}
 	v, err := read("desktops", want)
 	if err != nil {
+		for _, id := range DesktopIDs() {
+			if dv, derr := read("desktops", id); derr == nil {
+				for _, al := range dv.List("DE_ALIASES") {
+					if al == want {
+						return ResolveDesktop(id)
+					}
+				}
+			}
+		}
 		return nil, fmt.Errorf("unknown desktop %q", name)
 	}
 	return &Desktop{ID: v.Get("DE_ID"), Name: v.Get("DE_NAME"), Session: v.Get("DE_SESSION"),

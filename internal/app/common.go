@@ -275,6 +275,17 @@ func resolveDistro(name, cmd string) (*conf.Distro, error) {
 		}
 	}
 	if err != nil {
+		// A prefix or a typo ("debia"): used for commands that create or
+		// open, only suggested for the rest (never remove a guessed name).
+		if g, guess, gerr := conf.ForgiveDistro(name); gerr == nil && guess {
+			switch cmd {
+			case "install", "start", "desktop", "login", "run":
+				ui.Note("'" + name + "' isn't a distro name; using " + g.Label() + ".")
+				return g, nil
+			}
+			return nil, ui.Errorf("Unknown distro '"+name+"'", "Andronix doesn't have a distro called '"+name+"'.",
+				"Did you mean "+g.ID+"? andronix "+cmd+" "+g.ID)
+		}
 		return nil, ui.Errorf("Unknown distro '"+name+"'", "Andronix doesn't have a distro called '"+name+"' yet.",
 			"Run 'andronix list' to see the ones you can install.")
 	}

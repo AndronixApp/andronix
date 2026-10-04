@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -121,9 +122,10 @@ func install(ctx context.Context, o InstallOpts) error {
 	}
 	rep.distro = d.ID
 	// Old app keys (LXDE, the window managers) map to a desktop we offer;
-	// if that one isn't offered on this distro, XFCE is.
-	if de, notice, err := conf.ResolveDesktopCompat(o.Desktop); err == nil && notice != "" {
-		if !de.Supports(d) {
+	// if that one isn't offered on this distro, XFCE is. A prefix or a
+	// typo ("xfc") is forgiven, with a note.
+	if de, notice, err := conf.ForgiveDesktop(o.Desktop); err == nil && notice != "" {
+		if !de.Supports(d) && strings.Contains(notice, "any more") {
 			de, _ = conf.ResolveDesktop("xfce")
 			notice = o.Desktop + " isn't offered any more. Installing XFCE instead."
 		}
@@ -148,8 +150,12 @@ func install(ctx context.Context, o InstallOpts) error {
 	}
 	de, err := conf.ResolveDesktop(o.Desktop)
 	if err != nil {
-		return ui.Errorf("Unknown desktop '"+o.Desktop+"'", "Andronix can't install '"+o.Desktop+"'.",
-			"Available: "+strings.Join(conf.DesktopIDs(), ", "))
+		what := "Andronix can't install '" + o.Desktop + "'."
+		if _, _, ferr := conf.ForgiveDesktop(o.Desktop); ferr != nil && strings.Contains(ferr.Error(), "isn't offered") {
+			what = ferr.Error() + "."
+		}
+		return &ui.UserError{Title: "Unknown desktop '" + o.Desktop + "'", What: what, Class: "unknown_desktop",
+			Fix: "Choose one of: " + strings.Join(conf.DesktopIDs(), ", ") + ". XFCE is the lightest: --de xfce"}
 	}
 	rep.de = de.ID
 	fam, err := pkgmgr.Get(d.Family)
@@ -161,7 +167,8 @@ func install(ctx context.Context, o InstallOpts) error {
 		if on := de.SupportedOn(); len(on) > 0 {
 			fix = de.Name + " is available on " + strings.Join(on, ", ") + ". On " + d.Label() + ", try --de xfce."
 		}
-		return ui.Errorf(de.Name+" isn't available on "+d.Label(), d.Label()+" doesn't offer "+de.Name+" yet.", fix)
+		return &ui.UserError{Title: de.Name + " isn't available on " + d.Label(), What: d.Label() + " doesn't offer " + de.Name + " yet.",
+			Fix: fix, Class: "desktop_not_offered"}
 	}
 	arch := sys.DetectArch()
 	in := Open(d)
@@ -178,16 +185,36 @@ func install(ctx context.Context, o InstallOpts) error {
 	}
 	have := installedEdition(in)
 	if in.Installed() && !o.Reinstall && have != edition && (o.Modded || have != "") {
+		// Another edition is there (free Kali, and the app's Modded Kali
+		// command): not a failure. Ask what to do, or say both ways.
 		name := func(e string) string {
 			if e == "" {
 				return "the free edition"
 			}
 			return editionName(e) + " (" + e + ")"
 		}
-		return ui.Errorf(d.Label()+" is already installed", "It's "+name(have)+"; this command installs "+name(edition)+".",
-			"To replace it, add --reinstall (this deletes everything inside it; back it up first: andronix backup "+d.ID+").")
+		replace := false
+		if ui.Interactive && !ui.Yes {
+			v, err := ui.Choose(d.Label()+" is already installed: "+name(have)+".", "This command installs "+name(edition)+".",
+				[]ui.Option{{Label: "Keep it and open it (./" + d.MainStart() + ")", Value: "keep"},
+					{Label: "Replace it with " + name(edition) + " (deletes everything inside it)", Value: "replace"}}, "keep")
+			if err != nil {
+				return err
+			}
+			replace = v == "replace"
+		}
+		if !replace {
+			rep.outcome = "already_installed"
+			fmt.Print(ui.Box(ui.BoxOK, d.Label()+" is already installed",
+				ui.KV("Installed", name(have)), ui.KV("Start", "./"+d.MainStart()), "",
+				"To replace it with "+name(edition)+", run the same command with --reinstall. That deletes everything inside it; back it up first: andronix backup "+d.ID))
+			fmt.Println()
+			return nil
+		}
+		o.Reinstall = true
 	}
 	if in.Installed() && !o.Reinstall && (in.Get("DE") == de.ID || de.None()) {
+		rep.outcome = "already_installed"
 		WriteLaunchers(d)             // refresh in case andronix moved
 		rootfs.InstallSelf(in.Rootfs) // and keep the in-distro helper current
 		if cur, err := conf.ResolveDesktop(in.Get("DE")); err == nil && !cur.None() {
@@ -200,6 +227,13 @@ func install(ctx context.Context, o InstallOpts) error {
 		return nil
 	}
 	if o.Reinstall {
+		// A Modded reinstall from the app's Reinstall button can carry a
+		// token hours old: refuse an expired one before deleting anything.
+		if edition != "" && tokenExpired(o.Token, time.Now()) {
+			return &ui.UserError{Title: "Download link expired", Class: "token_refused",
+				What: "The download token in this command has expired, so nothing was deleted: " + d.Label() + " is as it was.",
+				Fix:  "Copy a fresh install command from the Andronix app and run it again."}
+		}
 		if _, err := os.Stat(in.Dir); err == nil {
 			fmt.Print(ui.Box(ui.BoxWarn, "Reinstall "+d.Label()+"?",
 				"This deletes everything inside "+d.Label()+", including your files in it. Files in /sdcard are safe."))
@@ -253,6 +287,7 @@ func install(ctx context.Context, o InstallOpts) error {
 	run := func(r ui.Reporter, cmd string) error {
 		return t.Run(ctx, cmd, nil, func(l string) { r.Line(l) })
 	}
+	ops := newPkgOps(t, fam, d, lg) // retries, mirror fallback, repairs
 
 	var steps []ui.Step
 	// proot comes from Termux's packages: install it here (with pkg's lock
@@ -496,7 +531,7 @@ func install(ctx context.Context, o InstallOpts) error {
 			return in.Set("STAGE", "configured")
 		}},
 		{Label: "Refreshing package lists", Run: func(ctx context.Context, r ui.Reporter) error {
-			if err := run(r, fam.Update); err != nil {
+			if err := ops.update(ctx, r); err != nil {
 				return pkgErr("Couldn't reach the package servers", err)
 			}
 			if err := cr.preScripts(ctx, t, r); err != nil {
@@ -513,7 +548,7 @@ func install(ctx context.Context, o InstallOpts) error {
 				return ui.Skip("already up to date")
 			}
 			r.Label(fmt.Sprintf("Updating %s", d.Label()))
-			if err := pkgRun(ctx, t, fam, fam.Upgrade, n, r); err != nil {
+			if err := ops.run(ctx, fam.Upgrade, n, r); err != nil {
 				return pkgErr("Couldn't update "+d.Name, err)
 			}
 			r.Detail(fmt.Sprintf("%d packages", n))
@@ -545,7 +580,7 @@ func install(ctx context.Context, o InstallOpts) error {
 				}
 			}
 			n := count(ctx, t, fam.SimInstall(pkgs), fam)
-			if err := pkgRun(ctx, t, fam, fam.Install(pkgs), n, r); err != nil {
+			if err := ops.run(ctx, fam.Install(pkgs), n, r); err != nil {
 				return pkgErr("Couldn't install "+strings.ToLower(installLabel(de)[len("Installing "):]), err)
 			}
 			if n > 0 {
@@ -570,7 +605,7 @@ func install(ctx context.Context, o InstallOpts) error {
 				return ui.Skip("couldn't reach Mozilla; install it later")
 			}
 			n := count(ctx, t, fam.SimInstall([]string{b}), fam)
-			if err := pkgRun(ctx, t, fam, fam.Install([]string{b}), n, r); err != nil {
+			if err := ops.run(ctx, fam.Install([]string{b}), n, r); err != nil {
 				lg.Printf("browser: %v", err)
 				return ui.Skip("failed; try later: install " + b)
 			}
@@ -797,6 +832,17 @@ func moddedSource(d *conf.Distro, de *conf.Desktop, arch sys.Arch, p Paths, toke
 		sumURL: base + url.PathEscape(file+".sha256") + "?" + q.Encode(), file: filepath.Join(p.Cache, file)}, nil
 }
 
+// tokenExpired reads a Modded token's expiry (e, unix seconds); a token
+// without a readable one isn't judged here (the server decides).
+func tokenExpired(token string, now time.Time) bool {
+	q, err := url.ParseQuery(strings.TrimPrefix(strings.TrimSpace(token), "?"))
+	if err != nil {
+		return false
+	}
+	e, err := strconv.ParseInt(q.Get("e"), 10, 64)
+	return err == nil && e > 0 && e < now.Add(time.Minute).Unix()
+}
+
 // moddedChecksum fetches a Modded download's sha256 (<file>.sha256, same
 // token). Missing (404: products-api not serving it yet) means unchecked,
 // logged; anything malformed is an error, never a silent pass.
@@ -943,8 +989,32 @@ func pkgErr(title string, err error) error {
 	if errors.Is(err, context.Canceled) {
 		return ui.ErrCancelled
 	}
-	return &ui.UserError{Title: title, What: "The package manager stopped with an error.", Class: "package_manager",
+	e := &ui.UserError{Title: title, What: "The package manager stopped with an error.", Class: "package_manager",
 		Fix: "Run the same command again; downloads resume. If Android closed Termux (signal 9), see docs.andronix.app on the phantom process killer.", Err: err}
+	var f *pkgFailure
+	if !errors.As(err, &f) {
+		return e
+	}
+	e.Kind, e.Detail = string(f.kind), f.detail
+	if f.detail != "" {
+		e.What = "The package manager stopped: " + f.detail
+	}
+	switch {
+	case f.kind == kindCancelled:
+		return ui.ErrCancelled
+	case f.kind == kindDiskFull:
+		e.Class = "not_enough_space"
+		e.Title, e.What = "Your phone ran out of space", "The package manager couldn't write any more files ("+f.detail+")."
+		e.Fix = "Free up some space (photos, videos, apps you don't use), then run the same command again. It goes on where it stopped."
+	case f.kind.network():
+		e.What = "The package servers didn't answer, on any mirror we tried (" + f.detail + ")."
+		e.Fix = "Check your internet (switch between Wi-Fi and mobile data, or turn a VPN off), then run the same command again. It goes on where it stopped."
+	case f.kind == kindClock || f.kind == kindGPG:
+		e.Fix = "Make sure the phone's date and time are set automatically (Settings, Date and time), then run the same command again."
+	case f.kind == kindKilled:
+		e.Fix = "Android stopped the install (signal 9). Keep Termux open in front while it runs, and see docs.andronix.app on the phantom process killer; then run the same command again."
+	}
+	return e
 }
 
 // count runs a simulate command and counts the packages it would touch.
