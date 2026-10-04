@@ -203,8 +203,8 @@ func TestBinaryVersion(t *testing.T) {
 // What Termux's am and Android's am print (a16, Sept 27).
 func TestAmDelivered(t *testing.T) {
 	for out, want := range map[string]bool{
-		"Broadcasting: Intent { act=x (has extras) }\nBroadcast sent without waiting for result": true,
-		"Broadcasting: Intent { act=x }\nBroadcast completed: result=0":                          true,
+		"Broadcasting: Intent { act=x (has extras) }\nBroadcast sent without waiting for result":                                         true,
+		"Broadcasting: Intent { act=x }\nBroadcast completed: result=0":                                                                  true,
 		"Broadcasting: Intent { act=x }\nException occurred while executing 'broadcast': java.lang.SecurityException: Permission Denial": false,
 		"": false,
 	} {

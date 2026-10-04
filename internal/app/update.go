@@ -165,6 +165,14 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 				phoneDefaults(in.Rootfs) // e.g. a Firefox installed or updated since
 				refreshWallpaper(ctx, in.Rootfs, de)
 			}
+			// Modded images run XFCE's panel plugins inside the panel (fewer
+			// processes). apt and pacman re-apply that after upgrades with a
+			// hook; dnf has none, so update does it too.
+			if hasAny(in.Rootfs, "usr/share/andronix/panel-inproc") {
+				if err := in.Target(true).Run(ctx, "sh /usr/share/andronix/panel-inproc", nil, nil); err != nil {
+					lg.Printf("panel-inproc: %v", err)
+				}
+			}
 			return nil
 		}})
 	}

@@ -2,7 +2,27 @@
 
 Changes to the `andronix` installer and the free distro images it installs. The app, the website and the docs have their own release notes. See https://docs.andronix.app for how to use the installer.
 
-## 2.0.1 (unreleased)
+## 2.0.2 (2026-10-04)
+
+### Downloads
+
+- **Downloads work on phones whose DNS setup confused the installer.** On some phones (seen on a moto g57 power with Android 16), Termux's `resolv.conf` lists `127.0.0.1` first, and nothing answers there. The installer kept asking that address and failed with "lookup … connection refused" at "Finding the best download". It now asks the real nameservers first (the phone's, then Termux's, then 8.8.8.8 and 1.1.1.1), tries loopback addresses last, and moves on when a server refuses or doesn't answer. This also covers an `/etc/resolv.conf` that is empty or lists only loopback addresses.
+
+### Install
+
+- **The app's command pasted twice now runs once.** Pasting the command a second time before pressing Enter glued the two copies together (`--de xfceexport ANDRONIX_INSTALL_ID=…`), and the install stopped with an unknown desktop. The installer now keeps the first command, drops the second copy, and says "It looks like the command was pasted twice; running it once."
+- **The Andronix app hears about the install result more reliably:** the installer also tries the `am` found on `PATH`.
+
+### Reporting a problem
+
+- **`andronix report`** sends a problem report to Andronix support. It records the last failed command (which step, the error and the log). Before sending, it shows exactly what it will send, with purchase tokens, signed links, email addresses and user names removed, and asks for one line about what went wrong. It then opens the report in the Andronix app, or prints a link and an ID when the app isn't there. `andronix report --help` lists what's sent; `--dry-run` only shows it.
+
+### Smaller fixes
+
+- Text wraps cleanly on narrow phone screens: boxes and lists wrap under their own indent, and only at spaces, so commands like `./start-debian.sh` are never split.
+- `andronix update` re-runs a Modded XFCE image's panel setup after updating packages, so its panel plugins keep working.
+
+## 2.0.1 (2026-09-27)
 
 ### Works on more phones
 

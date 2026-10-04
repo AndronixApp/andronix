@@ -99,12 +99,32 @@ func splitStart(in []string) (name string, root, x11 bool, rest []string) {
 	return name, root, x11, in[i:]
 }
 
+// reportHelp is 'andronix report --help'. --yes is for scripts and tests:
+// it isn't shown in hints.
+func reportHelp() {
+	fmt.Print(ui.Banner("Report a problem " + ui.GSep + " " + app.VersionLabel()))
+	fmt.Println("  " + ui.Bold("Usage"))
+	ui.Cmd("andronix report")
+	fmt.Println()
+	fmt.Println("  Sends the Andronix team what went wrong: the last failed command and its")
+	fmt.Println("  step, this phone's facts and the end of its log. Tokens, download links,")
+	fmt.Println("  email addresses, user names and your home folder are removed first, and")
+	fmt.Println("  you see everything before anything is sent. It then opens the Andronix")
+	fmt.Println("  app, where you add details or photos. It works inside a distro too.")
+	ui.Section("Options")
+	ui.Row("--message TEXT", "one line about what happened", 16)
+	ui.Row("--dry-run", "only print what would be sent", 16)
+	ui.Row("--open AX-ID", "open a waiting report in the app", 16)
+	ui.Row("--yes", "for scripts: send without asking (still prints it)", 16)
+	ui.Footer()
+}
+
 func help() {
 	fmt.Print(ui.Banner("Linux on Android " + ui.GSep + " " + app.VersionLabel()))
 	fmt.Println("  " + ui.Bold("Usage"))
 	for _, c := range []string{"andronix install debian --de xfce", "andronix start debian", "andronix desktop debian", "andronix update",
 		"andronix remove debian", "andronix list", "andronix backup debian --to storage", "andronix restore",
-		"andronix tune debian --profile light", "andronix pack add debian python", "andronix clean"} {
+		"andronix tune debian --profile light", "andronix pack add debian python", "andronix clean", "andronix report"} {
 		ui.Cmd(c)
 	}
 	ui.Section("Install options")
@@ -159,11 +179,12 @@ func main() {
 	if legacy, ok := legacyModded(all); ok {
 		all = legacy
 	}
+	all, pastedTwice := unglue(all)
 	cmd := "help"
 	if len(all) > 0 && !strings.HasPrefix(all[0], "-") {
 		cmd, all = all[0], all[1:]
 	}
-	a := parse(all, map[string]bool{"de": true, "desktop": true, "wm": true, "user": true, "token": true, "to": true, "profile": true, "manifest": true, "edition": true, "channel": true})
+	a := parse(all, map[string]bool{"de": true, "desktop": true, "wm": true, "user": true, "token": true, "to": true, "profile": true, "manifest": true, "edition": true, "channel": true, "message": true, "open": true})
 	if a.has("yes") {
 		ui.Yes = true
 	}
@@ -174,11 +195,18 @@ func main() {
 		os.Setenv("NO_COLOR", "1")
 	}
 	ui.Init(a.has("plain"))
+	if pastedTwice {
+		ui.Note("It looks like the command was pasted twice; running it once.")
+	}
 	if a.has("version") || a.has("v") {
 		cmd = "version"
 	}
 	if a.has("help") || a.has("h") {
-		cmd = "help"
+		if cmd == "report" {
+			cmd = "report-help"
+		} else {
+			cmd = "help"
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -219,6 +247,8 @@ func main() {
 			Manifest: a.flags["manifest"], Token: a.flags["token"], Channel: a.flags["channel"]})
 	case "list", "ls":
 		err = app.List()
+	case "report":
+		err = app.Report(ctx, a.has("dry-run"), a.flags["message"], a.flags["open"])
 	case "clean":
 		err = app.Clean()
 	case "backup":
@@ -273,6 +303,8 @@ func main() {
 		fmt.Printf("andronix %s (go, %s/%s)\n", app.Version, runtime.GOOS, runtime.GOARCH)
 	case "help":
 		help()
+	case "report-help":
+		reportHelp()
 	default:
 		err = ui.Errorf("Unknown command '"+cmd+"'", "andronix doesn't have a '"+cmd+"' command.", "Run 'andronix help' to see what it can do.")
 	}
@@ -285,6 +317,7 @@ func main() {
 			ui.Note("Stopped. Run the same command again to pick up where you left off.")
 			os.Exit(130)
 		}
+		app.SaveFailure(cmd, a.arg(0), err)
 		ui.ShowError(err)
 		os.Exit(1)
 	}

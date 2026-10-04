@@ -985,11 +985,12 @@ func finish(in *Inst, de *conf.Desktop, user string, noStart bool, rep *installR
 	lines := []string{}
 	// The desktop is Termux:X11 (owner decision); VNC is the other way.
 	if !de.None() {
-		lines = append(lines, ui.KV("Desktop", "andronix desktop "+d.ID), "  in Termux; it opens in the Termux:X11 app",
-			"  (github.com/termux/termux-x11, nightly: termux-x11-universal-debug.apk)", "")
+		lines = append(lines, ui.KV("Desktop", "andronix desktop "+d.ID),
+			ui.KV("", "in Termux; it opens in the Termux:X11 app (github.com/termux/termux-x11, nightly: termux-x11-universal-debug.apk)"), "")
 	}
 	if start {
-		lines = append(lines, "You're going into "+d.Name+"'s terminal now (type exit to leave).", "Next time, from Termux: ./"+d.MainStart(), "")
+		lines = append(lines, ui.KV("Terminal", "you're going into "+d.Name+"'s terminal now (type exit to leave)"),
+			ui.KV("", "next time, from Termux: ./"+d.MainStart()), "")
 	} else {
 		lines = append(lines, ui.KV("Terminal", "./"+d.MainStart()))
 	}

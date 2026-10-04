@@ -78,9 +78,13 @@ func (r *installReport) send(status string) {
 	if args == nil {
 		return
 	}
+	// Termux's am ($PREFIX/bin, else the first on PATH), then Android's.
 	var tried []string
 	if sys.Prefix() != "" {
 		tried = append(tried, filepath.Join(sys.Prefix(), "bin/am"))
+	}
+	if p, err := sys.LookPath("am"); err == nil && p != "/system/bin/am" && (len(tried) == 0 || p != tried[0]) {
+		tried = append(tried, p)
 	}
 	tried = append(tried, "/system/bin/am")
 	for _, am := range tried {

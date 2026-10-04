@@ -48,10 +48,24 @@ type Logger interface {
 	Printf(format string, args ...any)
 }
 
+// FailedStep is the label of the last step that failed (for andronix
+// report), "" if none has.
+var FailedStep string
+
 // RunSteps runs steps in order and stops at the first failure.
 func RunSteps(ctx context.Context, steps []Step, log Logger) error {
 	if log == nil {
 		log = nopLog{}
+	}
+	for i := range steps {
+		label, run := steps[i].Label, steps[i].Run
+		steps[i].Run = func(ctx context.Context, r Reporter) error {
+			err := run(ctx, r)
+			if _, skip := err.(skipErr); err != nil && !skip {
+				FailedStep = label
+			}
+			return err
+		}
 	}
 	if Plain {
 		return runPlain(ctx, steps, log)

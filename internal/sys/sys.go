@@ -6,10 +6,12 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -105,40 +107,16 @@ func Home() string {
 	return "/data/data/com.termux/files/home"
 }
 
-// FixDNS makes Go's resolver work on Android. A static GOOS=linux build
-// reads /etc/resolv.conf, which Android doesn't have, and would then ask
-// 127.0.0.1:53. Use Termux's resolv.conf, else public resolvers.
+// FixDNS makes Go's resolver work on Android. A static or cgo-less build
+// reads /etc/resolv.conf, which Android usually doesn't have, or has with no
+// usable nameserver (a Motorola: empty or loopback-only), and then asks
+// 127.0.0.1:53 and [::1]:53, which nothing answers. So Go's resolver always
+// gets this list: /etc/resolv.conf's real nameservers, then Termux's, then
+// 8.8.8.8 and 1.1.1.1, and loopback ones last. Each dial takes the next
+// server, so the resolver's own retries walk the list (a UDP dial never
+// fails by itself; a refused or silent server only shows on read).
 func FixDNS() {
-	if _, err := os.Stat("/etc/resolv.conf"); err == nil {
-		return
-	}
-	servers := []string{"8.8.8.8:53", "1.1.1.1:53"}
-	if b, err := os.ReadFile(filepath.Join(Prefix(), "etc/resolv.conf")); err == nil {
-		var found []string
-		for _, line := range strings.Split(string(b), "\n") {
-			f := strings.Fields(line)
-			if len(f) >= 2 && f[0] == "nameserver" {
-				found = append(found, net.JoinHostPort(f[1], "53"))
-			}
-		}
-		if len(found) > 0 {
-			servers = append(found, servers...)
-		}
-	}
-	net.DefaultResolver = &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			var err error
-			for _, s := range servers {
-				var c net.Conn
-				if c, err = d.DialContext(ctx, network, s); err == nil {
-					return c, nil
-				}
-			}
-			return nil, err
-		},
-	}
+	net.DefaultResolver = resolverFor(dnsServers(readFile("/etc/resolv.conf"), readFile(filepath.Join(Prefix(), "etc/resolv.conf"))))
 	// Termux ships a CA bundle too; Go already reads Android's
 	// /system/etc/security/cacerts, this is a fallback.
 	if os.Getenv("SSL_CERT_FILE") == "" {
@@ -147,6 +125,61 @@ func FixDNS() {
 		}
 	}
 }
+
+// resolverFor is Go's resolver over servers, one per dial, in turn.
+func resolverFor(servers []string) *net.Resolver {
+	var next atomic.Uint32
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			var err error
+			for range servers {
+				s := servers[int(next.Add(1)-1)%len(servers)]
+				var c net.Conn
+				if c, err = d.DialContext(ctx, network, s); err == nil {
+					return c, nil
+				}
+			}
+			return nil, err
+		},
+	}
+}
+
+// dnsServers orders the resolvers to try (host:53): the system's
+// non-loopback nameservers, Termux's, the public ones, then loopback ones.
+func dnsServers(system, termux string) []string {
+	var real, loop []string
+	seen := map[string]bool{}
+	add := func(ip string) {
+		a, err := netip.ParseAddr(ip) // keeps a zone: fe80::1%wlan0
+		if err != nil || a.IsUnspecified() {
+			return
+		}
+		hp := net.JoinHostPort(a.String(), "53")
+		if seen[hp] {
+			return
+		}
+		seen[hp] = true
+		if a.IsLoopback() {
+			loop = append(loop, hp)
+		} else {
+			real = append(real, hp)
+		}
+	}
+	for _, conf := range []string{system, termux} {
+		for _, line := range strings.Split(conf, "\n") {
+			if f := strings.Fields(line); len(f) >= 2 && f[0] == "nameserver" {
+				add(f[1])
+			}
+		}
+	}
+	add("8.8.8.8")
+	add("1.1.1.1")
+	return append(real, loop...)
+}
+
+func readFile(p string) string { b, _ := os.ReadFile(p); return string(b) }
 
 // Timezone from Android, for the distro's /etc/localtime.
 func Timezone() string {

@@ -228,8 +228,17 @@ func Box(kind int, title string, lines ...string) string {
 	}
 	width := W() - 2 // two-space indent
 	inner := width - 4
+	// Each line wraps on its own, continuing under its own indent (KV rows
+	// come already wrapped under their value column).
+	var wrapped []string
+	for _, l := range lines {
+		for _, part := range strings.Split(l, "\n") {
+			n := len(part) - len(strings.TrimLeft(part, " "))
+			wrapped = append(wrapped, hangWrap(part, inner, n)...)
+		}
+	}
 	body := lipgloss.NewStyle().Border(border, false, true, true, true).BorderForeground(col).
-		Padding(0, 1).Width(width - 2).Render(lipgloss.NewStyle().Width(inner).Render(strings.Join(lines, "\n")))
+		Padding(0, 1).Width(width - 2).Render(lipgloss.NewStyle().Width(inner).Render(strings.Join(wrapped, "\n")))
 	t := Trunc(title, width-6)
 	fill := width - lipgloss.Width(t) - 5
 	if fill < 1 {
@@ -241,9 +250,68 @@ func Box(kind int, title string, lines ...string) string {
 	return indent(top+"\n"+body, "  ") + "\n"
 }
 
-// KV is a key/value row for boxes and lists.
+// kvKey is the key column of KV rows (9 wide, then a space).
+const kvKey = 10
+
+// KV is a key/value row for boxes and lists. A long value wraps under the
+// value column (to a box's inner width); an empty key continues the row
+// above.
 func KV(k, v string) string {
-	return sMuted.Render(fmt.Sprintf("%-9s", k)) + " " + v
+	key := sMuted.Render(fmt.Sprintf("%-9s", k)) + " "
+	if Plain {
+		return key + v
+	}
+	lines := hangWrap(strings.Repeat(" ", kvKey)+v, W()-6, kvKey)
+	lines[0] = key + strings.TrimLeft(lines[0], " ")
+	return strings.Join(lines, "\n")
+}
+
+// hangWrap wraps s to width visible columns at spaces only (never inside
+// a word such as ./start-debian.sh, unless the word alone is too long);
+// continuation lines start with hang spaces.
+func hangWrap(s string, width, hang int) []string {
+	if lipgloss.Width(s) <= width || width <= hang+4 {
+		return []string{s}
+	}
+	lead := s[:len(s)-len(strings.TrimLeft(s, " "))]
+	words := strings.Fields(s)
+	var out []string
+	cur, curW := lead, lipgloss.Width(lead)
+	pad := strings.Repeat(" ", hang)
+	empty := true
+	for _, w := range words {
+		ww := lipgloss.Width(w)
+		switch {
+		case empty:
+			cur, curW, empty = cur+w, curW+ww, false
+		case curW+1+ww <= width:
+			cur, curW = cur+" "+w, curW+1+ww
+		case hang+ww > width && ww <= width:
+			// Too long for the hang but fits the line: its own line,
+			// unindented, rather than cut in the middle.
+			out = append(out, cur, w)
+			cur, curW, empty = pad, hang, true
+			continue
+		default:
+			out = append(out, cur)
+			cur, curW = pad+w, hang+ww
+		}
+		// A single word wider than the line: cut it.
+		for curW > width {
+			r := []rune(cur)
+			cut := width
+			if cut > len(r) {
+				cut = len(r)
+			}
+			out = append(out, string(r[:cut]))
+			cur = pad + string(r[cut:])
+			curW = lipgloss.Width(cur)
+		}
+	}
+	if !empty {
+		out = append(out, cur)
+	}
+	return out
 }
 
 func indent(s, pre string) string {
@@ -259,8 +327,11 @@ func msg(glyph string, st lipgloss.Style, text string) {
 		fmt.Println(glyph + " " + text)
 		return
 	}
-	wrapped := lipgloss.NewStyle().Width(W() - 4).Render(text)
-	for i, l := range strings.Split(wrapped, "\n") {
+	var wrapped []string
+	for _, p := range strings.Split(text, "\n") {
+		wrapped = append(wrapped, hangWrap(p, W()-4, 0)...)
+	}
+	for i, l := range wrapped {
 		if i == 0 {
 			fmt.Println("  " + st.Render(glyph) + " " + l)
 		} else {
@@ -281,7 +352,13 @@ func Note(t string) {
 		fmt.Println("  " + t)
 		return
 	}
-	fmt.Println(indent(sMuted.Width(W()-4).Render(t), "    "))
+	var wrapped []string
+	for _, p := range strings.Split(t, "\n") {
+		wrapped = append(wrapped, hangWrap(p, W()-4, 0)...)
+	}
+	for _, l := range wrapped {
+		fmt.Println("    " + sMuted.Render(l))
+	}
 }
 
 // Cmd shows a command to type.
@@ -298,7 +375,15 @@ func Section(t string) { fmt.Println("\n  " + sBold.Render(t)) }
 
 // Row prints an aligned key/value row.
 func Row(k, v string, kw int) {
-	fmt.Println("  " + sMuted.Render(fmt.Sprintf("%-*s", kw, k)) + " " + v)
+	if Plain {
+		fmt.Println("  " + fmt.Sprintf("%-*s", kw, k) + " " + v)
+		return
+	}
+	lines := hangWrap(strings.Repeat(" ", kw+1)+v, W()-2, kw+1)
+	lines[0] = sMuted.Render(fmt.Sprintf("%-*s", kw, k)) + " " + strings.TrimLeft(lines[0], " ")
+	for _, l := range lines {
+		fmt.Println("  " + l)
+	}
 }
 
 // Footer is the help block every screen ends with.
@@ -339,6 +424,9 @@ func Errorf(title, what, fix string) *UserError {
 	return &UserError{Title: title, What: what, Fix: fix}
 }
 
+// ReportHint is the error box's last line.
+const ReportHint = "run andronix report (it shows everything it sends first)"
+
 // ShowError prints a friendly error box and the help footer.
 func ShowError(err error) {
 	ue, ok := err.(*UserError)
@@ -354,6 +442,7 @@ func ShowError(err error) {
 		if ue.Log != "" {
 			fmt.Printf("log: %s\n", ue.Log)
 		}
+		fmt.Println("report: " + ReportHint)
 		Footer()
 		return
 	}
@@ -364,6 +453,7 @@ func ShowError(err error) {
 	if ue.Log != "" {
 		lines = append(lines, "", sMuted.Render("Log: ")+Tilde(ue.Log))
 	}
+	lines = append(lines, "", sMuted.Render("Still stuck? ")+ReportHint)
 	fmt.Println()
 	fmt.Print(Box(BoxError, GFail+" "+ue.Title, lines...))
 	Footer()
