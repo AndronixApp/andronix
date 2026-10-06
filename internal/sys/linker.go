@@ -37,7 +37,12 @@ func fixLinkerArgs(exe, self string, args []string) []string {
 		return args
 	}
 	linkerPath = exe
-	if len(args) > 1 && (args[1] == self || self == "" && isELF(args[1])) {
+	// Our path is args[1]. It matches TERMUX_EXEC__PROC_SELF_EXE only when
+	// both name the file the same way: run from another place or name
+	// (./rc4/andronix) they differed, and the path was taken as the
+	// command ("Unknown command '/data/.../rc4/andronix'"). An ELF file
+	// there is always the program: no command is a binary's path.
+	if len(args) > 1 && (args[1] == self || isELF(args[1])) {
 		selfPath, _ = filepath.Abs(args[1])
 		return append([]string{args[0]}, args[2:]...)
 	}

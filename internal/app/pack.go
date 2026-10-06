@@ -42,6 +42,16 @@ type packPlace struct {
 
 // splitPackArgs takes an optional distro off the front of args.
 func splitPackArgs(args []string) (distro string, packs []string) {
+	// Inside a distro, a distro name in front (support #80: andronix pack
+	// debian) isn't needed: packs go into this distro.
+	if len(args) > 0 && inGuest() {
+		if _, err := conf.LoadPack(args[0]); err != nil {
+			if _, err := conf.LoadDistro(args[0]); err == nil {
+				ui.Note("You're inside a distro: packs go into it, so '" + args[0] + "' isn't needed here.")
+				return "", args[1:]
+			}
+		}
+	}
 	if len(args) > 0 && !inGuest() {
 		if _, err := conf.LoadPack(args[0]); err != nil {
 			return args[0], args[1:]

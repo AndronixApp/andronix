@@ -95,11 +95,7 @@ func (in *Inst) Set(k, v string) error {
 	for _, key := range order {
 		fmt.Fprintf(&b, "%s=%s\n", key, vals[key])
 	}
-	tmp := in.State + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, in.State)
+	return sys.WriteFileAtomic(in.State, []byte(b.String()), 0o644)
 }
 
 // Installed reports a finished install.

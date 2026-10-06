@@ -164,7 +164,14 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 			if de, err := conf.ResolveDesktop(in.Get("DE")); err == nil && !de.None() {
 				writeXstartup(in.Rootfs, de)
 				phoneDefaults(in.Rootfs) // e.g. a Firefox installed or updated since
+				// An xfwm4 upgrade may bring other defaults (xfwm4defaults.go).
+				lg.Printf("xfwm4 defaults: %s", writeXfwm4Defaults(in.Rootfs))
 				refreshWallpaper(ctx, in.Rootfs, de)
+				// Rebuilt from the current defaults (writeINI): light layers
+				// from before 2.0.6 hid LXQt's wallpaper settings.
+				if Profile(in.Rootfs) == "light" {
+					ApplyProfile(in.Rootfs, de, "light")
+				}
 			}
 			// Modded images run XFCE's panel plugins inside the panel (fewer
 			// processes). apt and pacman re-apply that after upgrades with a

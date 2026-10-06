@@ -33,7 +33,15 @@ func Profile(root string) string {
 	if p := strings.TrimSpace(string(b)); p == "light" {
 		return p
 	}
-	return "balanced"
+	return "balanced" // also an empty or garbled file
+}
+
+// profileSet reports whether the install has a valid profile on record
+// (an empty or garbled file, left by a kill mid-write, counts as unset).
+func profileSet(root string) bool {
+	b, err := os.ReadFile(filepath.Join(root, profileFile))
+	p := strings.TrimSpace(string(b))
+	return err == nil && (p == "light" || p == "balanced")
 }
 
 // ApplyProfile writes (or removes) the light layer for a desktop.
@@ -53,7 +61,7 @@ func ApplyProfile(root string, de *conf.Desktop, profile string) error {
 			return err
 		}
 	}
-	if err := writeINI(base, de.LightXDGConfig); err != nil {
+	if err := writeINI(root, base, de.LightXDGConfig); err != nil {
 		return err
 	}
 	return writeXfconf(root, base, de.LightXfconf)
@@ -61,12 +69,16 @@ func ApplyProfile(root string, de *conf.Desktop, profile string) error {
 
 func writeFile(p, s string) error {
 	os.MkdirAll(filepath.Dir(p), 0o755)
-	os.Remove(p)
-	return os.WriteFile(p, []byte(s), 0o644)
+	return sys.WriteFileAtomic(p, []byte(s), 0o644)
 }
 
-// writeINI sets "<file>:<group>:<key>=<value>" entries in base/<file>.
-func writeINI(base string, entries []string) error {
+// writeINI sets "<file>:<group>:<key>=<value>" entries in base/<file>,
+// starting from the distro's /etc/xdg/<file> as writeXfconf does: some
+// programs read only the first one found in XDG_CONFIG_DIRS (pcmanfm-qt
+// takes the whole first pcmanfm-qt/<profile> dir), so a layer with just
+// the changed keys would hide the rest (LXQt's wallpaper and colour, so a
+// black desktop).
+func writeINI(root, base string, entries []string) error {
 	byFile := map[string][][3]string{}
 	var order []string
 	for _, e := range entries {
@@ -82,7 +94,7 @@ func writeINI(base string, entries []string) error {
 	}
 	for _, f := range order {
 		p := filepath.Join(base, f)
-		b, _ := os.ReadFile(p)
+		b, _ := os.ReadFile(filepath.Join(root, "etc/xdg", f))
 		s := string(b)
 		for _, kv := range byFile[f] {
 			s = iniSet(s, kv[0], kv[1], kv[2])

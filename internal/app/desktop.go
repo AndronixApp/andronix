@@ -47,7 +47,7 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-$(id -u)}"
 mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 # Performance profile (andronix tune): the light layer goes first.
 if [ "$(cat /etc/andronix/profile 2>/dev/null)" = light ] && [ -d /etc/xdg/andronix-light ]; then
-    export XDG_CONFIG_DIRS="/etc/xdg/andronix-light:${XDG_CONFIG_DIRS:-/etc/xdg}"
+    export XDG_CONFIG_DIRS="/etc/xdg/andronix-light:${XDG_CONFIG_DIRS:-@XDGDIRS@}"
 fi
 [ -r "$HOME/.Xresources" ] && xrdb "$HOME/.Xresources"
 # Keyboard layout chosen at first boot (andronix setup-user).
@@ -69,7 +69,7 @@ exec dbus-launch --exit-with-session sh -c '/usr/local/bin/andronix session-prep
 // /etc/skel, for users made later) and the default wallpaper.
 func setupDesktop(ctx context.Context, in *Inst, de *conf.Desktop, t *proot.Target, r ui.Reporter) error {
 	root := in.Rootfs
-	xs := strings.NewReplacer("@SESSION@", de.Session, "@NAME@", de.Name).Replace(xstartup)
+	xs := strings.NewReplacer("@SESSION@", de.Session, "@NAME@", de.Name, "@XDGDIRS@", xdgConfigDirs(de)).Replace(xstartup)
 	// TigerVNC 1.14+ keeps its files in ~/.config/tigervnc; ~/.vnc (what
 	// the docs use) is a symlink to it, which also stops TigerVNC's own
 	// migration (it fails under proot).
@@ -155,9 +155,13 @@ func setupDesktop(ctx context.Context, in *Inst, de *conf.Desktop, t *proot.Targ
 	if err := writeXDGConfig(root, de.XDGConfig); err != nil {
 		return err
 	}
+	// Every host (Termux too): a new home's first desktop start doesn't
+	// write xfwm4's defaults one by one (xfwm4defaults.go). Before the
+	// profile, so the light layer's xfwm4 channel starts from them.
+	r.Line("xfwm4 defaults: " + writeXfwm4Defaults(root))
 	// Performance profile: light by default on phones under 3 GB of RAM.
 	profile := Profile(root)
-	if _, err := os.Stat(filepath.Join(root, profileFile)); err != nil {
+	if !profileSet(root) {
 		if ram := sys.TotalRAMMB(); ram > 0 && ram < AutoLightBelow {
 			profile = "light"
 			r.Detail(fmt.Sprintf("light profile (%d MB RAM)", ram))
@@ -181,10 +185,19 @@ func setupDesktop(ctx context.Context, in *Inst, de *conf.Desktop, t *proot.Targ
 	return t.Run(ctx, "command -v Xvnc >/dev/null && command -v vncpasswd >/dev/null", nil, func(l string) { r.Line(l) })
 }
 
+// xdgConfigDirs is what XDG_CONFIG_DIRS would be for the desktop's
+// session if we didn't set it: our layers go in front of that.
+func xdgConfigDirs(de *conf.Desktop) string {
+	if de.XDGConfigDirs != "" {
+		return de.XDGConfigDirs
+	}
+	return "/etc/xdg"
+}
+
 // writeXstartup (re)writes the session script for root, /etc/skel and
 // every existing user, so fixes reach old installs too.
 func writeXstartup(root string, de *conf.Desktop) {
-	xs := strings.NewReplacer("@SESSION@", de.Session, "@NAME@", de.Name).Replace(xstartup)
+	xs := strings.NewReplacer("@SESSION@", de.Session, "@NAME@", de.Name, "@XDGDIRS@", xdgConfigDirs(de)).Replace(xstartup)
 	homes, _ := filepath.Glob(filepath.Join(root, "home/*"))
 	homes = append(homes, filepath.Join(root, "root"), filepath.Join(root, "etc/skel"))
 	for _, h := range homes {
@@ -200,7 +213,7 @@ func writeXstartup(root string, de *conf.Desktop) {
 // writeXDGConfig sets "<file>:<group>:<key>=<value>" entries in
 // /etc/xdg/<file>, keeping whatever else the file holds.
 func writeXDGConfig(root string, entries []string) error {
-	return writeINI(filepath.Join(root, "etc/xdg"), entries)
+	return writeINI(root, filepath.Join(root, "etc/xdg"), entries)
 }
 
 // iniSet sets key=value in [group] of an INI text.
@@ -342,13 +355,40 @@ func refreshWallpaper(ctx context.Context, root string, de *conf.Desktop) {
 		for _, h := range append(homes, filepath.Join(root, "root")) {
 			p := filepath.Join(h, ".config/pcmanfm-qt/lxqt/settings.conf")
 			b, err := os.ReadFile(p)
-			if err != nil || !strings.Contains(string(b), "Wallpaper="+WallpaperPath+"\n") || !strings.Contains(string(b), "WallpaperMode=zoom") {
+			if err != nil {
 				continue
 			}
-			s := iniSet(string(b), "Desktop", "WallpaperMode", "fit")
+			s := string(b)
+			switch {
+			case strings.Contains(s, "Wallpaper="+WallpaperPath+"\n") && strings.Contains(s, "WallpaperMode=zoom"):
+			case iniGet(s, "Desktop", "Wallpaper") == "" && strings.TrimPrefix(iniGet(s, "Desktop", "BgColor"), "#") == "000000",
+				iniGet(s, "Desktop", "Wallpaper") == "" && iniGet(s, "Desktop", "BgColor") == "":
+				// Saved by pcmanfm-qt while the light layer hid the
+				// defaults (before 2.0.6): no wallpaper on black.
+				s = iniSet(s, "Desktop", "Wallpaper", WallpaperPath)
+			default:
+				continue
+			}
+			s = iniSet(s, "Desktop", "WallpaperMode", "fit")
 			os.WriteFile(p, []byte(iniSet(s, "Desktop", "BgColor", "#15110e")), 0o644)
 		}
 	}
+}
+
+// iniGet is key's value in [group] of an INI text, or "".
+func iniGet(s, group, key string) string {
+	in := false
+	for _, l := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(l)
+		if strings.HasPrefix(t, "[") {
+			in = t == "["+group+"]"
+			continue
+		}
+		if k, v, ok := strings.Cut(t, "="); in && ok && strings.TrimSpace(k) == key {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // plasmaWallpaper writes the Plasma package (PlasmaWallpaper).

@@ -61,7 +61,7 @@ func save(v conf.Values) {
 			b.WriteString(k + "=" + v[k] + "\n")
 		}
 	}
-	os.WriteFile(stateFile(), []byte(b.String()), 0o644)
+	sys.WriteFileAtomic(stateFile(), []byte(b.String()), 0o644)
 }
 
 // Enabled reports whether events may be sent: not turned off by the user,

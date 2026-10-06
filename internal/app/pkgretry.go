@@ -191,6 +191,35 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 		}
 		sh(aptFix)
 		return true
+	case pkgmgr.KindHook:
+		// An optional apt hook failed (command-not-found's database and
+		// the like): clear them and try again (support #83 #85 #87).
+		if !apt || n > 1 {
+			return false
+		}
+		off := disableFailingHooks(p.t.Rootfs, f.Line)
+		if len(off) == 0 {
+			p.lg.Printf("package manager: an apt hook failed (%s), but none of apt's hook files matches it", f.Detail)
+			return false
+		}
+		p.lg.Printf("package manager: an apt hook failed; turned off %s", strings.Join(off, ", "))
+		r.Line("Turned off apt's " + strings.Join(off, ", ") + " hook (it fails under proot); to turn it back on, see /etc/andronix/apt-hooks-disabled.txt")
+		return true
+	case pkgmgr.KindIntercepted:
+		// One other mirror, in case it's that mirror; if it happens there
+		// too, it's the network (the message says so).
+		if n > 1 || !p.nextMirror(r) {
+			return false
+		}
+		refresh()
+		return true
+	case pkgmgr.KindProotArgs:
+		if n > 1 {
+			return false
+		}
+		p.lg.Printf("package manager: proot refused an option (%s); trying with only the essential ones", proot.Describe())
+		proot.Minimal = true
+		return true
 	case pkgmgr.KindGPG:
 		// A mirror in the middle of a sync, once.
 		if n > 1 || !p.nextMirror(r) {
@@ -250,3 +279,76 @@ type lineTee struct {
 }
 
 func (l lineTee) Line(s string) { l.fn(s); l.Reporter.Line(s) }
+
+// knownHooks are the apt hooks that fail under proot on phones: their
+// post-invoke runs need things proot or Android don't give (support).
+var knownHooks = []string{"command-not-found", "cnf-update-db", "appstream", "appstreamcli"}
+
+// disableFailingHooks turns off the apt.conf.d files that hold the hook
+// that just failed: the command in apt's "Problem executing scripts <key>
+// '<command>'" line, or, when apt printed only "Sub-process returned an
+// error code", the known ones (command-not-found, appstream). Each file
+// gets ".disabled" (apt ignores those) and a line in
+// /etc/andronix/apt-hooks-disabled.txt says how to turn it back on. Only
+// files that define an update or dpkg post-invoke hook are touched.
+func disableFailingHooks(rootfs, line string) []string {
+	dir := filepath.Join(rootfs, "etc/apt/apt.conf.d")
+	ents, _ := os.ReadDir(dir)
+	needle := ""
+	if i := strings.Index(line, "'"); i >= 0 {
+		if j := strings.LastIndex(line, "'"); j > i {
+			needle = line[i+1 : j]
+		}
+	}
+	var off []string
+	for _, e := range ents {
+		name := e.Name()
+		if e.IsDir() || strings.HasSuffix(name, ".disabled") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		s := string(b)
+		if !strings.Contains(s, "Post-Invoke") {
+			continue
+		}
+		match := false
+		if needle != "" {
+			// apt prints the command as the file has it; match on a
+			// distinctive part (the first 40 characters).
+			n := needle
+			if len(n) > 40 {
+				n = n[:40]
+			}
+			match = strings.Contains(s, n)
+		} else {
+			for _, k := range knownHooks {
+				if strings.Contains(s, k) {
+					match = true
+					break
+				}
+			}
+		}
+		if !match {
+			continue
+		}
+		if os.Rename(filepath.Join(dir, name), filepath.Join(dir, name+".disabled")) == nil {
+			off = append(off, name)
+		}
+	}
+	if len(off) > 0 {
+		note := filepath.Join(rootfs, "etc/andronix/apt-hooks-disabled.txt")
+		os.MkdirAll(filepath.Dir(note), 0o755)
+		f, err := os.OpenFile(note, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err == nil {
+			for _, n := range off {
+				fmt.Fprintf(f, "%s: Andronix turned off /etc/apt/apt.conf.d/%s (its hook failed under proot). To turn it back on: sudo mv /etc/apt/apt.conf.d/%s.disabled /etc/apt/apt.conf.d/%s\n",
+					time.Now().Format("2006-01-02"), n, n, n)
+			}
+			f.Close()
+		}
+	}
+	return off
+}

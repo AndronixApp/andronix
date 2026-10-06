@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
+	"github.com/AndronixApp/andronix-distros/internal/sys"
 )
 
 func TestKernelNewer(t *testing.T) {
@@ -211,5 +213,19 @@ func TestAmDelivered(t *testing.T) {
 		if got := amDelivered(out); got != want {
 			t.Errorf("%q: got %v", out, got)
 		}
+	}
+}
+
+// exitCode tells a Ctrl+C'd setup-user (130) from other failures.
+func TestExitCode(t *testing.T) {
+	if exitCode(nil) != 0 {
+		t.Error("nil: want 0")
+	}
+	err := sys.Command("sh", "-c", "exit 130").Run()
+	if got := exitCode(err); got != 130 {
+		t.Errorf("exit 130: got %d", got)
+	}
+	if exitCode(errors.New("no such file")) != -1 {
+		t.Error("not run: want -1")
 	}
 }

@@ -28,6 +28,14 @@ const (
 	KindDiskFull  Kind = "disk_full"
 	KindKilled    Kind = "killed"
 	KindCancelled Kind = "cancelled"
+	// An apt hook (APT::Update::Post-Invoke, e.g. command-not-found's
+	// database) failed, not the update itself (support, 2.0.3 Play Termux).
+	KindHook Kind = "apt_hook"
+	// "InRelease is not signed" on mirrors that are fine: the network
+	// rewrote the plain-HTTP download (a Wi-Fi login page or a filter).
+	KindIntercepted Kind = "network_intercepted"
+	// proot refused one of its options ("see proot --help").
+	KindProotArgs Kind = "proot_args"
 	KindOther     Kind = "other"
 )
 
@@ -38,6 +46,8 @@ var patterns = []struct {
 	re   *regexp.Regexp
 }{
 	{KindDiskFull, regexp.MustCompile(`(?i)no space left on device|not enough free space|you don't have enough free space|insufficient disk space`)},
+	{KindProotArgs, regexp.MustCompile(`(?i)see .?proot --help`)},
+	{KindHook, regexp.MustCompile(`(?i)problem executing scripts|post-invoke|^e: sub-process returned an error code$`)},
 	{KindDpkg, regexp.MustCompile(`(?i)dpkg was interrupted|dpkg --configure -a`)},
 	{KindLock, regexp.MustCompile(`(?i)could not get lock|unable to acquire the dpkg frontend lock|unable to lock database|db\.lck|waiting for cache lock`)},
 	{KindClock, regexp.MustCompile(`(?i)is not valid yet|not valid until|release file .* is expired|invalid for another`)},
@@ -46,7 +56,10 @@ var patterns = []struct {
 	{KindHTTP5xx, regexp.MustCompile(`(?i)\b50[0-9]\s+(internal|bad gateway|service|gateway)|error 50[0-9]|http/[0-9.]+ 50[0-9]`)},
 	{KindDNS, regexp.MustCompile(`(?i)temporary failure resolving|could not resolve|name or service not known|unknown host|no address associated|resolving timed out`)},
 	{KindConnect, regexp.MustCompile(`(?i)could not connect|connection timed out|connection refused|connection failed|connection reset|network is unreachable|operation timed out|failed to connect|unable to connect|transfer failed|failed retrieving file|couldn't download|reposync|curl error|cannot download|errno 104|ssl connect error|tls handshake|certificate verify failed`)},
-	{KindGPG, regexp.MustCompile(`(?i)no_pubkey|is not signed|invalid signature|expkeysig|badsig|gpg error|public key is not available|signature .* is (unknown|invalid)|key is unknown`)},
+	{KindGPG, regexp.MustCompile(`(?i)no_pubkey|invalid signature|expkeysig|badsig|gpg error|public key is not available|signature .* is (unknown|invalid)|key is unknown`)},
+	// After GPG: "not signed" with a real key error is GPG; alone, the
+	// download wasn't the mirror's (a login page or a filter).
+	{KindIntercepted, regexp.MustCompile(`(?i)in?release'? is not signed|clearsigned file isn't valid|got noclearsign|NOSPLIT`)},
 	{KindBroken, regexp.MustCompile(`(?i)unmet dependencies|held broken packages|broken packages|unresolvable|nothing provides|conflicting (files|requests)|cannot install both|unable to satisfy`)},
 	{KindKilled, regexp.MustCompile(`(?i)signal: killed|^killed$|signal 9|exit status 137`)},
 }
@@ -58,6 +71,7 @@ var errLineRe = regexp.MustCompile(`(?i)^(e:|err:|error|w: (failed|some index)|f
 type Failure struct {
 	Kind   Kind
 	Detail string // the error line, safe for telemetry
+	Line   string // the same line as printed (local use only: paths, URLs)
 	Err    error
 }
 
@@ -85,7 +99,7 @@ func Diagnose(lines []string, err error) *Failure {
 	for _, p := range patterns {
 		for _, l := range all {
 			if p.re.MatchString(l) {
-				f.Kind, f.Detail = p.kind, CleanDetail(l)
+				f.Kind, f.Detail, f.Line = p.kind, CleanDetail(l), l
 				return f
 			}
 		}

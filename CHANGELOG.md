@@ -2,6 +2,38 @@
 
 Changes to the `andronix` installer and the free distro images it installs. The app, the website and the docs have their own release notes. See https://docs.andronix.app for how to use the installer.
 
+## 2.0.5 (2026-10-06)
+
+### Phones with older kernels
+
+- **The desktop isn't ruled out any more.** On phones whose Linux kernel is older than 4.8, the warning now says the desktop may stay black, and what to try then (`andronix desktop --legacy-drawing`, or VNC with `vncserver-start`), instead of suggesting a command-line-only install. Desktops work on many such phones.
+
+### Installs that get through
+
+- **A failing apt hook no longer stops the install.** Under proot, some optional apt hooks fail (command-not-found's database, appstream). The installer turns off just the hook that failed and goes on, and `/etc/andronix/apt-hooks-disabled.txt` says how to turn it back on.
+- **A Wi-Fi sign-in page or filter is named as such.** When downloads arrive changed ("InRelease is not signed", "NOSPLIT") on every mirror, the message says to sign in to the Wi-Fi or switch networks, instead of blaming the mirrors.
+- **When proot refuses an option**, the installer tries again with only the basic ones, and suggests reinstalling proot if that fails too.
+- `andronix pack debian …` typed inside a distro drops the distro name: packs go into the distro you're in.
+- **Stopping the user setup with Ctrl+C no longer leaves you as root.** During the install it now says the distro is installed but your user isn't set up, and doesn't open a root shell. On the first start, Ctrl+C at the same questions leaves the distro instead of staying as root. Either way, the next start asks again.
+- **`andronix` works under any name or path on Play Store Termux.** A copy run as `./andronix-new` or from another folder no longer reads its own path as the command ("Unknown command '/data/…'").
+- **Termux commands typed inside a distro say where to type them.** `andronix install`, `start`, `remove`, `update`, `list`, `backup`, `restore`, `clean`, `tune`, `display` and `doctor` typed inside a distro now show the same two steps as `andronix desktop` (type exit, then run it in Termux), instead of failing with "proot is missing".
+
+### Black screens
+
+- **LXQt shows its wallpaper again on phones under 3 GB of RAM.** The light profile's settings hid LXQt's desktop defaults, so the desktop came up black (panel only) since 2.0.0. `andronix update` repairs existing installs, including desktops that saved the black settings. On Debian, LXQt's panel was black too: the light profile hid LXQt's own default settings (theme and panel layout), and now keeps them.
+
+### Settings survive a sudden stop
+
+- Android can stop Termux at any moment. The installer's small settings files (the install's state, the performance profile, the distro's release info, telemetry's choice) are now written so that they're either the old version or the new one, never empty. An empty profile file left by an older version counts as unset.
+
+### Faster desktops
+
+- **XFCE's first start is faster.** A new home's first desktop start no longer waits while the window manager saves about 80 default settings one at a time. The installer and `andronix update` write those defaults once, system-wide, when the distro has none. Nothing looks different, and your own settings still win.
+
+### Telemetry
+
+- With telemetry on, `andronix desktop` reports once, 20 seconds in, whether the Termux:X11 screen shows anything (a yes or no, plus the kernel version), so decisions about older kernels can rest on data. A few rows of the screen are read into memory to tell; no picture is kept or sent.
+
 ## 2.0.4 (2026-10-06)
 
 ### Installs that get through

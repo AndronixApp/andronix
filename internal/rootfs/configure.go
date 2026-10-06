@@ -151,6 +151,14 @@ case $- in
     *i*)
         if [ -z "${ANDRONIX_WELCOMED:-}" ] && [ -x /usr/local/bin/andronix ]; then
             /usr/local/bin/andronix welcome
+            # 10 (app.WelcomeStopped), or 130 while the first boot is still
+            # pending: the user setup was stopped (Ctrl+C), so don't stay as
+            # root without a user. The next start asks again.
+            _andronix_s=$?
+            if [ $_andronix_s = 10 ] || { [ $_andronix_s = 130 ] && [ -e /etc/andronix/firstboot ]; }; then
+                exit 0
+            fi
+            unset _andronix_s
             export ANDRONIX_WELCOMED=1
         fi
         ;;
@@ -243,11 +251,7 @@ const bwrapShim = "usr/local/lib/andronix/bwrap"
 var bwrapScript string
 
 func writeFile(p, s string, mode os.FileMode) error {
-	os.Remove(p)
-	if err := os.WriteFile(p, []byte(s), mode); err != nil {
-		return err
-	}
-	return os.Chmod(p, mode)
+	return sys.WriteFileAtomic(p, []byte(s), mode)
 }
 
 // FetchLinux downloads the GOOS=linux build for this CPU; the app sets it

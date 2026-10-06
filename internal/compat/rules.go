@@ -59,7 +59,7 @@ type Do struct {
 
 // Messages are what warn and refuse can say.
 var Messages = map[string]string{
-	"old_kernel_desktop": "This phone's Linux kernel (%s) is older than 4.8: desktops (XFCE, LXQt, MATE, KDE) stay black on it, in Termux:X11 and VNC alike. The command line works fully: install with --de none. Help: https://chat.andronix.app",
+	"old_kernel_desktop": "This phone's Linux kernel (%s) is older than 4.8. Desktops work on many such phones but may stay black. If yours does: andronix desktop --legacy-drawing, or try VNC (vncserver-start). The command line always works. Tell us how it went: https://chat.andronix.app",
 	"phantom_process":    "Android may stop long-running Linux processes (the phantom process killer). If an install or the desktop stops with 'signal 9', see docs.andronix.app: Phantom process killer.",
 }
 

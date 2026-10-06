@@ -15,7 +15,7 @@
     },
     {
       "id": "old-kernel-desktop",
-      "why": "Without seccomp acceleration the XFCE desktop stays black on 4.4 (xfwm4 deadlock); the command line works.",
+      "why": "Without seccomp acceleration XFCE stayed black on one Android 9 / 4.4 emulator (xfwm4 deadlock); real 4.4 phones have reported working desktops, so this only warns (may stay black).",
       "when": {
         "kernel_lt": "4.8",
         "desktop": true

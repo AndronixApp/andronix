@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -90,6 +91,9 @@ func desktopDistro() (string, error) {
 // x11 changes the remembered Termux:X11 options first (DesktopX11).
 func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 	if d := os.Getenv("ANDRONIX_DISTRO"); d != "" {
+		// Typed inside the distro (support #72 #79): say where to type it.
+		// (Opening it automatically after exit needs andronix to stay as
+		// the session's parent: 2.1, if support still sees this.)
 		insideDistroNote(d, "andronix desktop "+d)
 		return nil
 	}
@@ -261,14 +265,43 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 	if len(saved) == 0 {
 		ui.Note("Only a black screen with a cursor? Run: andronix desktop stop, then andronix desktop " + d.ID + " --legacy-drawing (Andronix remembers it).")
 	}
-	telemetry.Send("start", map[string]any{"distro": d.ID, "de": de.ID, "x11_args": termux.X11ArgsLabel(saved)})
+	// The start event goes out 20 s in, with whether the screen drew
+	// (drew.go), or when the session ends before that.
+	props := map[string]any{"distro": d.ID, "de": de.ID, "x11_args": termux.X11ArgsLabel(saved), "kernel": kernelMajorMinor()}
+	var sendOnce sync.Once
+	sendStart := func(drew *bool) {
+		sendOnce.Do(func() {
+			if drew != nil {
+				props["drew"] = *drew
+			}
+			telemetry.Send("start", props)
+		})
+	}
 	if n := termux.PhantomNote(); n != "" {
 		ui.Note(n)
 	}
 	fmt.Println()
 
 	done := make(chan error, 1)
-	go func() { done <- c.Wait() }()
+	ended := make(chan struct{})
+	go func() { err := c.Wait(); close(ended); done <- err }()
+	go func() {
+		select {
+		case <-ended:
+			return
+		case <-time.After(20 * time.Second):
+		}
+		if !telemetry.Enabled() {
+			sendStart(nil)
+			return
+		}
+		if drew, ok := screenDrew(termux.X11Socket(termux.X11Display)); ok {
+			termux.Logf("x11: screen drew=%v", drew)
+			sendStart(&drew)
+		} else {
+			sendStart(nil)
+		}
+	}()
 	var werr error
 	select {
 	case werr = <-done:
@@ -276,6 +309,7 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 		go stopSession(run.Proot)
 		werr = <-done
 	}
+	sendStart(nil) // ended within 20 s
 	// `andronix desktop stop` removes the state file first.
 	_, statErr := os.Stat(x11State())
 	requested := ctx.Err() != nil || os.IsNotExist(statErr)
@@ -310,13 +344,18 @@ type DesktopX11 struct {
 // insideDistroNote answers a Termux-only command typed inside a distro:
 // not an error (people filed it as one), just where to type it.
 func insideDistroNote(distro, cmd string) {
+	insideNote(distro, cmd, "The desktop opens from Termux, outside %s. Two steps:")
+}
+
+// insideNote is insideDistroNote with its own first line (%s: the distro).
+func insideNote(distro, cmd, what string) {
 	name := distro
 	if d, err := conf.ResolveDistro(distro); err == nil {
 		name = d.Label()
 	}
 	fmt.Println()
 	fmt.Print(ui.Box(ui.BoxBrand, "You're inside "+name,
-		"The desktop opens from Termux, outside "+name+". Two steps:", "",
+		fmt.Sprintf(what, name), "",
 		"1. Type exit (this leaves "+name+").",
 		"2. Then run: "+cmd))
 	fmt.Println()

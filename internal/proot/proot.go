@@ -76,15 +76,35 @@ func readable(p string) bool {
 
 func exists(p string) bool { _, err := os.Lstat(p); return err == nil }
 
+// Minimal is set after proot refused an option ("see proot --help"):
+// only the options every proot has, plus link2symlink (hard links fail
+// on Android without it).
+var Minimal bool
+
+// Describe is the proot in use, for logs: its first help line.
+func Describe() string {
+	Has("") // read the help once
+	for _, l := range strings.Split(helpText, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			return l
+		}
+	}
+	return "proot (no --help output)"
+}
+
 // Args returns proot's argument list (without the command to run).
 func (t *Target) Args() []string {
 	a := []string{"proot"}
-	for _, f := range []string{"--kill-on-exit", "--link2symlink", "--sysvipc", "-L"} {
+	optional := []string{"--kill-on-exit", "--link2symlink", "--sysvipc", "-L"}
+	if Minimal {
+		optional = []string{"--link2symlink"}
+	}
+	for _, f := range optional {
 		if Has(f) {
 			a = append(a, f)
 		}
 	}
-	if Has("--kernel-release") {
+	if Has("--kernel-release") && !Minimal {
 		a = append(a, "--kernel-release=6.12.0-andronix")
 	}
 	if t.User != "" && t.UID != "" {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -670,24 +671,48 @@ func install(ctx context.Context, o InstallOpts) error {
 
 	// A normal user instead of root (asks here; otherwise at first login).
 	user := in.Get("USER")
+	noStart, userStopped := o.NoStart, false
 	if user == "" && !o.NoUser {
+		firstboot := filepath.Join(in.Rootfs, "etc/andronix/firstboot")
 		if ui.Interactive {
 			fmt.Println()
-			if err := t.Interactive("/usr/local/bin/andronix setup-user", false); err == nil {
-				if b, err := os.ReadFile(filepath.Join(in.Rootfs, "etc/andronix/user")); err == nil {
-					user = strings.TrimSpace(string(b))
-					in.Set("USER", user)
+			err := t.Interactive("/usr/local/bin/andronix setup-user", false)
+			if b, rerr := os.ReadFile(filepath.Join(in.Rootfs, "etc/andronix/user")); err == nil && rerr == nil {
+				user = strings.TrimSpace(string(b))
+				in.Set("USER", user)
+			} else {
+				// Stopped (Ctrl+C) or failed: the first login asks again
+				// (Welcome) instead of leaving root without a user.
+				sys.WriteFileAtomic(firstboot, []byte("1\n"), 0o644)
+				if ctx.Err() != nil || exitCode(err) == 130 {
+					// Ctrl+C: don't go into the distro as root now.
+					noStart, userStopped = true, true
+					fmt.Println()
+					ui.Note(d.Label() + " is installed, but your user isn't set up yet. It asks again the next time you start it: ./" + d.MainStart())
 				}
 			}
 		} else {
-			os.WriteFile(filepath.Join(in.Rootfs, "etc/andronix/firstboot"), []byte("1\n"), 0o644)
+			sys.WriteFileAtomic(firstboot, []byte("1\n"), 0o644)
 		}
 	}
 	if lowRAM > 0 {
 		ui.Warn(fmt.Sprintf("%s needs about %d MB of RAM; this phone has %d MB. It may be slow or close apps; XFCE is lighter.", de.Name, de.MinRAMMB, lowRAM))
 	}
-	finish(in, de, user, o.NoStart, rep)
+	finish(in, de, user, noStart, userStopped, rep)
 	return nil
+}
+
+// exitCode is a finished command's exit code (0 without an error, -1 if
+// it didn't run).
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
 }
 
 // installShim puts the fchmodat2 preload shim for this CPU into the
@@ -1065,6 +1090,12 @@ func pkgErr(title string, err error) error {
 		e.Fix = "Make sure the phone's date and time are set automatically (Settings, Date and time), then run the same command again."
 	case f.Kind == pkgmgr.KindKilled:
 		e.Fix = "Android stopped the install (signal 9). Keep Termux open in front while it runs, and see docs.andronix.app on the phantom process killer; then run the same command again."
+	case f.Kind == pkgmgr.KindIntercepted:
+		e.What = "Downloads arrived changed, on every mirror we tried: your network is likely showing a sign-in page or filtering them."
+		e.Fix = "Open a browser and sign in to the Wi-Fi, or switch between Wi-Fi and mobile data (or turn a VPN on or off), then run the same command again."
+	case f.Kind == pkgmgr.KindProotArgs:
+		e.What = "proot refused how Andronix runs it, even with only its basic options. Termux's proot may be broken or very old."
+		e.Fix = "Reinstall it, then run the same command again: pkg reinstall proot"
 	}
 	return e
 }
@@ -1101,7 +1132,7 @@ func pkgRun(ctx context.Context, t *proot.Target, f *pkgmgr.Family, cmd string, 
 	})
 }
 
-func finish(in *Inst, de *conf.Desktop, user string, noStart bool, rep *installReport) {
+func finish(in *Inst, de *conf.Desktop, user string, noStart, userStopped bool, rep *installReport) {
 	d := in.D
 	start := ui.Interactive && !noStart
 	lines := []string{}
@@ -1127,7 +1158,11 @@ func finish(in *Inst, de *conf.Desktop, user string, noStart bool, rep *installR
 		lines = append(lines, "", "Your older "+d.Name+" is untouched. Start it with ./"+strings.Fields(r)[0])
 	}
 	fmt.Println()
-	fmt.Print(ui.Box(ui.BoxOK, d.Label()+" is ready", lines...))
+	title := d.Label() + " is ready"
+	if userStopped {
+		title = d.Label() + " is installed" // the user isn't set up yet (said above)
+	}
+	fmt.Print(ui.Box(ui.BoxOK, title, lines...))
 	ui.Footer()
 	rep.send("ok") // before the shell: Login replaces this process
 	if start {

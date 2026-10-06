@@ -102,9 +102,9 @@ func (c *compatRun) warnings(shown map[string]bool) {
 	}
 }
 
-// desktopNote warns before a desktop starts where the rules say it won't
-// draw (old_kernel_desktop: kernels before 4.8), so a black screen isn't
-// the first sign. Only the kernel is needed; inside a distro uname is the
+// desktopNote warns before a desktop starts where the rules say it may
+// not draw (old_kernel_desktop: kernels before 4.8), with what to try, so
+// a black screen isn't the first sign. Only the kernel is needed; inside a distro uname is the
 // phone's too.
 func desktopNote() {
 	t, err := compat.Default()

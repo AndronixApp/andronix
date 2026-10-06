@@ -48,7 +48,8 @@ check "desktop with nothing installed explains" "out=\$($A desktop 2>&1); [ \$? 
 check "install $distro (command line)" "$src_env $A install $distro --de none --yes --no-start"
 check "desktop on a command-line install explains" "out=\$($A desktop $distro 2>&1); [ \$? = 1 ] && echo \"\$out\" | grep -q 'has no desktop'"
 check "start --x11 is the same command" "out=\$($A start $distro --x11 2>&1); [ \$? = 1 ] && echo \"\$out\" | grep -q 'has no desktop'"
-check "desktop inside a distro says run it in Termux" "out=\$($A start $distro -- andronix desktop 2>&1); echo \"\$out\" | grep -q 'Run this in Termux'"
+check "desktop inside a distro says where to run it" "out=\$($A start $distro -- andronix desktop 2>&1); echo \"\$out\" | grep -q 'Type exit'"
+check "install inside a distro says where to run it" "out=\$($A start $distro -- andronix install $distro 2>&1); echo \"\$out\" | grep -q 'Type exit'"
 check "desktop stop with nothing running is fine" "$A desktop stop | grep -q 'Nothing was running'"
 
 # Each desktop and the process that proves it's up (bash 3: no maps).

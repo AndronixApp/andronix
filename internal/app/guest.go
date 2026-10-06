@@ -5,6 +5,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
@@ -518,12 +519,17 @@ func createUser(fam *pkgmgr.Family, d *conf.Distro, name, pass, vncPass string) 
 	return nil
 }
 
+// WelcomeStopped is welcome's exit code after Ctrl+C at the first-boot
+// user setup: the login profile then exits the shell (rootfs profileSh).
+const WelcomeStopped = 10
+
 // Welcome is the greeting on interactive logins. On a first boot it runs
 // the user setup, then switches to the new user.
 func Welcome() error {
 	rel := guestRelease()
 	if _, err := os.Stat("/etc/andronix/firstboot"); err == nil && os.Getuid() == 0 && ui.Interactive {
-		if err := SetupUser(""); err == nil {
+		err := SetupUser("")
+		if err == nil {
 			if b, err := os.ReadFile("/etc/andronix/user"); err == nil {
 				name := strings.TrimSpace(string(b))
 				// Not su: after su from proot's fake root, sudo refuses. The
@@ -531,6 +537,13 @@ func Welcome() error {
 				ui.Note("Type exit, then start " + rel.Get("ANDRONIX_NAME") + " again to log in as " + name + ".")
 				return nil
 			}
+		} else if errors.Is(err, ui.ErrCancelled) || errors.Is(err, context.Canceled) {
+			// Ctrl+C: don't leave a root shell without a user (lead, Redmi).
+			// The login profile ends the session on this exit code; the next
+			// start asks again (firstboot stays).
+			fmt.Println()
+			ui.Note("Stopped: no user was set up. " + rel.Get("ANDRONIX_NAME") + " asks again the next time you start it.")
+			os.Exit(WelcomeStopped)
 		}
 	}
 	if ui.Plain {

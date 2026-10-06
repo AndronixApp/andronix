@@ -33,6 +33,13 @@ func TestLinkerExec(t *testing.T) {
 	if !reflect.DeepEqual(got, []string{"andronix", "version"}) || selfPath != elf {
 		t.Fatalf("linker: %v %q", got, selfPath)
 	}
+	// Run from another place or name: TERMUX_EXEC__PROC_SELF_EXE names the
+	// file differently (Redmi, rc4 as ./rc4/andronix), still dropped.
+	got = fixLinkerArgs("/system/bin/linker64", "rc4/andronix", []string{"andronix", elf, "install", "alpine"})
+	if !reflect.DeepEqual(got, []string{"andronix", "install", "alpine"}) {
+		t.Fatalf("linker, other name: %v", got)
+	}
+	got = fixLinkerArgs("/system/bin/linker64", elf, []string{"andronix", elf, "version"})
 	if p, _ := Executable(); p != elf {
 		t.Errorf("Executable = %s", p)
 	}

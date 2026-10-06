@@ -212,6 +212,11 @@ func main() {
 		}
 	}
 
+	// Termux-only commands typed inside a distro: say where to type them.
+	if app.InsideDistro(cmd, append([]string{cmd}, all...)) {
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -317,7 +322,11 @@ func main() {
 	if err != nil {
 		if errors.Is(err, ui.ErrCancelled) || errors.Is(err, context.Canceled) {
 			fmt.Println()
-			ui.Note("Stopped. Run the same command again to pick up where you left off.")
+			if cmd == "setup-user" {
+				ui.Note("Stopped: no user was set up.")
+			} else {
+				ui.Note("Stopped. Run the same command again to pick up where you left off.")
+			}
 			os.Exit(130)
 		}
 		app.SaveFailure(cmd, a.arg(0), err)

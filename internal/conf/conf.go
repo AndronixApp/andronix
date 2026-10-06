@@ -148,7 +148,11 @@ type Desktop struct {
 	// DE_LIGHT_XDG_CONFIG ("<file>:<group>:<key>=<value>;..."),
 	// DE_LIGHT_XFCONF ("<channel>:/prop/path:<type>:<value>;...") and
 	// DE_LIGHT_GSETTINGS ("<schema> <key> <value>;...").
-	LightAutostartHide                          []string
+	LightAutostartHide []string
+	// XDGConfigDirs is DE_XDG_CONFIG_DIRS, the session's own default
+	// XDG_CONFIG_DIRS (when it's unset), kept after our layers: startlxqt
+	// adds /usr/share, where LXQt's default configs are, only when unset.
+	XDGConfigDirs                               string
 	LightXDGConfig, LightXfconf, LightGSettings []string
 	// XDGConfig is DE_XDG_CONFIG="<file>:<group>:<key>=<value>;...":
 	// defaults written to /etc/xdg/<file> (KDE's system-wide config).
@@ -345,6 +349,7 @@ func ResolveDesktop(name string) (*Desktop, error) {
 		Distros:            v.List("DE_DISTROS"),
 		DesktopEdits:       splitNonEmpty(v.Get("DE_DESKTOP_EDITS"), ";"),
 		XDGConfig:          splitNonEmpty(v.Get("DE_XDG_CONFIG"), ";"),
+		XDGConfigDirs:      v.Get("DE_XDG_CONFIG_DIRS"),
 		LightAutostartHide: v.List("DE_LIGHT_AUTOSTART_HIDE"), LightXDGConfig: splitNonEmpty(v.Get("DE_LIGHT_XDG_CONFIG"), ";"),
 		LightXfconf: splitNonEmpty(v.Get("DE_LIGHT_XFCONF"), ";"), LightGSettings: splitNonEmpty(v.Get("DE_LIGHT_GSETTINGS"), ";"),
 		raw: v}, nil
