@@ -81,8 +81,8 @@ func (p *pkgOps) prepare() {
 
 func (p *pkgOps) do(ctx context.Context, cmd string, n int, r ui.Reporter, isUpdate bool) error {
 	p.prepare()
-	var f *pkgFailure
-	seen := map[pkgKind]int{}
+	var f *pkgmgr.Failure
+	seen := map[pkgmgr.Kind]int{}
 	for attempt := 1; attempt <= pkgAttempts; attempt++ {
 		var lines []string
 		err := pkgRunWatch(ctx, p.t, p.fam, cmd, n, r, func(l string) {
@@ -96,16 +96,16 @@ func (p *pkgOps) do(ctx context.Context, cmd string, n int, r ui.Reporter, isUpd
 			}
 			return nil
 		}
-		f = diagnose(lines, err)
-		seen[f.kind]++
-		p.lg.Printf("package manager: attempt %d failed: %s: %s", attempt, f.kind, f.detail)
-		if attempt == pkgAttempts || !p.recover(ctx, f, seen[f.kind], isUpdate, r) {
+		f = pkgmgr.Diagnose(lines, err)
+		seen[f.Kind]++
+		p.lg.Printf("package manager: attempt %d failed: %s: %s", attempt, f.Kind, f.Detail)
+		if attempt == pkgAttempts || !p.recover(ctx, f, seen[f.Kind], isUpdate, r) {
 			break
 		}
-		r.Line(fmt.Sprintf("Trying again (%s)...", strings.ReplaceAll(string(f.kind), "_", " ")))
+		r.Line(fmt.Sprintf("Trying again (%s)...", strings.ReplaceAll(string(f.Kind), "_", " ")))
 	}
-	if isUpdate && p.fam.ID == "apt" && f.kind != kindCancelled && f.kind != kindDiskFull && p.aptListsUsable() {
-		p.lg.Printf("package manager: some sources failed (%s); going on with the lists apt has", f.detail)
+	if isUpdate && p.fam.ID == "apt" && f.Kind != pkgmgr.KindCancelled && f.Kind != pkgmgr.KindDiskFull && p.aptListsUsable() {
+		p.lg.Printf("package manager: some sources failed (%s); going on with the lists apt has", f.Detail)
 		r.Line("Some package sources didn't answer; going on with the others.")
 		p.t.Run(ctx, "dpkg -s ca-certificates >/dev/null 2>&1 || "+p.fam.Install([]string{"ca-certificates"}), nil, nil)
 		return nil
@@ -115,7 +115,7 @@ func (p *pkgOps) do(ctx context.Context, cmd string, n int, r ui.Reporter, isUpd
 
 // recover prepares the next try for this failure (the n-th of its kind),
 // or reports that trying again won't help.
-func (p *pkgOps) recover(ctx context.Context, f *pkgFailure, n int, isUpdate bool, r ui.Reporter) bool {
+func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate bool, r ui.Reporter) bool {
 	apt := p.fam.ID == "apt"
 	sh := func(cmd string) { p.t.Run(ctx, cmd, nil, r.Line) }
 	refresh := func() {
@@ -123,10 +123,10 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgFailure, n int, isUpdate boo
 			p.t.Run(ctx, p.fam.Update, nil, r.Line)
 		}
 	}
-	switch f.kind {
-	case kindCancelled, kindDiskFull:
+	switch f.Kind {
+	case pkgmgr.KindCancelled, pkgmgr.KindDiskFull:
 		return false
-	case kindDNS, kindConnect, kindHTTP5xx:
+	case pkgmgr.KindDNS, pkgmgr.KindConnect, pkgmgr.KindHTTP5xx:
 		if n == 1 {
 			p.sleep(5 * time.Second)
 			return true
@@ -140,7 +140,7 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgFailure, n int, isUpdate boo
 			return true
 		}
 		return false
-	case kindHTTP404:
+	case pkgmgr.KindHTTP404:
 		if n > 2 {
 			return false
 		}
@@ -149,7 +149,7 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgFailure, n int, isUpdate boo
 		}
 		refresh() // stale lists name packages the mirror replaced
 		return true
-	case kindHash:
+	case pkgmgr.KindHash:
 		if n > 2 {
 			return false
 		}
@@ -161,7 +161,7 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgFailure, n int, isUpdate boo
 		}
 		refresh()
 		return true
-	case kindClock:
+	case pkgmgr.KindClock:
 		if !apt || n > 1 {
 			return false
 		}
@@ -170,13 +170,13 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgFailure, n int, isUpdate boo
 			"// Andronix: the phone's clock was off; don't fail on release dates.\nAcquire::Check-Valid-Until \"false\";\nAcquire::Check-Date \"false\";\n")
 		refresh()
 		return true
-	case kindDpkg:
+	case pkgmgr.KindDpkg:
 		if !apt || n > 2 {
 			return false
 		}
 		sh("dpkg --configure -a")
 		return true
-	case kindLock:
+	case pkgmgr.KindLock:
 		if n > 2 {
 			return false
 		}
@@ -185,13 +185,13 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgFailure, n int, isUpdate boo
 		}
 		p.sleep(10 * time.Second)
 		return true
-	case kindBroken:
+	case pkgmgr.KindBroken:
 		if !apt || n > 1 {
 			return false
 		}
 		sh(aptFix)
 		return true
-	case kindGPG:
+	case pkgmgr.KindGPG:
 		// A mirror in the middle of a sync, once.
 		if n > 1 || !p.nextMirror(r) {
 			return false

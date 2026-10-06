@@ -233,7 +233,7 @@ func main() {
 		// (flags included), so argv reaches the distro unchanged.
 		name, root, x11, rest := splitStart(all)
 		if x11 {
-			err = app.Desktop(ctx, name)
+			err = app.Desktop(ctx, name, app.DesktopX11{})
 		} else {
 			err = app.Start(name, root, rest)
 		}
@@ -241,7 +241,7 @@ func main() {
 		if a.arg(0) == "stop" {
 			err = app.DesktopStop()
 		} else {
-			err = app.Desktop(ctx, a.arg(0))
+			err = app.Desktop(ctx, a.arg(0), app.DesktopX11{Legacy: a.has("legacy-drawing"), BGRA: a.has("force-bgra"), Default: a.has("x11-default")})
 		}
 	case "remove", "uninstall", "rm":
 		err = app.Remove(ctx, a.arg(0), a.has("legacy"))

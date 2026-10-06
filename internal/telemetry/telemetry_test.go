@@ -87,3 +87,30 @@ func TestErrorClass(t *testing.T) {
 		}
 	}
 }
+
+func TestHostAndTermuxPackage(t *testing.T) {
+	t.Setenv("ANDRONIX_DISTRO", "")
+	t.Setenv("ANDRONIX_HOST", "standalone")
+	if h := host(); h != "standalone" {
+		t.Errorf("host %q", h)
+	}
+	if f := termuxFlavor(); f != "" {
+		t.Errorf("standalone counted as a Termux flavor: %q", f)
+	}
+	t.Setenv("ANDRONIX_HOST", "weird")
+	if h := host(); h != "termux" && h != "linux" {
+		t.Errorf("host outside the enum: %q", h)
+	}
+	t.Setenv("ANDRONIX_HOST", "")
+	t.Setenv("ANDRONIX_DISTRO", "debian")
+	if h := host(); h != "distro" {
+		t.Errorf("host %q", h)
+	}
+	if got := token("googleplay.2026.02.11 (beta)"); got != "googleplay.2026.02.11_beta_" {
+		t.Errorf("token %q", got)
+	}
+	t.Setenv("TERMUX_APP__PACKAGE_NAME", "com.termux.zerotermux")
+	if got := termuxPackage(); got != "com.termux.zerotermux" {
+		t.Errorf("pkg %q", got)
+	}
+}

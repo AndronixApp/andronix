@@ -153,6 +153,17 @@ func build(name string, props map[string]any) Event {
 		"android_sdk":   androidSDK(),
 		"termux_flavor": termuxFlavor(),
 		"version":       version,
+		"host":          host(),
+	}
+	// Which Termux: its version and the app's package (com.termux, or a
+	// fork's), so "unknown" flavors can be told apart (2.0.4).
+	if h := host(); h == "termux" {
+		if v := token(os.Getenv("TERMUX_VERSION")); v != "" {
+			p["termux_version"] = v
+		}
+		if pk := termuxPackage(); pk != "" {
+			p["termux_pkg"] = pk
+		}
 	}
 	for k, v := range props {
 		p[k] = v
@@ -200,9 +211,54 @@ func androidSDK() int {
 	return sdk
 }
 
+// host is where andronix runs, exactly one of products-api's enum: termux,
+// standalone (Andronix's own app: ANDRONIX_HOST=standalone), distro
+// (inside one), or linux; app hosts are never counted as an unknown Termux.
+func host() string {
+	switch {
+	case os.Getenv("ANDRONIX_DISTRO") != "":
+		return "distro"
+	case os.Getenv("ANDRONIX_HOST") == "standalone":
+		return "standalone"
+	case sys.IsTermux():
+		return "termux"
+	}
+	return "linux"
+}
+
+var notToken = regexp.MustCompile(`[^A-Za-z0-9._:-]+`)
+
+// token is s in products-api's token charset, at most 64 characters.
+func token(s string) string {
+	s = notToken.ReplaceAllString(strings.TrimSpace(s), "_")
+	if len(s) > 64 {
+		s = s[:64]
+	}
+	return s
+}
+
+// termuxPackage is the Termux app's package name: TERMUX_APP__PACKAGE_NAME
+// (newer Termux), else from $PREFIX (/data/data/<pkg>/files/usr or
+// /data/user/<n>/<pkg>/files/usr).
+func termuxPackage() string {
+	if p := os.Getenv("TERMUX_APP__PACKAGE_NAME"); p != "" {
+		return token(p)
+	}
+	f := strings.Split(strings.Trim(sys.Prefix(), "/"), "/")
+	for i := 0; i+2 < len(f); i++ {
+		if f[i+1] == "files" && f[i+2] == "usr" && i >= 1 && (f[i-1] == "data" || i >= 2 && f[i-2] == "user") {
+			return token(f[i])
+		}
+	}
+	return ""
+}
+
 // termuxFlavor is which Termux build: google_play_store, f_droid, github,
 // or "" off Termux (TERMUX_APK_RELEASE, else TERMUX_VERSION).
 func termuxFlavor() string {
+	if h := host(); h != "termux" && h != "linux" {
+		return "" // the standalone app, or inside a distro: no Termux to name
+	}
 	if r := os.Getenv("TERMUX_APK_RELEASE"); r != "" {
 		return strings.ToLower(r)
 	}

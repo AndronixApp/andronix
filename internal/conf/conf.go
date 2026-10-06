@@ -93,6 +93,10 @@ func (d *Distro) UpstreamTarball(arch string) string {
 // upstream tarball (kernel, firmware, network daemons).
 func (d *Distro) UpstreamRemove() []string { return d.raw.List("DISTRO_UPSTREAM_REMOVE") }
 
+// XFCEMB is DISTRO_XFCE_MB: the measured peak disk use of an install with
+// XFCE, or 0 when not measured.
+func (d *Distro) XFCEMB() int { return d.raw.Int("DISTRO_XFCE_MB") }
+
 // MirrorFallbacks is DISTRO_MIRROR_FALLBACK: groups split by ";", each the
 // base URL the image's sources use, then the mirrors to switch to, in order.
 func (d *Distro) MirrorFallbacks() [][]string {

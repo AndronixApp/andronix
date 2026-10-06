@@ -18,37 +18,37 @@ func TestDiagnose(t *testing.T) {
 	exit := errors.New("exit status 100")
 	for _, c := range []struct {
 		lines []string
-		kind  pkgKind
+		kind  pkgmgr.Kind
 	}{
-		{[]string{"Err:1 http://ports.ubuntu.com/ubuntu-ports resolute InRelease", "  Temporary failure resolving 'ports.ubuntu.com'", "E: Failed to fetch http://ports.ubuntu.com/ubuntu-ports/dists/resolute/InRelease"}, kindDNS},
-		{[]string{"Err:7 http://deb.debian.org/debian trixie/main arm64 libgtk-3-0t64 arm64 3.24.49-3", "  404  Not Found [IP: 151.101.2.132 80]", "E: Failed to fetch http://deb.debian.org/debian/pool/main/g/gtk+3.0/libgtk-3-0t64_3.24.49-3_arm64.deb  404  Not Found"}, kindHTTP404},
-		{[]string{"E: Failed to fetch http://ports.ubuntu.com/ubuntu-ports/dists/resolute-updates/main/binary-arm64/Packages.xz  Hash Sum mismatch"}, kindHash},
-		{[]string{"E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct the problem."}, kindDpkg},
-		{[]string{"E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 4242 (apt-get)"}, kindLock},
-		{[]string{"E: Release file for http://ports.ubuntu.com/ubuntu-ports/dists/resolute-updates/InRelease is not valid yet (invalid for another 3h 2min 1s)."}, kindClock},
-		{[]string{"W: GPG error: http://kali.download/kali kali-rolling InRelease: The following signatures were invalid: EXPKEYSIG ED65462EC8D5E4C5", "E: The repository 'http://kali.download/kali kali-rolling InRelease' is not signed."}, kindGPG},
-		{[]string{"The following packages have unmet dependencies:", "E: Unable to correct problems, you have held broken packages."}, kindBroken},
-		{[]string{"dpkg: error processing archive /var/cache/apt/archives/firefox.deb (--unpack):", " cannot copy extracted data for './usr/lib/firefox/libxul.so' to '/usr/lib/firefox/libxul.so.dpkg-new': failed to write (No space left on device)"}, kindDiskFull},
-		{[]string{"ERROR: [reposync] failed to fetch file `https://repo-default.voidlinux.org/current/aarch64/aarch64-repodata': Operation timed out"}, kindConnect},
-		{[]string{"error: failed retrieving file 'core.db' from mirror.archlinuxarm.org : Could not resolve host: mirror.archlinuxarm.org"}, kindDNS},
-		{[]string{"Setting up libssl3t64:arm64 (3.5.0-1) ...", "Setting up tls-utils (1.0) ...", "E: Sub-process /usr/bin/dpkg returned an error code (1)"}, kindOther},
+		{[]string{"Err:1 http://ports.ubuntu.com/ubuntu-ports resolute InRelease", "  Temporary failure resolving 'ports.ubuntu.com'", "E: Failed to fetch http://ports.ubuntu.com/ubuntu-ports/dists/resolute/InRelease"}, pkgmgr.KindDNS},
+		{[]string{"Err:7 http://deb.debian.org/debian trixie/main arm64 libgtk-3-0t64 arm64 3.24.49-3", "  404  Not Found [IP: 151.101.2.132 80]", "E: Failed to fetch http://deb.debian.org/debian/pool/main/g/gtk+3.0/libgtk-3-0t64_3.24.49-3_arm64.deb  404  Not Found"}, pkgmgr.KindHTTP404},
+		{[]string{"E: Failed to fetch http://ports.ubuntu.com/ubuntu-ports/dists/resolute-updates/main/binary-arm64/Packages.xz  Hash Sum mismatch"}, pkgmgr.KindHash},
+		{[]string{"E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct the problem."}, pkgmgr.KindDpkg},
+		{[]string{"E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 4242 (apt-get)"}, pkgmgr.KindLock},
+		{[]string{"E: Release file for http://ports.ubuntu.com/ubuntu-ports/dists/resolute-updates/InRelease is not valid yet (invalid for another 3h 2min 1s)."}, pkgmgr.KindClock},
+		{[]string{"W: GPG error: http://kali.download/kali kali-rolling InRelease: The following signatures were invalid: EXPKEYSIG ED65462EC8D5E4C5", "E: The repository 'http://kali.download/kali kali-rolling InRelease' is not signed."}, pkgmgr.KindGPG},
+		{[]string{"The following packages have unmet dependencies:", "E: Unable to correct problems, you have held broken packages."}, pkgmgr.KindBroken},
+		{[]string{"dpkg: error processing archive /var/cache/apt/archives/firefox.deb (--unpack):", " cannot copy extracted data for './usr/lib/firefox/libxul.so' to '/usr/lib/firefox/libxul.so.dpkg-new': failed to write (No space left on device)"}, pkgmgr.KindDiskFull},
+		{[]string{"ERROR: [reposync] failed to fetch file `https://repo-default.voidlinux.org/current/aarch64/aarch64-repodata': Operation timed out"}, pkgmgr.KindConnect},
+		{[]string{"error: failed retrieving file 'core.db' from mirror.archlinuxarm.org : Could not resolve host: mirror.archlinuxarm.org"}, pkgmgr.KindDNS},
+		{[]string{"Setting up libssl3t64:arm64 (3.5.0-1) ...", "Setting up tls-utils (1.0) ...", "E: Sub-process /usr/bin/dpkg returned an error code (1)"}, pkgmgr.KindOther},
 	} {
-		f := diagnose(c.lines, exit)
-		if f.kind != c.kind {
-			t.Errorf("%q: kind %s, want %s", c.lines[len(c.lines)-1], f.kind, c.kind)
+		f := pkgmgr.Diagnose(c.lines, exit)
+		if f.Kind != c.kind {
+			t.Errorf("%q: kind %s, want %s", c.lines[len(c.lines)-1], f.Kind, c.kind)
 		}
-		if f.detail == "" || len(f.detail) > 120 || regexp.MustCompile(`[^A-Za-z0-9 ._:,+/()-]`).MatchString(f.detail) {
-			t.Errorf("detail %q isn't clean", f.detail)
+		if f.Detail == "" || len(f.Detail) > 120 || regexp.MustCompile(`[^A-Za-z0-9 ._:,+/()-]`).MatchString(f.Detail) {
+			t.Errorf("detail %q isn't clean", f.Detail)
 		}
 	}
-	if f := diagnose(nil, errors.New("signal: killed")); f.kind != kindKilled {
-		t.Errorf("killed: %s", f.kind)
+	if f := pkgmgr.Diagnose(nil, errors.New("signal: killed")); f.Kind != pkgmgr.KindKilled {
+		t.Errorf("killed: %s", f.Kind)
 	}
 }
 
 // No URLs, addresses or paths go to telemetry; hosts stay.
 func TestCleanDetail(t *testing.T) {
-	got := cleanDetail("E: Failed to fetch http://ports.ubuntu.com/ubuntu-ports/pool/main/x/x.deb  404  Not Found [IP: 185.125.190.39 80] in /data/data/com.termux/files/home/x")
+	got := pkgmgr.CleanDetail("E: Failed to fetch http://ports.ubuntu.com/ubuntu-ports/pool/main/x/x.deb  404  Not Found [IP: 185.125.190.39 80] in /data/data/com.termux/files/home/x")
 	if got != "E: Failed to fetch ports.ubuntu.com 404 Not Found in (path)" {
 		t.Errorf("got %q", got)
 	}
@@ -106,11 +106,11 @@ func TestMirrorData(t *testing.T) {
 
 func TestPkgErrClasses(t *testing.T) {
 	var ue *ui.UserError
-	err := pkgErr("Couldn't install xfce desktop", &pkgFailure{kind: kindDiskFull, detail: "No space left on device", err: errors.New("exit status 100")})
+	err := pkgErr("Couldn't install xfce desktop", &pkgmgr.Failure{Kind: pkgmgr.KindDiskFull, Detail: "No space left on device", Err: errors.New("exit status 100")})
 	if !errors.As(err, &ue) || ue.Class != "not_enough_space" || ue.Kind != "disk_full" {
 		t.Errorf("disk full: %+v", err)
 	}
-	err = pkgErr("Couldn't reach the package servers", &pkgFailure{kind: kindDNS, detail: "Temporary failure resolving ports.ubuntu.com", err: errors.New("exit status 100")})
+	err = pkgErr("Couldn't reach the package servers", &pkgmgr.Failure{Kind: pkgmgr.KindDNS, Detail: "Temporary failure resolving ports.ubuntu.com", Err: errors.New("exit status 100")})
 	if !errors.As(err, &ue) || ue.Class != "package_manager" || ue.Kind != "network_dns" || ue.Detail == "" {
 		t.Errorf("dns: %+v", err)
 	}
@@ -122,3 +122,28 @@ func (nopRep) Progress(cur, total int64, unit string) {}
 func (nopRep) Line(s string)                          {}
 func (nopRep) Detail(s string)                        {}
 func (nopRep) Label(s string)                         {}
+
+func TestSpaceNeed(t *testing.T) {
+	deb, _ := conf.LoadDistro("debian")
+	xfce, _ := conf.ResolveDesktop("xfce")
+	kde, _ := conf.ResolveDesktop("kde")
+	none, _ := conf.ResolveDesktop("none")
+	if n := spaceNeed(deb, xfce, false); n != int64(float64(deb.XFCEMB())*1.2) {
+		t.Errorf("debian xfce: %d", n)
+	}
+	if k, x := spaceNeed(deb, kde, false), spaceNeed(deb, xfce, false); k <= x {
+		t.Errorf("kde %d not above xfce %d", k, x)
+	}
+	if r, f := spaceNeed(deb, xfce, true), spaceNeed(deb, xfce, false); r >= f {
+		t.Errorf("a resume (%d) needs less than a fresh install (%d)", r, f)
+	}
+	if n := spaceNeed(deb, none, false); n <= 0 || n >= spaceNeed(deb, xfce, false) {
+		t.Errorf("none: %d", n)
+	}
+	for _, id := range conf.DistroIDs() {
+		d, _ := conf.LoadDistro(id)
+		if d.XFCEMB() == 0 {
+			t.Errorf("%s: no DISTRO_XFCE_MB", id)
+		}
+	}
+}

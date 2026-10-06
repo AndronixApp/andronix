@@ -34,6 +34,13 @@ func LookPath(file string) (string, error) {
 			return p, nil
 		}
 	}
+	// Termux's own bin, when PATH lost it (a shell started another way):
+	// proot was installed but "missing".
+	if pre := Prefix(); pre != "" {
+		if p := filepath.Join(pre, "bin", file); executable(p) {
+			return p, nil
+		}
+	}
 	return "", &exec.Error{Name: file, Err: exec.ErrNotFound}
 }
 

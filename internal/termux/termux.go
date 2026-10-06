@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/AndronixApp/andronix-distros/internal/pkgmgr"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
 )
 
@@ -56,10 +57,13 @@ func LogFile() string { return logPath() }
 // pkgInstall installs Termux packages with apt-get (not pkg: pkg runs
 // curl first, which can't start on a half-upgraded Termux), sending each
 // output line to onLine. It refreshes the lists first (x11-repo adds a
-// source), installs non-interactively keeping user-edited conffiles, and
-// if that fails runs one apt-get full-upgrade, as pkg itself advises for
-// a Termux whose packages were upgraded only in part (a new libcurl on an
-// old OpenSSL), then tries again.
+// source) and installs non-interactively, keeping user-edited conffiles.
+// A failure is diagnosed (pkgmgr.Diagnose) and recovered as for distros:
+// dpkg --configure -a, a pause for a lock, refetched lists, a pause and
+// then the next Termux mirror for network errors, and one apt-get
+// full-upgrade for anything else (as pkg advises for a half-upgraded
+// Termux: a new libcurl on an old OpenSSL). The error is a
+// *pkgmgr.Failure, for the message and telemetry.
 func pkgInstall(ctx context.Context, onLine func(string), pkgs ...string) error {
 	if _, err := sys.LookPath("apt-get"); err != nil {
 		return fmt.Errorf("apt-get not found")
@@ -75,16 +79,114 @@ func pkgInstall(ctx context.Context, onLine func(string), pkgs ...string) error 
 	defer cancel()
 	keep := []string{"-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"}
 	install := append(append([]string{"-y"}, keep...), append([]string{"install"}, pkgs...)...)
-	termuxRun(ctx, onLine, "apt-get", "update") // stale lists still let install try
-	if _, err = termuxRun(ctx, onLine, "apt-get", install...); err == nil {
-		return nil
+	update := func() { termuxRun(ctx, onLine, "apt-get", "update") } // stale lists still let install try
+	update()
+	var f *pkgmgr.Failure
+	seen := map[pkgmgr.Kind]int{}
+	upgraded := false
+	for attempt := 1; attempt <= 5; attempt++ {
+		out, err := termuxRun(ctx, onLine, "apt-get", install...)
+		if err == nil {
+			return nil
+		}
+		f = pkgmgr.Diagnose(tailOf(out, 60), err)
+		seen[f.Kind]++
+		n := seen[f.Kind]
+		Logf("apt-get: install %s failed (attempt %d): %s: %s", strings.Join(pkgs, " "), attempt, f.Kind, f.Detail)
+		switch {
+		case f.Kind == pkgmgr.KindCancelled || f.Kind == pkgmgr.KindDiskFull:
+			return f
+		case f.Kind == pkgmgr.KindDpkg && n <= 2:
+			termuxRun(ctx, onLine, "dpkg", "--configure", "-a")
+		case f.Kind == pkgmgr.KindLock && n <= 2:
+			time.Sleep(10 * time.Second)
+		case f.Kind.Network():
+			if n == 1 {
+				time.Sleep(5 * time.Second)
+			} else if nextMirror() {
+				update()
+			} else if n <= 3 {
+				time.Sleep(time.Duration(n*10) * time.Second)
+			} else {
+				return f
+			}
+		case (f.Kind == pkgmgr.KindHash || f.Kind == pkgmgr.KindHTTP404) && n <= 2:
+			termuxRun(ctx, onLine, "apt-get", "clean")
+			if n == 2 {
+				nextMirror()
+			}
+			update()
+		case (f.Kind == pkgmgr.KindGPG || f.Kind == pkgmgr.KindClock) && n == 1 && nextMirror():
+			update()
+		case !upgraded:
+			upgraded = true
+			Logf("apt-get: upgrading Termux's packages (apt-get full-upgrade), then retrying")
+			if _, err := termuxRun(ctx, onLine, "apt-get", append(append([]string{"-y"}, keep...), "full-upgrade")...); err != nil {
+				Logf("apt-get: full-upgrade: %v", err)
+			}
+		default:
+			return f
+		}
 	}
-	Logf("apt-get: install failed; upgrading Termux's packages (apt-get full-upgrade), then retrying")
-	if _, err := termuxRun(ctx, onLine, "apt-get", append(append([]string{"-y"}, keep...), "full-upgrade")...); err != nil {
-		return err
+	return f
+}
+
+func tailOf(s string, n int) []string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
 	}
-	_, err = termuxRun(ctx, onLine, "apt-get", install...)
-	return err
+	return lines
+}
+
+// termuxMirrors are Termux's main and x11 repositories on mirrors that
+// answered in Oct 2026, in the order to try.
+var termuxMirrors = [][2]string{
+	{"https://packages-cf.termux.dev/apt/termux-main", "https://packages-cf.termux.dev/apt/termux-x11"},
+	{"https://packages.termux.dev/apt/termux-main", "https://packages.termux.dev/apt/termux-x11"},
+	{"https://grimler.se/termux/termux-main", "https://grimler.se/termux/termux-x11"},
+	{"https://mirror.accum.se/mirror/termux.dev/apt/termux-main", "https://mirror.accum.se/mirror/termux.dev/apt/termux-x11"},
+	{"https://mirror.mwt.me/termux/main", "https://mirror.mwt.me/termux/x11"},
+	{"https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main", "https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-x11"},
+}
+
+var mirrorsTried = map[string]bool{}
+
+// nextMirror points Termux's sources at the next mirror not tried yet (as
+// termux-change-repo would), for the current repositories only: Android
+// 5 and 6 Termux has its own frozen ones.
+func nextMirror() bool {
+	list := filepath.Join(sys.Prefix(), "etc/apt/sources.list")
+	b, err := os.ReadFile(list)
+	if err != nil {
+		return false
+	}
+	cur := ""
+	for _, l := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(l); len(f) >= 3 && f[0] == "deb" && f[2] == "stable" {
+			cur = strings.TrimSuffix(f[1], "/")
+		}
+	}
+	if cur == "" || !(strings.Contains(cur, "termux-main") || strings.HasSuffix(cur, "/termux/main")) {
+		return false
+	}
+	mirrorsTried[cur] = true
+	for _, m := range termuxMirrors {
+		if mirrorsTried[m[0]] {
+			continue
+		}
+		mirrorsTried[m[0]] = true
+		if os.WriteFile(list, []byte("# Andronix switched mirrors after "+cur+" failed\ndeb "+m[0]+" stable main\n"), 0o644) != nil {
+			return false
+		}
+		x11 := filepath.Join(sys.Prefix(), "etc/apt/sources.list.d/x11.list")
+		if _, err := os.Stat(x11); err == nil {
+			os.WriteFile(x11, []byte("deb "+m[1]+" x11 main\n"), 0o644)
+		}
+		Logf("apt-get: switched Termux's package mirror from %s to %s", cur, m[0])
+		return true
+	}
+	return false
 }
 
 // Install is pkgInstall for other packages (the installer's proot).

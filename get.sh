@@ -53,7 +53,11 @@ fetch() { # fetch URL FILE: curl, else wget
     wget_works && wget -q -T 20 -t 4 -O "$2" "$1"
 }
 
-if [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ]; then bin="$PREFIX/bin"; else bin="$HOME/.local/bin"; fi
+# Termux's bin, also when PREFIX got lost (a shell started another way);
+# elsewhere ~/.local/bin.
+if [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ]; then bin="$PREFIX/bin"
+elif [ -d /data/data/com.termux/files/usr/bin ] && [ -w /data/data/com.termux/files/usr/bin ]; then bin=/data/data/com.termux/files/usr/bin
+else bin="$HOME/.local/bin"; fi
 mkdir -p "$bin" || fail "Can't write to $bin" "Check that Termux has storage space left."
 dst="$bin/andronix"
 
@@ -99,7 +103,22 @@ else
     fi
     rm -f "$dst.sums"
 fi
-chmod 755 "$dst.new" && mv -f "$dst.new" "$dst"
+# Never silently: a failed install here showed up later as "andronix:
+# command not found".
+# Checked before it replaces anything: a working andronix stays if the new
+# one doesn't start.
+chmod 755 "$dst.new" ||
+    fail "Couldn't install andronix to $bin" "Check that Termux has storage space left, then run the same command again."
+if ! "$dst.new" version >/dev/null 2>&1; then
+    rm -f "$dst.new"
+    fail "The downloaded andronix doesn't start" "Update Termux's packages (pkg upgrade -y), then run the same command again. If it still fails, tell us your phone model on Discord."
+fi
+mv -f "$dst.new" "$dst" ||
+    fail "Couldn't install andronix to $bin" "Check that Termux has storage space left, then run the same command again."
+case ":$PATH:" in
+    *":$bin:"*) ;;
+    *) say "andronix is in $bin, which isn't on your PATH. Run it as $dst, or add it for next time: echo 'export PATH=\"$bin:\$PATH\"' >> ~/.profile" ;;
+esac
 # The phase-1 bash prototype lived in $PREFIX/share/andronix; the binary
 # doesn't use it, so drop it to avoid confusion.
 [ -n "${PREFIX:-}" ] && [ -f "$PREFIX/share/andronix/lib/ui.sh" ] && rm -rf "$PREFIX/share/andronix"

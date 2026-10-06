@@ -2,6 +2,23 @@
 
 Changes to the `andronix` installer and the free distro images it installs. The app, the website and the docs have their own release notes. See https://docs.andronix.app for how to use the installer.
 
+## 2.0.4 (2026-10-06)
+
+### Installs that get through
+
+- **Termux's own packages are repaired like the distro's.** When installing proot or Termux:X11 fails, the installer finishes an interrupted dpkg, waits for a locked package manager, fetches fresh package lists, and for network errors pauses and moves to the next verified Termux mirror. The message says which kind of problem it was.
+- **The space check asks for what an install really needs.** The numbers come from measuring each distro with XFCE, Firefox and video codecs. The old ones were 40–70% too high: Debian XFCE asked for 2070 MB and uses 1213. A resumed install needs no space for the image, and the message says how much to free.
+- **`andronix: command not found` after installing explains itself.** get.sh stops with a clear message when installing the `andronix` binary fails or it doesn't start, finds Termux's `bin` folder even without `$PREFIX`, and says when that folder isn't on `PATH`.
+
+### Black screens
+
+- **`--legacy-drawing` and `--force-bgra` are remembered.** If one of them fixed a black Termux:X11 screen, `andronix desktop` uses it on every start. `--x11-default` forgets them. `andronix doctor` shows the saved options and the Termux:X11 versions.
+- **Typing `andronix desktop` inside a distro** says where to type it instead of failing.
+
+### Telemetry
+
+- With telemetry on, events also say where the installer runs (Termux, a distro, Linux) and the Termux version, so problems can be told apart by setup. Nothing personal is added.
+
 ## 2.0.3 (2026-10-05)
 
 ### Installs that get through

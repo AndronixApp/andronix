@@ -14,6 +14,7 @@ import (
 	"github.com/AndronixApp/andronix-distros/internal/rootfs"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
 	"github.com/AndronixApp/andronix-distros/internal/telemetry"
+	"github.com/AndronixApp/andronix-distros/internal/termux"
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
 
@@ -204,6 +205,13 @@ func Doctor(ctx context.Context, name string) error {
 	ui.Row("Termux", strings.TrimSpace(p.Termux+" "+p.TermuxV), 10)
 	ui.Row("RAM", fmt.Sprintf("%d MB (free space %d MB)", p.RAMMB, p.FreeMB), 10)
 	ui.Row("Phantom", "process killer "+p.Phantom, 10)
+	if sys.IsTermux() {
+		x11 := "default options"
+		if a := termux.X11SavedArgs(); len(a) > 0 {
+			x11 = strings.Join(a, " ") + " (remembered; andronix desktop --x11-default clears it)"
+		}
+		ui.Row("Termux:X11", x11+"; "+termux.X11Versions(), 10)
+	}
 	ui.Section("Syscalls under proot")
 	if len(p.Syscalls) == 0 {
 		ui.Note("Not measured: install a distro first (the probe runs inside one).")

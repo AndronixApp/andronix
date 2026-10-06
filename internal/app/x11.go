@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
 	"github.com/AndronixApp/andronix-distros/internal/rootfs"
+	"github.com/AndronixApp/andronix-distros/internal/telemetry"
 	"github.com/AndronixApp/andronix-distros/internal/termux"
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
@@ -84,10 +86,12 @@ func desktopDistro() (string, error) {
 // Desktop is `andronix desktop [distro]`: the desktop on Termux:X11. It
 // stays in the foreground until the desktop ends (log out, Ctrl-C, or
 // `andronix desktop stop` from another session).
-func Desktop(ctx context.Context, name string) error {
-	if os.Getenv("ANDRONIX_DISTRO") != "" {
-		return ui.Errorf("Run this in Termux", "andronix desktop starts Termux:X11, which lives in Termux, not inside a distro.",
-			"Type exit, then run: andronix desktop "+os.Getenv("ANDRONIX_DISTRO"))
+//
+// x11 changes the remembered Termux:X11 options first (DesktopX11).
+func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
+	if d := os.Getenv("ANDRONIX_DISTRO"); d != "" {
+		insideDistroNote(d, "andronix desktop "+d)
+		return nil
 	}
 	if name == "" {
 		var err error
@@ -100,6 +104,31 @@ func Desktop(ctx context.Context, name string) error {
 		return err
 	}
 	desktopNote()
+	if x11.Default || x11.Legacy || x11.BGRA {
+		var args []string
+		if !x11.Default {
+			args = termux.X11SavedArgs()
+			for _, a := range []struct {
+				on   bool
+				flag string
+			}{{x11.Legacy, "-legacy-drawing"}, {x11.BGRA, "-force-bgra"}} {
+				if a.on && !slices.Contains(args, a.flag) {
+					args = append(args, a.flag)
+				}
+			}
+		}
+		if err := termux.SaveX11Args(args); err != nil {
+			return err
+		}
+		if len(args) > 0 {
+			ui.Note("Termux:X11 starts with " + strings.Join(args, " ") + " from now on (andronix desktop --x11-default goes back).")
+		} else {
+			ui.Note("Termux:X11 starts with its default options again.")
+		}
+		if run, ok := readX11State(); ok && run.StartedServer {
+			ui.Note("The running desktop keeps its options; stop it first for them to apply: andronix desktop stop")
+		}
+	}
 	in := Open(d)
 	if !in.Installed() {
 		return ui.Errorf(d.Label()+" isn't installed", "There's no desktop to show yet.", "Install it first: andronix install "+d.ID+" --de xfce")
@@ -167,8 +196,7 @@ func Desktop(ctx context.Context, name string) error {
 				return ui.Skip("already installed")
 			}
 			if err := termux.InstallX11Server(ctx, r.Line); err != nil {
-				return ui.Errorf("Couldn't install Termux:X11", err.Error(),
-					"Check your internet, then run: pkg install x11-repo && pkg install "+termux.X11Package)
+				return termuxPkgErr("Couldn't install Termux:X11", "pkg install x11-repo && pkg install "+termux.X11Package, err)
 			}
 			return nil
 		}},
@@ -229,6 +257,11 @@ func Desktop(ctx context.Context, name string) error {
 	}
 	fmt.Println()
 	fmt.Print(ui.Box(ui.BoxOK, "Desktop is running", lines...))
+	saved := termux.X11SavedArgs()
+	if len(saved) == 0 {
+		ui.Note("Only a black screen with a cursor? Run: andronix desktop stop, then andronix desktop " + d.ID + " --legacy-drawing (Andronix remembers it).")
+	}
+	telemetry.Send("start", map[string]any{"distro": d.ID, "de": de.ID, "x11_args": termux.X11ArgsLabel(saved)})
 	if n := termux.PhantomNote(); n != "" {
 		ui.Note(n)
 	}
@@ -266,6 +299,27 @@ func Desktop(ctx context.Context, name string) error {
 	ui.OK("The " + d.Label() + " desktop has stopped.")
 	fmt.Println()
 	return nil
+}
+
+// DesktopX11 are andronix desktop's Termux:X11 options.
+type DesktopX11 struct {
+	Legacy, BGRA bool // --legacy-drawing, --force-bgra: add and remember
+	Default      bool // --x11-default: forget them
+}
+
+// insideDistroNote answers a Termux-only command typed inside a distro:
+// not an error (people filed it as one), just where to type it.
+func insideDistroNote(distro, cmd string) {
+	name := distro
+	if d, err := conf.ResolveDistro(distro); err == nil {
+		name = d.Label()
+	}
+	fmt.Println()
+	fmt.Print(ui.Box(ui.BoxBrand, "You're inside "+name,
+		"The desktop opens from Termux, outside "+name+". Two steps:", "",
+		"1. Type exit (this leaves "+name+").",
+		"2. Then run: "+cmd))
+	fmt.Println()
 }
 
 // stopOurServer stops termux-x11 if this run started it; a server the
@@ -314,6 +368,10 @@ func tracees(tracer int) []int {
 // DesktopStop is `andronix desktop stop`: ends the Termux:X11 desktop and
 // its server from any Termux session.
 func DesktopStop() error {
+	if d := os.Getenv("ANDRONIX_DISTRO"); d != "" {
+		insideDistroNote(d, "andronix desktop stop")
+		return nil
+	}
 	run, ok := readX11State()
 	os.Remove(x11State())
 	stopped := false

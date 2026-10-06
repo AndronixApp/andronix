@@ -98,6 +98,54 @@ func X11AppInstalled() (installed, known bool) {
 	return false, true
 }
 
+// X11 options a user picked for a black screen (-legacy-drawing) or
+// swapped colours (-force-bgra), remembered in ~/.andronix/x11.args.
+var x11Options = map[string]bool{"-legacy-drawing": true, "-force-bgra": true}
+
+func x11ArgsFile() string { return filepath.Join(filepath.Dir(filepath.Dir(logPath())), "x11.args") }
+
+// X11SavedArgs are the remembered Termux:X11 options.
+func X11SavedArgs() []string {
+	b, _ := os.ReadFile(x11ArgsFile())
+	var out []string
+	for _, a := range strings.Fields(string(b)) {
+		if x11Options[a] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// SaveX11Args remembers options (nil forgets them).
+func SaveX11Args(args []string) error {
+	if len(args) == 0 {
+		err := os.Remove(x11ArgsFile())
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return os.WriteFile(x11ArgsFile(), []byte(strings.Join(args, " ")+"\n"), 0o644)
+}
+
+// X11ArgsLabel names the options for telemetry: none, legacy, bgra, both.
+func X11ArgsLabel(args []string) string {
+	l, b := false, false
+	for _, a := range args {
+		l = l || a == "-legacy-drawing"
+		b = b || a == "-force-bgra"
+	}
+	switch {
+	case l && b:
+		return "both"
+	case l:
+		return "legacy"
+	case b:
+		return "bgra"
+	}
+	return "none"
+}
+
 // StartX11 starts `termux-x11 :n -ac` detached, logging to logf, and
 // waits for its socket. Extra server options come from ANDRONIX_X11_ARGS
 // (e.g. -legacy-drawing for a black screen, -force-bgra for swapped
@@ -107,7 +155,8 @@ func StartX11(n int, logf string) (int, error) {
 	// A stale socket from a killed server would make the new one fail.
 	os.Remove(X11Socket(n))
 	os.Remove(filepath.Join(filepath.Dir(X11SocketDir()), fmt.Sprintf(".X%d-lock", n)))
-	args := append([]string{fmt.Sprintf(":%d", n), "-ac"}, strings.Fields(os.Getenv("ANDRONIX_X11_ARGS"))...)
+	args := append([]string{fmt.Sprintf(":%d", n), "-ac"}, X11SavedArgs()...)
+	args = append(args, strings.Fields(os.Getenv("ANDRONIX_X11_ARGS"))...)
 	lg, err := os.Create(logf)
 	if err != nil {
 		return 0, err
@@ -332,4 +381,24 @@ func Alive(pid int) bool {
 		return s[i+2] != 'Z'
 	}
 	return true
+}
+
+// X11Versions describes the Termux:X11 package and app for doctor (the
+// package and the app out of step is another cause of a black screen).
+func X11Versions() string {
+	pkg := "package not installed"
+	if out, err := sys.Command("dpkg-query", "-W", "-f", "${Version}", X11Package).Output(); err == nil && len(out) > 0 {
+		pkg = X11Package + " " + strings.TrimSpace(string(out))
+	}
+	app := "app not installed"
+	if out, err := sys.Command("pm", "list", "packages", "--show-versioncode", X11App).Output(); err == nil {
+		for _, l := range strings.Split(string(out), "\n") {
+			if f := strings.Fields(l); len(f) >= 2 && f[0] == "package:"+X11App {
+				app = "app versionCode " + strings.TrimPrefix(f[1], "versionCode:")
+			}
+		}
+	} else {
+		app = "app version unknown"
+	}
+	return pkg + ", " + app
 }

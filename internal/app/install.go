@@ -295,9 +295,7 @@ func install(ctx context.Context, o InstallOpts) error {
 	if _, err := sys.LookPath("proot"); err != nil && sys.IsTermux() {
 		steps = append(steps, ui.Step{Label: "Installing proot", Run: func(ctx context.Context, r ui.Reporter) error {
 			if err := termux.Install(ctx, r.Line, "proot"); err != nil {
-				return &ui.UserError{Title: "Couldn't install proot", Class: "termux_pkg",
-					What: "Termux's package manager stopped with an error.",
-					Fix:  "Update Termux's packages and install it, then run the same command again: pkg upgrade -y && pkg install proot -y", Err: err}
+				return termuxPkgErr("Couldn't install proot", "pkg upgrade -y && pkg install proot -y", err)
 			}
 			return nil
 		}})
@@ -305,7 +303,13 @@ func install(ctx context.Context, o InstallOpts) error {
 	steps = append(steps, []ui.Step{
 		{Label: "Checking your phone", Run: func(ctx context.Context, r ui.Reporter) error {
 			if _, err := sys.LookPath("proot"); err != nil {
-				return ui.Errorf("proot is missing", "Andronix needs proot to run Linux inside Termux.", "Install it, then run the same command again: pkg install proot -y")
+				if !sys.IsTermux() {
+					return &ui.UserError{Title: "proot is missing", Class: "proot_is_missing",
+						What: "This doesn't look like a normal Termux session ($PREFIX isn't set), so Andronix can't install proot itself.",
+						Fix:  "Open the Termux app, then run the same command there."}
+				}
+				return &ui.UserError{Title: "proot is missing", Class: "proot_is_missing", What: "Andronix needs proot to run Linux inside Termux.",
+					Fix: "Install it, then run the same command again: pkg install proot -y"}
 			}
 			if d.MaxKernel != "" && kernelNewer(sys.KernelRelease(), d.MaxKernel) {
 				return ui.Errorf(d.Label()+" can't run on this phone yet",
@@ -316,15 +320,13 @@ func install(ctx context.Context, o InstallOpts) error {
 				return ui.Errorf(d.Label()+" isn't available here", d.Label()+" has no build for "+arch.Label()+" phones.",
 					"Pick another distro in the Andronix app, e.g. Debian.")
 			}
-			need := int64(de.DiskMB + 300)
-			if !haveRootfs {
-				need += int64(d.DownloadMB*2 + d.DiskMB)
-			}
+			need := spaceNeed(d, de, haveRootfs)
 			free := sys.FreeMB(sys.Home())
 			lg.Printf("free=%dMB need=%dMB", free, need)
 			if free >= 0 && free < need {
-				return ui.Errorf("Not enough space", fmt.Sprintf("Your phone has %d MB free; %s with %s needs about %d MB.", free, d.Label(), deLabel, need),
-					"Free up some space (old videos, app caches), then run the same command again.")
+				return &ui.UserError{Title: "Not enough space", Class: "not_enough_space",
+					What: fmt.Sprintf("Your phone has %d MB free; %s with %s needs about %d MB (with some to spare).", free, d.Label(), deLabel, need),
+					Fix:  fmt.Sprintf("Free up about %d MB (old videos, app caches), then run the same command again.", need-free)}
 			}
 			if de.MinRAMMB > 0 {
 				if ram := sys.TotalRAMMB(); ram > 0 && ram < int64(de.MinRAMMB) {
@@ -985,33 +987,83 @@ func downloadErr(err error) error {
 		Fix: "Check your internet connection, then run the same command again. It resumes where it stopped.", Err: err}
 }
 
+// termuxPkgErr explains a failed Termux package install (proot, the
+// X server) by what went wrong; manual is the command to do it by hand.
+func termuxPkgErr(title, manual string, err error) error {
+	e := &ui.UserError{Title: title, Class: "termux_pkg", What: "Termux's package manager stopped with an error.",
+		Fix: "Update Termux's packages, then run the same command again: " + manual, Err: err}
+	var f *pkgmgr.Failure
+	if !errors.As(err, &f) {
+		return e
+	}
+	e.Kind, e.Detail = string(f.Kind), f.Detail
+	if f.Detail != "" {
+		e.What = "Termux's package manager stopped: " + f.Detail
+	}
+	switch {
+	case f.Kind == pkgmgr.KindCancelled:
+		return ui.ErrCancelled
+	case f.Kind == pkgmgr.KindDiskFull:
+		e.Class, e.Title = "not_enough_space", "Your phone ran out of space"
+		e.Fix = "Free up some space, then run the same command again."
+	case f.Kind.Network():
+		e.What = "Termux's package servers didn't answer, on any mirror we tried (" + f.Detail + ")."
+		e.Fix = "Check your internet (switch between Wi-Fi and mobile data, or turn a VPN off), then run the same command again. Or pick a mirror yourself: termux-change-repo"
+	case f.Kind == pkgmgr.KindClock || f.Kind == pkgmgr.KindGPG:
+		e.Fix = "Make sure the phone's date and time are set automatically, then run: " + manual
+	}
+	return e
+}
+
+// spaceNeed is the free space (MB) an install needs: the download and the
+// unpacked image, plus the desktop's packages, plus 20%. The desktop part
+// comes from DISTRO_XFCE_MB (measured with XFCE) scaled by the desktop's
+// size against XFCE's; distros not measured use the older estimate.
+func spaceNeed(d *conf.Distro, de *conf.Desktop, haveRootfs bool) int64 {
+	base := d.DownloadMB*2 + d.DiskMB
+	if haveRootfs {
+		base = 0
+	}
+	if x := d.XFCEMB(); x > 0 && !de.None() {
+		desk := x - (d.DownloadMB*2 + d.DiskMB)
+		if xfce, err := conf.ResolveDesktop("xfce"); err == nil && xfce.DiskMB > 0 && de.DiskMB > 0 {
+			desk = desk * de.DiskMB / xfce.DiskMB
+		}
+		return int64(float64(base+desk) * 1.2)
+	}
+	if de.None() {
+		return int64(float64(base+100) * 1.2)
+	}
+	return int64(base + de.DiskMB + 300)
+}
+
 func pkgErr(title string, err error) error {
 	if errors.Is(err, context.Canceled) {
 		return ui.ErrCancelled
 	}
 	e := &ui.UserError{Title: title, What: "The package manager stopped with an error.", Class: "package_manager",
 		Fix: "Run the same command again; downloads resume. If Android closed Termux (signal 9), see docs.andronix.app on the phantom process killer.", Err: err}
-	var f *pkgFailure
+	var f *pkgmgr.Failure
 	if !errors.As(err, &f) {
 		return e
 	}
-	e.Kind, e.Detail = string(f.kind), f.detail
-	if f.detail != "" {
-		e.What = "The package manager stopped: " + f.detail
+	e.Kind, e.Detail = string(f.Kind), f.Detail
+	if f.Detail != "" {
+		e.What = "The package manager stopped: " + f.Detail
 	}
 	switch {
-	case f.kind == kindCancelled:
+	case f.Kind == pkgmgr.KindCancelled:
 		return ui.ErrCancelled
-	case f.kind == kindDiskFull:
+	case f.Kind == pkgmgr.KindDiskFull:
 		e.Class = "not_enough_space"
-		e.Title, e.What = "Your phone ran out of space", "The package manager couldn't write any more files ("+f.detail+")."
+		e.Title, e.What = "Your phone ran out of space", "The package manager couldn't write any more files ("+f.Detail+")."
 		e.Fix = "Free up some space (photos, videos, apps you don't use), then run the same command again. It goes on where it stopped."
-	case f.kind.network():
-		e.What = "The package servers didn't answer, on any mirror we tried (" + f.detail + ")."
+	case f.Kind.Network():
+		e.What = "The package servers didn't answer, on any mirror we tried (" + f.Detail + ")."
 		e.Fix = "Check your internet (switch between Wi-Fi and mobile data, or turn a VPN off), then run the same command again. It goes on where it stopped."
-	case f.kind == kindClock || f.kind == kindGPG:
+	case f.Kind == pkgmgr.KindClock || f.Kind == pkgmgr.KindGPG:
 		e.Fix = "Make sure the phone's date and time are set automatically (Settings, Date and time), then run the same command again."
-	case f.kind == kindKilled:
+	case f.Kind == pkgmgr.KindKilled:
 		e.Fix = "Android stopped the install (signal 9). Keep Termux open in front while it runs, and see docs.andronix.app on the phantom process killer; then run the same command again."
 	}
 	return e
