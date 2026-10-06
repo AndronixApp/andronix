@@ -2,6 +2,22 @@
 
 Changes to the `andronix` installer and the free distro images it installs. The app, the website and the docs have their own release notes. See https://docs.andronix.app for how to use the installer.
 
+## 2.0.6 (2026-10-07)
+
+### Installs that get through
+
+- **The Andronix server moves to api.andronix.app.** get.sh and the installer (finding the download, the beta channel, Modded downloads, reports, telemetry) use api.andronix.app first and fall back to the old products.andronix.xyz only when it can't be reached.
+
+- **A package-signing key problem is named as such.** On some phones Arch's key tool (gpg-agent) won't start under proot, so the first package refresh can't make the keyring. The installer now clears the half-made keyring and tries once more, and if it still fails it says so (instead of "Couldn't reach the package servers") and asks for a report. Other non-network failures while refreshing package lists no longer say the servers were unreachable.
+
+### Termux:X11
+
+- **A missing Termux:X11 app is named at the end of the install.** When a desktop install finishes and the Termux:X11 app isn't installed, a box says where to get it (termux-x11-universal-debug.apk from the nightly release) and links the docs page with pictures. `andronix desktop` shows the same box. When Android won't say whether the app is installed and Termux:X11 then doesn't start, the fix names the app first.
+
+### Telemetry
+
+- With telemetry on, a failed install or update caused by the distro's package manager also reports proot's version and whether Termux started andronix through Android's linker (Play Store Termux), to find why package lists fail on some Play Store Termux phones with older kernels.
+
 ## 2.0.5 (2026-10-06)
 
 ### Phones with older kernels

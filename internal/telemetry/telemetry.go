@@ -31,12 +31,14 @@ import (
 	"time"
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
+	"github.com/AndronixApp/andronix-distros/internal/netx"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
 
-// DefaultURL is products-api's events endpoint.
-const DefaultURL = "https://products.andronix.xyz/v1/events"
+// DefaultURL is products-api's events endpoint (its first address; Post
+// tries the others when that one can't be reached).
+const DefaultURL = "https://api.andronix.app/v1/events"
 
 var (
 	home, version string
@@ -173,10 +175,23 @@ func build(name string, props map[string]any) Event {
 
 // Post sends one event now, with a 2 s timeout (`andronix __telemetry`).
 func Post(body string) error {
-	url := os.Getenv("ANDRONIX_TELEMETRY_URL")
-	if url == "" {
-		url = DefaultURL
+	urls := []string{os.Getenv("ANDRONIX_TELEMETRY_URL")}
+	if urls[0] == "" {
+		urls = nil
+		for _, a := range netx.APIs() {
+			urls = append(urls, a+"/v1/events")
+		}
 	}
+	var err error
+	for _, url := range urls { // 2 s each; the next only if this one can't be reached
+		if err = postEvent(url, body); err == nil || !netx.Unreachable(context.Background(), err) {
+			return err
+		}
+	}
+	return err
+}
+
+func postEvent(url, body string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBufferString(body))

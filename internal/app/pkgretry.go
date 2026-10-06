@@ -29,6 +29,9 @@ type pkgOps struct {
 	cur     []int
 	sleep   func(time.Duration)
 	ready   bool // the sources were read (they exist once the rootfs is unpacked)
+	// keyringAgent: start gpg-agent ourselves inside each retried run
+	// (a keyring failure, support #119).
+	keyringAgent bool
 }
 
 // pkgAttempts caps the runs of one command (first try included).
@@ -85,11 +88,18 @@ func (p *pkgOps) do(ctx context.Context, cmd string, n int, r ui.Reporter, isUpd
 	seen := map[pkgmgr.Kind]int{}
 	for attempt := 1; attempt <= pkgAttempts; attempt++ {
 		var lines []string
-		err := pkgRunWatch(ctx, p.t, p.fam, cmd, n, r, func(l string) {
+		run := cmd
+		if p.keyringAgent {
+			run = keyringAgentWrap(cmd)
+		}
+		err := pkgRunWatch(ctx, p.t, p.fam, run, n, r, func(l string) {
 			if lines = append(lines, l); len(lines) > 60 {
 				lines = lines[1:]
 			}
 		})
+		if p.keyringAgent {
+			p.t.Run(ctx, "tail -n 20 "+keyringAgentLog+" 2>/dev/null", nil, func(l string) { p.lg.Printf("keyring agent: %s", l) })
+		}
 		if err == nil {
 			if attempt > 1 {
 				p.lg.Printf("package manager: worked on attempt %d", attempt)
@@ -220,6 +230,16 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 		p.lg.Printf("package manager: proot refused an option (%s); trying with only the essential ones", proot.Describe())
 		proot.Minimal = true
 		return true
+	case pkgmgr.KindKeyring:
+		// Once: a clean keyring with gpg-agent started by us, its own
+		// errors and socket paths logged, so a phone where it still won't
+		// start tells us why (support #119).
+		if n > 1 {
+			return false
+		}
+		p.t.Run(ctx, keyringReset, nil, func(l string) { p.lg.Printf("keyring: %s", l) })
+		p.keyringAgent = true
+		return true
 	case pkgmgr.KindGPG:
 		// A mirror in the middle of a sync, once.
 		if n > 1 || !p.nextMirror(r) {
@@ -230,6 +250,30 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 	}
 	// killed (Android stopped it) and anything else: once more.
 	return n == 1
+}
+
+// keyringReset clears a half-made pacman keyring (the retried Update
+// makes the keys again) and reports where gpg wants its sockets.
+const keyringReset = `G=/etc/pacman.d/gnupg
+gpgconf --homedir "$G" --kill all 2>/dev/null
+rm -rf "$G" && mkdir -p "$G" && chmod 700 "$G"
+echo "socketdir: $(gpgconf --homedir "$G" --list-dirs socketdir 2>&1)"`
+
+// keyringAgentLog is gpg-agent's own log for the retried runs.
+const keyringAgentLog = "/tmp/andronix-gpg-agent.log"
+
+// keyringAgentWrap runs cmd with a gpg-agent we started in the same proot
+// session (one started in another session is gone: proot ends them with
+// it). Its output goes to a file: a daemon holding our pipe would hang the
+// run. Its start is capped at 20 s (lead: a misbehaving agent must never
+// stall the install), and it's stopped at the end, so proot never waits
+// for it.
+func keyringAgentWrap(cmd string) string {
+	return `G=/etc/pacman.d/gnupg; mkdir -p "$G" && chmod 700 "$G"; : >` + keyringAgentLog + `; ` +
+		`T=; command -v timeout >/dev/null 2>&1 && T="timeout 20"; ` +
+		`$T gpg-agent --homedir "$G" --daemon --verbose --log-file ` + keyringAgentLog + ` </dev/null >/dev/null 2>&1; ` +
+		`echo "andronix: gpg-agent started: $?" >>` + keyringAgentLog + `; ` +
+		`{ ` + cmd + `; }; s=$?; gpgconf --homedir "$G" --kill gpg-agent 2>/dev/null; exit $s`
 }
 
 const aptFix = "DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -y -f install"

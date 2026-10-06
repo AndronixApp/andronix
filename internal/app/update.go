@@ -43,8 +43,10 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 	telemetry.Notice()
 	started, n := time.Now(), 0
 	defer func() {
-		telemetry.Send("update", map[string]any{"ok": err == nil, "distros": n, "self_only": o.SelfOnly,
-			"error_class": telemetry.ErrorClass(err), "duration_ms": time.Since(started).Milliseconds()})
+		props := map[string]any{"ok": err == nil, "distros": n, "self_only": o.SelfOnly,
+			"error_class": telemetry.ErrorClass(err), "duration_ms": time.Since(started).Milliseconds()}
+		addPMFailure(props)
+		telemetry.Send("update", props)
 	}()
 	fmt.Print(ui.Banner("Linux on Android " + ui.GSep + " " + VersionLabel()))
 	lg := NewLog("update")
@@ -113,7 +115,7 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 			ui.Step{Label: "Refreshing " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
 				rootfs.InstallSelf(in.Rootfs) // the in-distro helper matches this binary
 				if err := ops.update(ctx, r); err != nil {
-					return pkgErr("Couldn't reach the package servers", err)
+					return pkgErr(refreshTitle, err)
 				}
 				// Before the upgrade, also on installs made before it existed:
 				// the compat rules' scripts (from the cached probe), then the distro's.

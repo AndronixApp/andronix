@@ -222,7 +222,7 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 		}},
 	}
 	if err := ui.RunSteps(ctx, steps, lg); err != nil {
-		return x11Error(err, serverLog)
+		return x11Error(err, serverLog, d.ID)
 	}
 	termux.OpenX11App()
 	// After the app is open (see HideExtraKeysOnce); it can take a few
@@ -434,16 +434,16 @@ func DesktopStop() error {
 
 // x11Error explains a failed Termux:X11 start; the missing app gets a
 // branded box with the download link instead of an error.
-func x11Error(err error, serverLog string) error {
+func x11Error(err error, serverLog, distro string) error {
 	switch {
 	case errors.Is(err, termux.ErrX11AppMissing):
-		fmt.Println()
-		fmt.Print(ui.Box(ui.BoxBrand, "One more app: Termux:X11",
-			"Termux:X11 shows your Linux desktop as a normal Android app, faster than VNC. It's free and made by the Termux team.", "",
-			"1. Open "+termux.X11AppURL,
-			"2. Download termux-x11-universal-debug.apk and install it (allow installs from your browser if Android asks).",
-			"3. Come back to Termux and run the same command again."))
+		x11AppBox("Come back to Termux and run the same command again.")
 		ui.Footer()
+		// For andronix report (support #36 #98 #99): the box was shown,
+		// so main doesn't save it. Support counts these reports by this
+		// exact title: keep it unchanged.
+		SaveFailure("desktop", distro, &ui.UserError{Title: "The Termux:X11 app isn't installed", Class: "x11_app_missing", Kind: "x11_app_missing",
+			What: "andronix desktop needs the Termux:X11 app (" + termux.X11App + ")."})
 		return ErrExplained
 	case errors.Is(err, termux.ErrX11AppSignature):
 		return ui.Errorf("Termux:X11 doesn't match", "The Termux:X11 app and the termux-x11 package come from different builds.",
@@ -456,8 +456,24 @@ func x11Error(err error, serverLog string) error {
 	if errors.As(err, &ue) || errors.Is(err, ui.ErrCancelled) || errors.Is(err, context.Canceled) {
 		return err
 	}
-	return &ui.UserError{Title: "Termux:X11 didn't start", What: err.Error(),
-		Fix: "Run andronix desktop stop, then try again. For a black screen, try ANDRONIX_X11_ARGS=-legacy-drawing andronix desktop.", Log: serverLog}
+	fix := "Run andronix desktop stop, then try again. For a black screen, try ANDRONIX_X11_ARGS=-legacy-drawing andronix desktop."
+	if _, known := termux.X11AppInstalled(); !known {
+		// Android didn't say whether the app is there (pm refused or
+		// failed): the likeliest cause comes first.
+		fix = "If the Termux:X11 app isn't installed: get " + termux.X11AppAPK + " from " + termux.X11AppURL + " (help: " + termux.X11Docs + "). Otherwise: " + fix
+	}
+	return &ui.UserError{Title: "Termux:X11 didn't start", What: err.Error(), Fix: fix, Log: serverLog}
+}
+
+// x11AppBox is the box for a missing Termux:X11 app; last is its third step.
+func x11AppBox(last string) {
+	fmt.Println()
+	fmt.Print(ui.Box(ui.BoxBrand, "One more app: Termux:X11",
+		"Termux:X11 shows your Linux desktop as a normal Android app. It's free, made by the Termux team, and smoother than VNC.", "",
+		"1. Open "+termux.X11AppURL,
+		"2. Download "+termux.X11AppAPK+" and install it (allow installs from your browser if Android asks).",
+		"3. "+last, "",
+		"Help with pictures: "+termux.X11Docs))
 }
 
 func nameOr(s, def string) string {

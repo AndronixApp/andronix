@@ -49,6 +49,10 @@ func fixLinkerArgs(exe, self string, args []string) []string {
 	return args
 }
 
+// ViaLinker reports whether andronix was started through Android's
+// linker (Play Store Termux's W^X exec path), for telemetry.
+func ViaLinker() bool { return linkerPath != "" }
+
 // appData is where W^X applies (a variable for tests).
 var appData = "/data/"
 

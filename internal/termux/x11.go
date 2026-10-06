@@ -26,6 +26,12 @@ const X11App = "com.termux.x11"
 // "termux-x11-universal-debug.apk" from the nightly release).
 const X11AppURL = "https://github.com/termux/termux-x11/releases/tag/nightly"
 
+// X11AppAPK is the file to download there (every CPU, any Termux build).
+const X11AppAPK = "termux-x11-universal-debug.apk"
+
+// X11Docs is the docs page for getting Termux:X11 (steps with pictures).
+const X11Docs = "https://docs.andronix.app/desktop/termux-x11"
+
 // X11Package is the Termux package with the termux-x11 server (x11-repo).
 const X11Package = "termux-x11-nightly"
 

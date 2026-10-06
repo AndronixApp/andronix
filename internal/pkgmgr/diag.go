@@ -36,7 +36,10 @@ const (
 	KindIntercepted Kind = "network_intercepted"
 	// proot refused one of its options ("see proot --help").
 	KindProotArgs Kind = "proot_args"
-	KindOther     Kind = "other"
+	// pacman-key couldn't make the local keyring: gpg-agent didn't start
+	// under proot (support #119: Redmi Note 8 Pro, kernel 4.14).
+	KindKeyring Kind = "keyring"
+	KindOther   Kind = "other"
 )
 
 // Most specific first: a 404 or a hash mismatch also prints "Failed to
@@ -56,6 +59,7 @@ var patterns = []struct {
 	{KindHTTP5xx, regexp.MustCompile(`(?i)\b50[0-9]\s+(internal|bad gateway|service|gateway)|error 50[0-9]|http/[0-9.]+ 50[0-9]`)},
 	{KindDNS, regexp.MustCompile(`(?i)temporary failure resolving|could not resolve|name or service not known|unknown host|no address associated|resolving timed out`)},
 	{KindConnect, regexp.MustCompile(`(?i)could not connect|connection timed out|connection refused|connection failed|connection reset|network is unreachable|operation timed out|failed to connect|unable to connect|transfer failed|failed retrieving file|couldn't download|reposync|curl error|cannot download|errno 104|ssl connect error|tls handshake|certificate verify failed`)},
+	{KindKeyring, regexp.MustCompile(`(?i)gnupg agent unusable|agent_genkey failed|no agent running|no secret key available to sign with|can't connect to the gpg-agent`)},
 	{KindGPG, regexp.MustCompile(`(?i)no_pubkey|invalid signature|expkeysig|badsig|gpg error|public key is not available|signature .* is (unknown|invalid)|key is unknown`)},
 	// After GPG: "not signed" with a real key error is GPG; alone, the
 	// download wasn't the mirror's (a login page or a filter).

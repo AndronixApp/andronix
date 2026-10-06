@@ -71,3 +71,20 @@ func TestCompatEnvHookReentrant(t *testing.T) {
 		t.Fatal("compatEnv deadlocked")
 	}
 }
+
+// proot_version for telemetry: the version from --help's first line only.
+func TestVersion(t *testing.T) {
+	helpOnce.Do(func() {}) // don't run a real proot
+	defer func(h string) { helpText = h }(helpText)
+	for help, want := range map[string]string{
+		"proot 5.1.107.96: chroot, mount --bind, and binfmt_misc without privilege/setup.\n": "5.1.107.96",
+		"\nproot v5.1.107-96\nUsage:\n":         "5.1.107-96",
+		"Usage: proot [option] ... [command]\n": "",
+		"":                                      "",
+	} {
+		helpText = help
+		if got := Version(); got != want {
+			t.Errorf("%q: got %q, want %q", help, got, want)
+		}
+	}
+}

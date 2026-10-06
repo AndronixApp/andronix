@@ -23,3 +23,24 @@ func TestDiagnoseSupportKinds(t *testing.T) {
 		}
 	}
 }
+
+// Support #119 (Arch, kernel 4.14): gpg-agent never starts, so
+// pacman-key --init makes no master key. That's the keyring, not the
+// network and not a bad signature.
+func TestDiagnoseKeyring(t *testing.T) {
+	lines := []string{
+		"gpg: starting migration from earlier GnuPG versions",
+		"gpg: can't connect to the gpg-agent: IPC connect call failed",
+		"gpg: error: GnuPG agent unusable. Please check that a GnuPG agent can be started.",
+		"gpg: agent_genkey failed: No agent running",
+		"==> ERROR: There is no secret key available to sign with.",
+		"==> Use 'pacman-key --init' to generate a default secret key.",
+	}
+	if got := Diagnose(lines, errors.New("exit status 1")); got.Kind != KindKeyring {
+		t.Errorf("got %s (%q), want keyring", got.Kind, got.Detail)
+	}
+	// A real signature problem stays gpg.
+	if got := Diagnose([]string{"error: archlinuxarm: signature from \"X\" is invalid"}, errors.New("exit status 1")); got.Kind != KindGPG {
+		t.Errorf("bad signature: got %s", got.Kind)
+	}
+}

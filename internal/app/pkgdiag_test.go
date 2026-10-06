@@ -11,6 +11,7 @@ import (
 	"github.com/AndronixApp/andronix-distros/internal/conf"
 	"github.com/AndronixApp/andronix-distros/internal/pkgmgr"
 	"github.com/AndronixApp/andronix-distros/internal/proot"
+	"github.com/AndronixApp/andronix-distros/internal/sys"
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
 
@@ -145,5 +146,42 @@ func TestSpaceNeed(t *testing.T) {
 		if d.XFCEMB() == 0 {
 			t.Errorf("%s: no DISTRO_XFCE_MB", id)
 		}
+	}
+}
+
+// A refresh that fails for a non-network reason doesn't say the servers
+// were unreachable; the keyring case has its own message (support #119).
+func TestPkgErrRefreshTitles(t *testing.T) {
+	title := func(k pkgmgr.Kind) string {
+		var ue *ui.UserError
+		errors.As(pkgErr(refreshTitle, &pkgmgr.Failure{Kind: k, Detail: "x", Err: errors.New("exit status 1")}), &ue)
+		return ue.Title
+	}
+	if got := title(pkgmgr.KindDNS); got != "Couldn't reach the package servers" {
+		t.Errorf("dns: %q", got)
+	}
+	if got := title(pkgmgr.KindOther); got != refreshTitle {
+		t.Errorf("other: %q", got)
+	}
+	if got := title(pkgmgr.KindKeyring); got != "The package signing keys couldn't be set up" {
+		t.Errorf("keyring: %q", got)
+	}
+}
+
+// The keyring retry starts gpg-agent in the same run, never through a
+// pipe, and stops it at the end (support #119: a daemon on our pipe hung
+// the run; one started in another proot session was already gone).
+func TestKeyringAgentWrap(t *testing.T) {
+	w := keyringAgentWrap("pacman -Syy")
+	for _, want := range []string{`T="timeout 20"`, "$T gpg-agent --homedir", "--daemon", "</dev/null >/dev/null 2>&1", "{ pacman -Syy; }", "--kill gpg-agent", "exit $s"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("wrap lacks %q:\n%s", want, w)
+		}
+	}
+	if out, err := sys.Command("sh", "-n", "-c", w).CombinedOutput(); err != nil {
+		t.Errorf("not valid sh: %v %s", err, out)
+	}
+	if strings.Contains(keyringReset, "--daemon") {
+		t.Error("the reset must not start a daemon (its own proot session ends it, and it holds the pipe)")
 	}
 }

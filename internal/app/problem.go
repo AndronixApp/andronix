@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
+	"github.com/AndronixApp/andronix-distros/internal/netx"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
@@ -637,13 +638,19 @@ func newUUID() string {
 func postJSON(ctx context.Context, path string, body []byte, headers map[string]string, out any) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, API()+path, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "andronix/"+Version)
-	for k, v := range headers {
-		req.Header.Set(k, v)
+	var resp *http.Response
+	var err error
+	for _, api := range netx.APIs() { // the next address only if this one can't be reached
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, api+path, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "andronix/"+Version)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		if resp, err = http.DefaultClient.Do(req); !netx.Unreachable(ctx, err) {
+			break
+		}
 	}
-	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, ui.Errorf("Couldn't send the report", "No connection to the report service.", "Check your internet and run andronix report again; it won't be filed twice.")
 	}

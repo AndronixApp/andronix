@@ -56,9 +56,17 @@ func resolveQuery(ctx context.Context, item string, q url.Values) (*Resolved, er
 	if telemetry.Enabled() {
 		q.Set("t", "1")
 	}
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	b, _, err := netx.Get(ctx, API()+"/v1/installer/resolve?"+q.Encode(), nil)
+	// 3 s per address; the next one only when this one can't be reached.
+	var b []byte
+	var err error
+	for _, api := range netx.APIs() {
+		actx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		b, _, err = netx.Get(actx, api+"/v1/installer/resolve?"+q.Encode(), nil)
+		cancel()
+		if !netx.Unreachable(ctx, err) {
+			break
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

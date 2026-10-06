@@ -252,7 +252,7 @@ func PackAdd(ctx context.Context, args []string) error {
 	t, fam := pp.t, pp.fam
 	steps := []ui.Step{{Label: "Refreshing package lists", Run: func(ctx context.Context, r ui.Reporter) error {
 		if err := t.Run(ctx, fam.Update, nil, func(l string) { r.Line(l) }); err != nil {
-			return pkgErr("Couldn't reach the package servers", err)
+			return pkgErr(refreshTitle, err)
 		}
 		return nil
 	}}}

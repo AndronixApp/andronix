@@ -66,6 +66,7 @@ type source struct {
 	// sumURL is where a Modded download's sha256 comes from (the same
 	// token check, <file>.sha256).
 	sumURL string
+	api    string // the products-api address in url and sumURL (Modded)
 }
 
 // Install is `andronix install`. It tells the Andronix app how the
@@ -535,7 +536,7 @@ func install(ctx context.Context, o InstallOpts) error {
 		}},
 		{Label: "Refreshing package lists", Run: func(ctx context.Context, r ui.Reporter) error {
 			if err := ops.update(ctx, r); err != nil {
-				return pkgErr("Couldn't reach the package servers", err)
+				return pkgErr(refreshTitle, err)
 			}
 			if err := cr.preScripts(ctx, t, r); err != nil {
 				return err
@@ -818,13 +819,8 @@ func hasAny(root string, rels ...string) bool {
 	return false
 }
 
-// API is products-api, which signs Modded downloads.
-func API() string {
-	if a := os.Getenv("ANDRONIX_API"); a != "" {
-		return strings.TrimRight(a, "/")
-	}
-	return "https://products.andronix.xyz"
-}
+// API is products-api's first address (netx.APIs has the fallback).
+func API() string { return netx.APIs()[0] }
 
 // moddedSource turns the app's token into a products-api download:
 // GET <api>/v1/modded/download/<file>?k&e&h answers with a redirect to a
@@ -855,7 +851,7 @@ func moddedSource(d *conf.Distro, de *conf.Desktop, arch sys.Arch, p Paths, toke
 	// products-api as given (every field), with this CPU's file name.
 	q.Del("f")
 	base := API() + "/v1/modded/download/"
-	return source{kind: "modded", url: base + url.PathEscape(file) + "?" + q.Encode(),
+	return source{kind: "modded", api: API(), url: base + url.PathEscape(file) + "?" + q.Encode(),
 		sumURL: base + url.PathEscape(file+".sha256") + "?" + q.Encode(), file: filepath.Join(p.Cache, file)}, nil
 }
 
@@ -874,7 +870,20 @@ func tokenExpired(token string, now time.Time) bool {
 // token). Missing (404: products-api not serving it yet) means unchecked,
 // logged; anything malformed is an error, never a silent pass.
 func moddedChecksum(ctx context.Context, s *source, lg *Logger, warn func(string)) error {
-	b, _, err := netx.Get(ctx, s.sumURL, nil) // products-api answers 302 to the file
+	// products-api answers 302 to the file. Its first reachable address
+	// is the one the download then uses.
+	var b []byte
+	var err error
+	for _, api := range netx.APIs() {
+		sum := api + strings.TrimPrefix(s.sumURL, s.api)
+		if b, _, err = netx.Get(ctx, sum, nil); !netx.Unreachable(ctx, err) {
+			if api != s.api {
+				lg.Printf("modded: %s unreachable, using %s", s.api, api)
+				s.url, s.sumURL, s.api = api+strings.TrimPrefix(s.url, s.api), sum, api
+			}
+			break
+		}
+	}
 	var se *netx.StatusError
 	switch {
 	case errors.As(err, &se) && se.Code == 404:
@@ -1062,6 +1071,10 @@ func spaceNeed(d *conf.Distro, de *conf.Desktop, haveRootfs bool) int64 {
 	return int64(base + de.DiskMB + 300)
 }
 
+// refreshTitle is a failed package-list refresh; network failures get
+// "Couldn't reach the package servers" (pkgErr), others keep this.
+const refreshTitle = "The package lists couldn't be refreshed"
+
 func pkgErr(title string, err error) error {
 	if errors.Is(err, context.Canceled) {
 		return ui.ErrCancelled
@@ -1083,7 +1096,14 @@ func pkgErr(title string, err error) error {
 		e.Class = "not_enough_space"
 		e.Title, e.What = "Your phone ran out of space", "The package manager couldn't write any more files ("+f.Detail+")."
 		e.Fix = "Free up some space (photos, videos, apps you don't use), then run the same command again. It goes on where it stopped."
+	case f.Kind == pkgmgr.KindKeyring:
+		e.Title = "The package signing keys couldn't be set up"
+		e.What = "The key tool (gpg-agent) wouldn't start under proot on this phone (" + f.Detail + ")."
+		e.Fix = "Send a report so we can look: andronix report. Meanwhile, Debian, Ubuntu or Fedora usually install fine."
 	case f.Kind.Network():
+		if title == refreshTitle {
+			e.Title = "Couldn't reach the package servers"
+		}
 		e.What = "The package servers didn't answer, on any mirror we tried (" + f.Detail + ")."
 		e.Fix = "Check your internet (switch between Wi-Fi and mobile data, or turn a VPN off), then run the same command again. It goes on where it stopped."
 	case f.Kind == pkgmgr.KindClock || f.Kind == pkgmgr.KindGPG:
@@ -1139,7 +1159,8 @@ func finish(in *Inst, de *conf.Desktop, user string, noStart, userStopped bool, 
 	// The desktop is Termux:X11 (owner decision); VNC is the other way.
 	if !de.None() {
 		lines = append(lines, ui.KV("Desktop", "andronix desktop "+d.ID),
-			ui.KV("", "in Termux; it opens in the Termux:X11 app (github.com/termux/termux-x11, nightly: termux-x11-universal-debug.apk)"), "")
+			ui.KV("", "in Termux; it opens in the Termux:X11 app ("+termux.X11AppAPK+" from "+termux.X11AppURL+")"),
+			ui.KV("", "help: "+termux.X11Docs), "")
 	}
 	if start {
 		lines = append(lines, ui.KV("Terminal", "you're going into "+d.Name+"'s terminal now (type exit to leave)"),
@@ -1163,6 +1184,11 @@ func finish(in *Inst, de *conf.Desktop, user string, noStart, userStopped bool, 
 		title = d.Label() + " is installed" // the user isn't set up yet (said above)
 	}
 	fmt.Print(ui.Box(ui.BoxOK, title, lines...))
+	if !de.None() {
+		if installed, known := termux.X11AppInstalled(); known && !installed {
+			x11AppBox("Then, in Termux: andronix desktop " + d.ID)
+		}
+	}
 	ui.Footer()
 	rep.send("ok") // before the shell: Login replaces this process
 	if start {

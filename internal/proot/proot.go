@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -90,6 +91,19 @@ func Describe() string {
 		}
 	}
 	return "proot (no --help output)"
+}
+
+// reVersion is a proot version in its --help first line ("5.1.107.96",
+// "5.1.107-96").
+var reVersion = regexp.MustCompile(`(?:^|[^0-9.])(\d+\.\d+(?:\.\d+)*(?:-\d+)?)`)
+
+// Version is proot's version from its --help, or "" if there is none.
+func Version() string {
+	m := reVersion.FindStringSubmatch(Describe())
+	if m == nil || len(m[1]) > 32 {
+		return ""
+	}
+	return m[1]
 }
 
 // Args returns proot's argument list (without the command to run).

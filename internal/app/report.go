@@ -87,6 +87,7 @@ func (r *installReport) send(status string) {
 			}
 		}
 	}
+	addPMFailure(props)
 	telemetry.Send("install_result", props)
 	if id := os.Getenv("ANDRONIX_INSTALL_ID"); id != "" && !installIDRe.MatchString(id) {
 		termux.Logf("install result: ANDRONIX_INSTALL_ID %q isn't 16 hex digits; not sent", id)

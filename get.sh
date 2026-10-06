@@ -80,8 +80,19 @@ else
         { [ -n "${ANDRONIX_NO_TELEMETRY:-}" ] || [ "${DO_NOT_TRACK:-}" = 1 ] ||
             grep -qx ENABLED=no "${ANDRONIX_HOME:-$HOME/.andronix}/telemetry" 2>/dev/null; } && t=""
         q="item=bin&arch=$arch&flavor=$os&v=get.sh$t"
-        j=$( { curl_works && curl -fsS -m 3 "${ANDRONIX_API:-https://products.andronix.xyz}/v1/installer/resolve?$q"; } 2>/dev/null ||
-            { wget_works && wget -q -T 3 -t 1 -O - "${ANDRONIX_API:-https://products.andronix.xyz}/v1/installer/resolve?$q"; } 2>/dev/null) || j=""
+        # api.andronix.app first; products.andronix.xyz only if it can't be
+        # reached (curl 22 is an HTTP answer: no second try).
+        j=""
+        for api in $(printf %s "${ANDRONIX_API:-https://api.andronix.app https://products.andronix.xyz}" | tr , " "); do
+            if curl_works; then
+                j=$(curl -fsS -m 3 "$api/v1/installer/resolve?$q" 2>/dev/null) && break
+                [ $? = 22 ] && break
+            elif wget_works; then
+                j=$(wget -q -T 3 -t 1 -O - "$api/v1/installer/resolve?$q" 2>/dev/null) && break
+                [ $? = 8 ] && break # wget 8: the server answered with an error
+            fi
+            j=""
+        done
         rurl=$(printf '%s' "$j" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\(https:[^"]*\)".*/\1/p' | head -1)
         rsha=$(printf '%s' "$j" | sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' | head -1)
         if [ -n "$rurl" ] && [ -n "$rsha" ] && fetch "$rurl" "$dst.new" &&

@@ -41,6 +41,11 @@ func InsideDistro(cmd string, args []string) bool {
 	if !termuxOnly[cmd] {
 		return false
 	}
+	// The standalone display's own step inside the distro (DisplayHost
+	// runs "andronix display start" there): not a user typing it.
+	if cmd == "display" && len(args) > 1 && args[1] == "start" {
+		return false
+	}
 	d := guestDistro()
 	if d == "" {
 		return false
