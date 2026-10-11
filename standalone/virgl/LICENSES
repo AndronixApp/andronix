@@ -1,0 +1,34 @@
+Licences of what standalone/virgl builds into libvirgl.so (jniLibs/arm64-v8a)
+and of what the GPU feature uses. Shipped: MIT, plus the NDK's
+permissive runtime objects. No GPL code ships.
+
+Shipped in the APK (libvirgl.so, one static executable)
+- virglrenderer 1.3.0        MIT        https://gitlab.freedesktop.org/virgl/virglrenderer
+  (includes parts of Mesa's util and gallium aux code, MIT, as virglrenderer
+  vendors them under src/mesa and src/gallium)
+- libepoxy 1.5.10            MIT        https://github.com/anholt/libepoxy
+- libandronixpresent.so      MIT        ours (present_jni.c): the app's end of
+  the zero-copy present; links only Android system libraries
+- android.patch              MIT        ours, adapted from Termux's
+  virglrenderer-android recipe (termux-packages: patches carry the
+  package's licence, here MIT)
+- Android NDK r27c objects   bionic crtbegin/crtend (BSD-2-Clause, Apache-2.0)
+                             and compiler-rt builtins (Apache-2.0 WITH
+                             LLVM-exception), linked in by the toolchain
+  (libc, libm, libdl and libandroid are the phone's system libraries, not
+  shipped)
+
+Used in the guest, not shipped (comes from the distro's own packages)
+- Mesa (virpipe/virgl gallium driver; Zink)  MIT
+
+Not shipped, tests only
+- glmark2                    GPL-3.0    benchmark run inside the distro
+- mesa-utils (glxgears)      MIT-style  the installer's GPU check, when present
+
+Not used (for the record)
+- ANGLE (BSD-3-Clause), Venus, gl4es's S3TC code (MIT): left out of this build.
+- Turnip (Mesa, MIT): only if it measures faster than VirGL on Adreno; it
+  would be a separate KGSL build.
+
+The licence texts go into the app's open-source notices from
+cache/<out>/COPYING.virglrenderer and COPYING.libepoxy (build.sh output).

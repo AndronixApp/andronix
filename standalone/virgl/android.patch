@@ -1,0 +1,789 @@
+Android changes to virglrenderer 1.3.0 for the Andronix app (standalone mode).
+Adapted from Termux's virglrenderer-android recipe (MIT, like virglrenderer):
+- meson.build: Android has EGL without GBM; no memfd_create/timespec_get
+  detection (bionic has them only from API 30/29; we build for API 26);
+  clang's GNU-extension warnings off.
+- detect_os.h: an NDK build, not AOSP (Mesa's Android paths need
+  log/log.h and cutils).
+- vrend_winsys.c: EGL on the default display (pbuffer + GLES) on Android.
+- vrend_winsys_egl.c: on Android, GLES needs neither EGL_KHR_create_context
+  nor EGL_KHR_surfaceless_context; without the latter (EGL 1.4 drivers, the
+  emulator), contexts are made current on a 1x1 pbuffer; the config says
+  ES3 (vrend's contexts are GLES 3.x; EGL_BAD_MATCH otherwise).
+- vrend_renderer.c: no dual-source blending on Android (draws wrong on
+  Adreno: virglrenderer issue 223).
+- vtest_server.c: on Android, try the renderer once in a forked child
+  before listening, and exit if the phone's EGL/GLES can't run it (the app
+  then starts the desktop in software, not black).
+- vrend_renderer.c, fast readback (on by default; VTEST_FAST_READBACK=0
+  turns it off): every X11 window's frame is a B8G8R8[AX]8 readback, which
+  on GLES went through a fresh full-frame malloc, a CPU swizzle and a second
+  copy. It now reads straight into the guest's memory: BGRA where
+  GL_EXT_read_format_bgra exists, else RGBA swizzled in place; a flipped one
+  copies once from a kept buffer. A GL error on the first fast readback
+  turns it off for good and the frame is read the old way. Device Farm
+  (gpu3 scenes, 800x600): glmark2 +15% to +26% on Pixel 4a, Pixel 8, A15,
+  S24 Ultra; GPU now ahead of software on all four.
+- andronix_present.c (new), vrend_renderer.c, src/meson.build: zero-copy
+  present. When the app passes VTEST_PRESENT_SOCKET and
+  VTEST_PRESENT_SIZE_FILE (one "W H" line per window size it can show: the
+  full screen, and windows of a unique size that nothing covers), a
+  display-target readback of one of those sizes is a GPU blit into one of
+  three AHardwareBuffers the app shows at the window's place, with a native
+  fence where the driver has one (else glFinish); no readback, no Xvfb copy,
+  no upload. A size the app stops listing (a menu opened over the window)
+  goes back to the readback within 100 ms. The app replaces the list file
+  atomically (temporary file, then rename), so the server always reads a
+  whole list. Any failure
+  drops back to the readback; three failed connections in a row and that
+  client stays on the readback. Device Farm (full screen, glmark2 gpu3
+  scenes): +16% Pixel 4a, +47% Pixel 8, +19% A15, +38% S24 Ultra over the
+  fast readback. Protocol at the top of the file.
+- vtest_shm.c: memfd_create, else ASharedMemory_create (apps targeting
+  Android 10+ may not open /dev/ashmem).
+
+diff -ruN a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -65,6 +65,8 @@
+    '-Werror=switch',
+    '-Wno-overlength-strings',
+    '-Wno-missing-field-initializers',
++   '-Wno-gnu-offsetof-extensions',
++   '-Wno-gnu-pointer-arith',
+    '-Werror=format',
+ ]
+ 
+@@ -81,6 +83,7 @@
+ 
+ with_host_windows = host_machine.system() == 'windows'
+ with_host_darwin = host_machine.system() == 'darwin'
++with_host_android = host_machine.system() == 'android'
+ 
+ not_found = dependency('', required: false)
+ gbm_dep = not_found
+@@ -241,7 +244,7 @@
+   endif
+ endforeach
+ 
+-foreach f : ['memfd_create', 'strtok_r', 'timespec_get']
++foreach f : ['strtok_r']
+   if cc.has_function(f)
+     conf_data.set('HAVE_@0@'.format(f.to_upper()), 1)
+   endif
+@@ -295,7 +298,7 @@
+ 
+ if with_egl
+    if cc.has_header('epoxy/egl.h', dependencies: epoxy_dep) and epoxy_dep.get_variable(pkgconfig: 'epoxy_has_egl') == '1'
+-      if with_host_windows or with_host_darwin
++      if with_host_windows or with_host_darwin or with_host_android
+          have_egl = true
+       else
+          if libdrm_dep.found()
+diff -ruN a/src/mesa/util/detect_os.h b/src/mesa/util/detect_os.h
+--- a/src/mesa/util/detect_os.h
++++ b/src/mesa/util/detect_os.h
+@@ -24,7 +24,8 @@
+  * Android defines __linux__, so DETECT_OS_LINUX and DETECT_OS_UNIX will
+  * also be defined.
+  */
+-#if defined(__ANDROID__)
++/* Andronix: built with the NDK, not in AOSP (no log/log.h, cutils) */
++#if defined(__ANDROID__) && defined(ANDROID_AOSP_BUILD)
+ #define DETECT_OS_ANDROID 1
+ #endif
+ 
+diff -ruN a/src/meson.build b/src/meson.build
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -39,6 +39,7 @@
+    'vrend/vrend_formats.c',
+    'vrend/vrend_object.c',
+    'vrend/vrend_renderer.c',
++   'vrend/andronix_present.c',
+    'vrend/vrend_shader.c',
+    'vrend/vrend_tweaks.c',
+    'vrend/vrend_winsys.c',
+diff -ruN a/src/vrend/andronix_present.c b/src/vrend/andronix_present.c
+--- a/src/vrend/andronix_present.c
++++ b/src/vrend/andronix_present.c
+@@ -0,0 +1,307 @@
++/*
++ * Andronix (standalone app): zero-copy present for GPU windows.
++ *
++ * An X11 window's frame normally comes back to the guest by readback
++ * (glReadPixels into its shared memory), the guest puts it into Xvfb, and
++ * the app uploads Xvfb's framebuffer again. Here, when the app asks for it
++ * (VTEST_PRESENT_SOCKET, its listening socket, and VTEST_PRESENT_SIZE_FILE,
++ * one "W H" line per window size the app can show: the full screen, and
++ * windows whose size is unique and that nothing covers), a display-target
++ * readback of one of those sizes is replaced by a GPU blit into one of
++ * three AHardwareBuffers the app shows directly, at the window's place. The guest's copy is then
++ * left as it was (it puts a stale frame into Xvfb, which the app ignores
++ * while frames come this way).
++ *
++ * Protocol (SOCK_SEQPACKET, the server connects):
++ *   1. "ANXP" u32 version=1, width, height, count   (one message)
++ *   2. count x AHardwareBuffer_sendHandleToUnixSocket
++ *   3. per frame: "ANXF" u32 index, flags (1 = rows bottom-up), seq,
++ *      with the blit's native fence fd (SCM_RIGHTS) when there is one.
++ * Any error: the connection is dropped and readbacks go on as before.
++ *
++ * MIT, like virglrenderer.
++ */
++#ifdef __ANDROID__
++
++#include <android/hardware_buffer.h>
++#include <epoxy/egl.h>
++#include <epoxy/gl.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "virgl_hw.h"
++#include "vrend_renderer.h"
++#include "andronix_present.h"
++
++#define NBUF 3
++
++static int enabled = -1, have_fence, failures;
++static const char *sock_path, *size_path;
++static int conn = -1;
++static uint32_t buf_w, buf_h, seq, next_buf;
++static AHardwareBuffer *ahb[NBUF];
++static EGLImageKHR img[NBUF];
++static GLuint tex[NBUF], fbo[NBUF];
++static EGLContext made_in;
++#define MAX_SIZES 16
++static uint32_t sizes[MAX_SIZES][2];
++static int n_sizes;
++static double size_checked, retry_after;
++static struct timespec size_mtime;
++
++static double now_ms(void)
++{
++   struct timespec t;
++   clock_gettime(CLOCK_MONOTONIC, &t);
++   return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
++}
++
++static void drop(const char *why)
++{
++   if (why)
++      fprintf(stderr, "present: off (%s)\n", why);
++   if (conn >= 0)
++      close(conn);
++   conn = -1;
++   EGLDisplay dpy = eglGetCurrentDisplay();
++   bool same_ctx = made_in == eglGetCurrentContext();
++   for (int i = 0; i < NBUF; i++) {
++      if (fbo[i] && same_ctx)
++         glDeleteFramebuffers(1, &fbo[i]);
++      if (tex[i] && same_ctx)
++         glDeleteTextures(1, &tex[i]);
++      if (img[i] != EGL_NO_IMAGE_KHR && dpy != EGL_NO_DISPLAY)
++         eglDestroyImageKHR(dpy, img[i]);
++      if (ahb[i])
++         AHardwareBuffer_release(ahb[i]);
++      fbo[i] = tex[i] = 0;
++      img[i] = EGL_NO_IMAGE_KHR;
++      ahb[i] = NULL;
++   }
++   buf_w = buf_h = 0;
++   /* The app may not listen yet: try again in a second. Three failures in a
++    * row (not a connection the app closed after using it) and this client
++    * stays on the readback for good. */
++   retry_after = now_ms() + 1000;
++}
++
++/* The sizes the app can show, as it wrote them (re-read when the file
++ * changes, at most every 100 ms: a menu opening over a window must take it
++ * off quickly). The app writes a temporary file and renames it over this
++ * one, so a read always sees a whole list, never half of one (which could
++ * send the wrong window this way). */
++static void read_sizes(void)
++{
++   double t = now_ms();
++   if (t - size_checked < 100)
++      return;
++   size_checked = t;
++   struct stat st;
++   if (stat(size_path, &st) != 0) {
++      n_sizes = 0;
++      return;
++   }
++   if (st.st_mtim.tv_sec == size_mtime.tv_sec && st.st_mtim.tv_nsec == size_mtime.tv_nsec)
++      return;
++   size_mtime = st.st_mtim;
++   FILE *f = fopen(size_path, "r");
++   unsigned w, h;
++   n_sizes = 0;
++   if (f) {
++      while (n_sizes < MAX_SIZES && fscanf(f, "%u %u", &w, &h) == 2) {
++         sizes[n_sizes][0] = w;
++         sizes[n_sizes][1] = h;
++         n_sizes++;
++      }
++      fclose(f);
++   }
++}
++
++static bool size_listed(uint32_t w, uint32_t h)
++{
++   for (int i = 0; i < n_sizes; i++)
++      if (sizes[i][0] == w && sizes[i][1] == h)
++         return true;
++   return false;
++}
++
++static bool send_all(const void *p, size_t n, int fence_fd)
++{
++   struct iovec iov = { (void *)p, n };
++   struct msghdr m = { 0 };
++   char cbuf[CMSG_SPACE(sizeof(int))];
++   m.msg_iov = &iov;
++   m.msg_iovlen = 1;
++   if (fence_fd >= 0) {
++      memset(cbuf, 0, sizeof(cbuf));
++      m.msg_control = cbuf;
++      m.msg_controllen = sizeof(cbuf);
++      struct cmsghdr *c = CMSG_FIRSTHDR(&m);
++      c->cmsg_level = SOL_SOCKET;
++      c->cmsg_type = SCM_RIGHTS;
++      c->cmsg_len = CMSG_LEN(sizeof(int));
++      memcpy(CMSG_DATA(c), &fence_fd, sizeof(int));
++   }
++   return sendmsg(conn, &m, MSG_NOSIGNAL) == (ssize_t)n;
++}
++
++/* Textures and FBOs on the EGLImages, in the current context. glmark2 and
++ * others make a new context per scene: the buffers and the connection stay,
++ * only these are made again. */
++static bool make_gl_objects(void)
++{
++   GLint old_draw;
++   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw);
++   bool ok = true;
++   for (int i = 0; i < NBUF && ok; i++) {
++      glGenTextures(1, &tex[i]);
++      glBindTexture(GL_TEXTURE_2D, tex[i]);
++      glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img[i]);
++      glGenFramebuffers(1, &fbo[i]);
++      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo[i]);
++      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[i], 0);
++      ok = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
++   }
++   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, old_draw);
++   made_in = eglGetCurrentContext();
++   return ok;
++}
++
++static bool connect_app(uint32_t w, uint32_t h)
++{
++   conn = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++   struct sockaddr_un a = { .sun_family = AF_UNIX };
++   if (conn < 0 || strlen(sock_path) >= sizeof(a.sun_path))
++      return false;
++   strcpy(a.sun_path, sock_path);
++   if (connect(conn, (struct sockaddr *)&a, sizeof(a)) != 0)
++      return false;
++
++   EGLDisplay dpy = eglGetCurrentDisplay();
++   AHardwareBuffer_Desc d = {
++      .width = w, .height = h, .layers = 1,
++      .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
++      .usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
++   };
++   uint32_t hello[5] = { 0x50584e41 /* "ANXP" */, 1, w, h, NBUF };
++   if (!send_all(hello, sizeof(hello), -1))
++      return false;
++   for (int i = 0; i < NBUF; i++) {
++      if (AHardwareBuffer_allocate(&d, &ahb[i]) != 0)
++         return false;
++      if (AHardwareBuffer_sendHandleToUnixSocket(ahb[i], conn) != 0)
++         return false;
++      EGLClientBuffer cb = eglGetNativeClientBufferANDROID(ahb[i]);
++      static const EGLint attrs[] = { EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE };
++      img[i] = eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, cb, attrs);
++      if (img[i] == EGL_NO_IMAGE_KHR)
++         return false;
++   }
++   buf_w = w;
++   buf_h = h;
++   if (!make_gl_objects())
++      return false;
++   fprintf(stderr, "present: on, %ux%u, %d buffers\n", w, h, NBUF);
++   return true;
++}
++
++bool andronix_present_frame(struct vrend_resource *res, uint32_t level,
++                            const struct pipe_box *box, bool invert)
++{
++   if (enabled < 0) {
++      EGLDisplay dpy = eglGetCurrentDisplay();
++      sock_path = getenv("VTEST_PRESENT_SOCKET");
++      size_path = getenv("VTEST_PRESENT_SIZE_FILE");
++      /* libepoxy aborts on a call whose extension isn't advertised: check them all first. */
++      enabled = sock_path && size_path &&
++                epoxy_has_egl_extension(dpy, "EGL_KHR_image_base") &&
++                epoxy_has_egl_extension(dpy, "EGL_ANDROID_get_native_client_buffer") &&
++                epoxy_has_egl_extension(dpy, "EGL_ANDROID_image_native_buffer") &&
++                epoxy_has_gl_extension("GL_OES_EGL_image");
++      have_fence = epoxy_has_egl_extension(dpy, "EGL_KHR_fence_sync") &&
++                   epoxy_has_egl_extension(dpy, "EGL_ANDROID_native_fence_sync");
++      fprintf(stderr, "present: %s, fences %s\n", enabled ? "available" : "not available (flag or EGL/GL extensions)",
++              have_fence ? "native" : "none (glFinish)");
++   }
++   if (!enabled || level != 0 || !(res->base.bind & VIRGL_BIND_DISPLAY_TARGET) ||
++       box->x != 0 || box->y != 0 || box->z != 0 || box->depth != 1 ||
++       (uint32_t)box->width != res->base.width0 || (uint32_t)box->height != res->base.height0 ||
++       res->base.nr_samples > 1)
++      return false;
++
++   read_sizes();
++   const uint32_t rw = res->base.width0, rh = res->base.height0;
++   if (!size_listed(rw, rh)) {
++      /* Not (or no longer) a size the app shows: the readback, and let the app go. */
++      if (conn >= 0 && rw == buf_w && rh == buf_h)
++         drop("the app stopped showing this size");
++      return false;
++   }
++   if (conn >= 0 && (buf_w != rw || buf_h != rh))
++      drop("the window's size changed");
++   if (conn >= 0 && made_in != eglGetCurrentContext() && !make_gl_objects())
++      drop("couldn't use the buffers in a new context");
++   if (conn < 0) {
++      if (now_ms() < retry_after)
++         return false;
++      if (!connect_app(rw, rh)) {
++         drop(errno ? strerror(errno) : "connect");
++         if (++failures >= 3) {
++            enabled = 0;
++            fprintf(stderr, "present: off for this client (3 failures)\n");
++         }
++         return false;
++      }
++      failures = 0;
++   }
++
++   GLint old_read, old_draw;
++   glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_read);
++   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw);
++   GLuint src;
++   glGenFramebuffers(1, &src);
++   glBindFramebuffer(GL_FRAMEBUFFER, src);
++   vrend_fb_bind_texture(res, 0, 0, 0);
++   uint32_t k = next_buf;
++   next_buf = (next_buf + 1) % NBUF;
++   glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
++   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo[k]);
++   /* Rows top-down in the buffer, as the guest's readback would have had them. */
++   const GLint w = buf_w, h = buf_h;
++   if (invert)
++      glBlitFramebuffer(0, 0, w, h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++   else
++      glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++   glDeleteFramebuffers(1, &src);
++   glBindFramebuffer(GL_READ_FRAMEBUFFER, old_read);
++   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, old_draw);
++
++   EGLDisplay dpy = eglGetCurrentDisplay();
++   int fence = -1;
++   EGLSyncKHR sync = have_fence ? eglCreateSyncKHR(dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL) : EGL_NO_SYNC_KHR;
++   glFlush();
++   if (sync != EGL_NO_SYNC_KHR) {
++      fence = eglDupNativeFenceFDANDROID(dpy, sync);
++      eglDestroySyncKHR(dpy, sync);
++   }
++   if (fence < 0)
++      glFinish(); /* no fence for the app to wait on: finish here */
++   uint32_t msg[4] = { 0x46584e41 /* "ANXF" */, k, 0, ++seq };
++   bool ok = send_all(msg, sizeof(msg), fence);
++   if (fence >= 0)
++      close(fence);
++   if (!ok) {
++      drop("the app went away");
++      return false;
++   }
++   return true;
++}
++
++#endif /* __ANDROID__ */
+diff -ruN a/src/vrend/andronix_present.h b/src/vrend/andronix_present.h
+--- a/src/vrend/andronix_present.h
++++ b/src/vrend/andronix_present.h
+@@ -0,0 +1,24 @@
++/* Andronix zero-copy present (see andronix_present.c). MIT. */
++#ifndef ANDRONIX_PRESENT_H
++#define ANDRONIX_PRESENT_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++struct vrend_resource;
++struct pipe_box;
++
++#ifdef __ANDROID__
++/* true: the frame went to the app instead of the guest's readback. */
++bool andronix_present_frame(struct vrend_resource *res, uint32_t level,
++                            const struct pipe_box *box, bool invert);
++#else
++static inline bool andronix_present_frame(struct vrend_resource *res, uint32_t level,
++                                          const struct pipe_box *box, bool invert)
++{
++   (void)res; (void)level; (void)box; (void)invert;
++   return false;
++}
++#endif
++
++#endif
+diff -ruN a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -48,6 +48,7 @@
+ #include "vrend_object.h"
+ #include "vrend_shader.h"
+ 
++#include "andronix_present.h"
+ #include "vrend_renderer.h"
+ #include "vrend_blitter.h"
+ #include "vrend_debug.h"
+@@ -418,6 +419,10 @@
+ 
+ static inline bool has_feature(enum features_id feature_id)
+ {
++#ifdef __ANDROID__
++   if (feature_id == feat_dual_src_blend)
++      return false;
++#endif
+    int slot = feature_id / 64;
+    uint64_t mask = 1ull << (feature_id & 63);
+    bool retval = vrend_state.features[slot] & mask ? true : false;
+@@ -9729,6 +9734,98 @@
+    glDeleteFramebuffers(1, &fb_id);
+ }
+ 
++/* Andronix: a B8G8R8[AX]8 readback on GLES (every X11 window's frame) reads
++ * straight into the guest's memory instead of a fresh full-frame malloc, a
++ * CPU swizzle and a second copy: BGRA where GL_EXT_read_format_bgra exists
++ * (no CPU pass), else RGBA swizzled in place; a flipped one copies once from
++ * a kept buffer. On by default; VTEST_FAST_READBACK=0 turns it off, and a GL
++ * error on the first fast readback turns it off for good (the frame is then
++ * read the old way). */
++static int vrend_fast_readback = -1, vrend_fast_bgra, vrend_fast_checked;
++static char *vrend_fast_buf;
++static size_t vrend_fast_buf_size;
++
++static bool vrend_try_fast_readback(struct vrend_resource *res,
++                                    const struct iovec *iov, int num_iovs,
++                                    const struct vrend_transfer_info *info,
++                                    bool invert)
++{
++   if (vrend_fast_readback < 0) {
++      const char *e = getenv("VTEST_FAST_READBACK");
++      vrend_fast_readback = !(e && e[0] == '0');
++      vrend_fast_bgra = epoxy_has_gl_extension("GL_EXT_read_format_bgra");
++      fprintf(stderr, "fast readback: %s (GL_EXT_read_format_bgra %d)\n",
++              vrend_fast_readback ? "on" : "off", vrend_fast_bgra);
++   }
++   enum virgl_formats fmt = res->base.format;
++   if (!vrend_fast_readback || !vrend_state.use_gles || num_iovs != 1 ||
++       (fmt != VIRGL_FORMAT_B8G8R8A8_UNORM && fmt != VIRGL_FORMAT_B8G8R8X8_UNORM) ||
++       res->base.nr_samples > 1 || info->box->depth != 1 || info->box->z != 0)
++      return false;
++
++   const uint32_t w = info->box->width, hgt = info->box->height;
++   const uint32_t h = u_minify(res->base.height0, info->level);
++   const size_t dst_stride = info->stride ? info->stride
++      : (size_t)u_minify(res->base.width0, info->level) * 4;
++   char *dst = (char *)iov[0].iov_base + info->offset;
++   if (w == 0 || hgt == 0 || dst_stride < (size_t)w * 4 ||
++       info->offset + dst_stride * (hgt - 1) + (size_t)w * 4 > iov[0].iov_len)
++      return false;
++   if (invert && (size_t)w * 4 * hgt > vrend_fast_buf_size) {
++      free(vrend_fast_buf);
++      vrend_fast_buf = malloc((size_t)w * 4 * hgt);
++      vrend_fast_buf_size = vrend_fast_buf ? (size_t)w * 4 * hgt : 0;
++      if (!vrend_fast_buf)
++         return false;
++   }
++
++   GLint old_fbo;
++   GLuint fb_id;
++   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_fbo);
++   if (!vrend_fast_checked)
++      while (glGetError() != GL_NO_ERROR)
++         ;
++   glGenFramebuffers(1, &fb_id);
++   glBindFramebuffer(GL_FRAMEBUFFER, fb_id);
++   vrend_fb_bind_texture(res, 0, info->level, 0);
++   glPixelStorei(GL_PACK_ALIGNMENT, 4);
++
++   GLint y1 = invert ? (GLint)(h - info->box->y - hgt) : (GLint)info->box->y;
++   const GLenum rfmt = vrend_fast_bgra ? GL_BGRA_EXT : GL_RGBA;
++   char *target = invert ? vrend_fast_buf : dst;
++   if (!invert)
++      glPixelStorei(GL_PACK_ROW_LENGTH, dst_stride / 4);
++   glReadPixels(info->box->x, y1, w, hgt, rfmt, GL_UNSIGNED_BYTE, target);
++   if (!invert)
++      glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++   glDeleteFramebuffers(1, &fb_id);
++   glBindFramebuffer(GL_FRAMEBUFFER, old_fbo);
++
++   if (!vrend_fast_checked) {
++      vrend_fast_checked = 1;
++      GLenum err = glGetError();
++      if (err != GL_NO_ERROR) {
++         fprintf(stderr, "fast readback: off (GL error 0x%x)\n", err);
++         vrend_fast_readback = 0;
++         return false;
++      }
++   }
++
++   if (!vrend_fast_bgra) {
++      if (invert)
++         vrend_swizzle_data_bgra((uint64_t)w * 4 * hgt, vrend_fast_buf);
++      else if (dst_stride == (size_t)w * 4)
++         vrend_swizzle_data_bgra((uint64_t)w * 4 * hgt, dst);
++      else
++         for (uint32_t row = 0; row < hgt; row++)
++            vrend_swizzle_data_bgra((uint64_t)w * 4, dst + dst_stride * row);
++   }
++   if (invert)
++      for (uint32_t row = 0; row < hgt; row++)
++         memcpy(dst + dst_stride * row, vrend_fast_buf + (size_t)w * 4 * (hgt - 1 - row), (size_t)w * 4);
++   return true;
++}
++
+ static int vrend_transfer_send_readpixels(struct vrend_context *ctx,
+                                           struct vrend_resource *res,
+                                           const struct iovec *iov, int num_iovs,
+@@ -9784,6 +9881,12 @@
+    glPixelStorei(GL_PACK_SWAP_BYTES, 1);
+ #endif
+ 
++   /* Zero-copy first (the app shows the frame; no readback), then the fast readback. */
++   if (andronix_present_frame(res, info->level, info->box, actually_invert))
++      return 0;
++   if (vrend_try_fast_readback(res, iov, num_iovs, info, actually_invert))
++      return 0;
++
+    if (num_iovs > 1 || separate_invert)
+       need_temp = 1;
+ 
+diff -ruN a/src/vrend/vrend_winsys_egl.c b/src/vrend/vrend_winsys_egl.c
+--- a/src/vrend/vrend_winsys_egl.c
++++ b/src/vrend/vrend_winsys_egl.c
+@@ -103,6 +103,9 @@
+    EGLDisplay egl_display;
+    EGLConfig egl_conf;
+    EGLContext egl_ctx;
++   /* Android without EGL_KHR_surfaceless_context: a 1x1 pbuffer to make
++    * contexts current on (EGL_NO_SURFACE elsewhere). */
++   EGLSurface egl_surface;
+    uint32_t extension_bits;
+    EGLSyncKHR signaled_fence;
+    bool different_gpu;
+@@ -188,6 +191,11 @@
+ 
+ static bool virgl_egl_check_extensions(struct virgl_egl *egl)
+ {
++#ifdef __ANDROID__
++   /* GLES contexts need neither; without surfaceless, a pbuffer stands in. */
++   (void)egl;
++   return true;
++#endif
+    if (!has_bits(egl->extension_bits, EGL_KHR_SURFACELESS_CONTEXT | EGL_KHR_CREATE_CONTEXT)) {
+       virgl_error("Missing EGL_KHR_surfaceless_context or EGL_KHR_create_context\n");
+       return false;
+@@ -414,6 +422,17 @@
+    if (!success)
+       goto fail;
+ 
++#ifdef __ANDROID__
++   /* vrend makes GLES 3.x contexts: their config must say ES3, or making
++    * them current fails with EGL_BAD_MATCH. ES2 only if there's none. */
++   if (gles) {
++      conf_att[3] = 0x0040; /* EGL_OPENGL_ES3_BIT_KHR */
++      success = eglChooseConfig(egl->egl_display, conf_att, &egl->egl_conf,
++                                1, &num_configs);
++      if (!success || num_configs != 1)
++         conf_att[3] = EGL_OPENGL_ES2_BIT;
++   }
++#endif
+    success = eglChooseConfig(egl->egl_display, conf_att, &egl->egl_conf,
+                              1, &num_configs);
+    if (!success || num_configs != 1)
+@@ -424,8 +443,20 @@
+    if (!egl->egl_ctx)
+       goto fail;
+ 
+-   eglMakeCurrent(egl->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+-                  egl->egl_ctx);
++   egl->egl_surface = EGL_NO_SURFACE;
++#ifdef __ANDROID__
++   if (!has_bit(egl->extension_bits, EGL_KHR_SURFACELESS_CONTEXT)) {
++      static const EGLint pbuf_att[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
++      egl->egl_surface = eglCreatePbufferSurface(egl->egl_display, egl->egl_conf, pbuf_att);
++      if (egl->egl_surface == EGL_NO_SURFACE) {
++         virgl_error("No EGL_KHR_surfaceless_context and no pbuffer\n");
++         goto fail;
++      }
++   }
++#endif
++   if (!eglMakeCurrent(egl->egl_display, egl->egl_surface, egl->egl_surface,
++                       egl->egl_ctx))
++      goto fail;
+ 
+    if (virgl_egl_supports_fences(egl)) {
+       egl->signaled_fence = eglCreateSyncKHR(egl->egl_display,
+@@ -453,6 +484,8 @@
+    }
+    eglMakeCurrent(egl->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
++   if (egl->egl_surface != EGL_NO_SURFACE)
++      eglDestroySurface(egl->egl_display, egl->egl_surface);
+    eglDestroyContext(egl->egl_display, egl->egl_ctx);
+    eglTerminate(egl->egl_display);
+    free(egl);
+@@ -649,7 +682,7 @@
+ {
+    EGLContext egl_ctx = (EGLContext)virglctx;
+ 
+-   return eglMakeCurrent(egl->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++   return eglMakeCurrent(egl->egl_display, egl->egl_surface, egl->egl_surface,
+                          egl_ctx) ? 0 : -1;
+ }
+ 
+diff -ruN a/src/vrend/vrend_winsys.c b/src/vrend/vrend_winsys.c
+--- a/src/vrend/vrend_winsys.c
++++ b/src/vrend/vrend_winsys.c
+@@ -76,6 +76,13 @@
+       }
+ 
+       use_context = CONTEXT_EGL;
++#elif defined(__ANDROID__)
++      (void)preferred_fd;
++      egl = virgl_egl_init(EGL_DEFAULT_DISPLAY, flags & VIRGL_RENDERER_USE_SURFACELESS,
++                           flags & VIRGL_RENDERER_USE_GLES);
++      if (!egl)
++         return -1;
++      use_context = CONTEXT_EGL;
+ #else
+       (void)preferred_fd;
+       virgl_error("EGL is not supported on this platform\n");
+@@ -98,6 +105,13 @@
+ 
+ void vrend_winsys_cleanup(void)
+ {
++#if defined(__ANDROID__) && !defined(ENABLE_GBM)
++   if (use_context == CONTEXT_EGL) {
++      virgl_egl_destroy(egl);
++      egl = NULL;
++      use_context = CONTEXT_NONE;
++   }
++#endif
+ #ifdef ENABLE_GBM
+    if (use_context == CONTEXT_EGL) {
+       virgl_egl_destroy(egl);
+diff -ruN a/vtest/vtest_server.c b/vtest/vtest_server.c
+--- a/vtest/vtest_server.c
++++ b/vtest/vtest_server.c
+@@ -51,6 +51,9 @@
+ #ifdef HAVE_SYS_SELECT_H
+ #include <sys/select.h>
+ #endif
++#ifdef __ANDROID__
++#include <sys/wait.h>
++#endif
+ 
+ enum vtest_client_result {
+    VTEST_CLIENT_DISCONNECTED = 1,
+@@ -132,6 +135,31 @@
+ static int vtest_client_dispatch_commands(struct vtest_client *client);
+ 
+ 
++#ifdef __ANDROID__
++
++/* Android: the phone's EGL/GLES may not do what vrend needs. Try the
++ * renderer once in a child (the server itself never touches EGL, so its
++ * forked clients start clean) and exit before listening if it fails: the
++ * app then starts the desktop without the GPU instead of a black one. */
++static void vtest_server_android_self_test(void)
++{
++   pid_t pid = fork();
++   if (pid == 0) {
++      int ret = vtest_init_renderer(server.multi_clients, server.ctx_flags,
++                                    server.render_device);
++      if (!ret)
++         vtest_cleanup_renderer();
++      _exit(ret ? 1 : 0);
++   }
++   int status = 0;
++   if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) ||
++       WEXITSTATUS(status) != 0) {
++      fprintf(stderr, "self-test: the renderer can't start on this phone's EGL/GLES\n");
++      exit(EXIT_FAILURE);
++   }
++}
++#endif
++
+ int vtest_main(int argc, char **argv)
+ {
+ #ifdef __AFL_LOOP
+@@ -140,6 +168,9 @@
+ 
+    vtest_server_getenv();
+    vtest_server_parse_args(argc, argv);
++#ifdef __ANDROID__
++   vtest_server_android_self_test();
++#endif
+ 
+    list_inithead(&server.new_clients);
+    list_inithead(&server.active_clients);
+diff -ruN a/vtest/vtest_shm.c b/vtest/vtest_shm.c
+--- a/vtest/vtest_shm.c
++++ b/vtest/vtest_shm.c
+@@ -44,6 +44,10 @@
+ #endif
+ }
+ 
++#ifdef __ANDROID__
++#include <android/sharedmem.h>
++#endif
++
+ int vtest_new_shm(uint32_t handle, size_t size)
+ {
+    int fd, ret;
+@@ -52,6 +56,15 @@
+    snprintf(str, length + 1, "vtest-res-%u", handle);
+ 
+    fd = memfd_create(str, MFD_ALLOW_SEALING);
++#ifdef __ANDROID__
++   if (fd < 0) {
++      fd = ASharedMemory_create(str, size);
++      free(str);
++      if (fd < 0)
++         return report_failed_call("ASharedMemory_create", -errno);
++      return fd;
++   }
++#endif
+    free(str);
+    if (fd < 0) {
+       return report_failed_call("memfd_create", -errno);
+@@ -68,6 +81,9 @@
+ 
+ int vtest_shm_check(void)
+ {
++#ifdef __ANDROID__
++    return 1; /* vtest_new_shm falls back to ASharedMemory */
++#endif
+     int mfd = memfd_create("test", MFD_ALLOW_SEALING);
+ 
+     if (mfd >= 0) {
