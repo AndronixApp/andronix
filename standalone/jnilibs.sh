@@ -23,7 +23,7 @@
 #   source/                  the source archives, for the public release
 #                            standalone-<version> (GPL source offer, README.md)
 #   SHA256SUMS               of everything above, relative paths
-#   build.json               versions, commits and sums, for the app's release notes
+#   build.json               versions, commits, cgo and sums, for the app's release notes
 #
 # Nothing is uploaded or published; android's build copies <out dir>.
 set -euo pipefail
@@ -140,11 +140,16 @@ PY
 
 (cd "$out" && find jniLibs licenses source -type f | LC_ALL=C sort | xargs shasum -a 256) >"$out/SHA256SUMS"
 sum() { awk -v f="$1" '$2 == f {print $1}' "$out/SHA256SUMS"; }
+# cgo: libandronix links with Android's libc (Android's resolver, card #141);
+# Go records the setting in the binary's build info.
+cgo=false
+grep -aq 'CGO_ENABLED=1' "$out/jniLibs/arm64-v8a/libandronix.so" && cgo=true
 cat >"$out/build.json" <<EOF
 {
   "installer_version": "$version",
   "installer_tag": "${tag:-}",
   "repo_commit": "$commit",
+  "cgo": $cgo,
   "abis": ["arm64-v8a"],
   "proot": "termux/proot 5.1.107.96, talloc 2.5.0, libandroid-shmem 0.7, NDK r27c, API 26",
   "virgl": "virglrenderer 1.3.0 (+ standalone/virgl/android.patch), libepoxy 1.5.10, NDK r27c",
