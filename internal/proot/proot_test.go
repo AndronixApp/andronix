@@ -88,3 +88,28 @@ func TestVersion(t *testing.T) {
 		}
 	}
 }
+
+// NoSeccomp (support #312) puts PROOT_NO_SECCOMP=1 in every later proot
+// run's environment; a user's own setting wins.
+func TestHostEnvNoSeccomp(t *testing.T) {
+	defer func() { NoSeccomp = false }()
+	has := func() bool {
+		for _, e := range hostEnv() {
+			if e == "PROOT_NO_SECCOMP=1" {
+				return true
+			}
+		}
+		return false
+	}
+	t.Setenv("PROOT_NO_SECCOMP", "")
+	os.Unsetenv("PROOT_NO_SECCOMP")
+	before := has()
+	NoSeccomp = true
+	if !has() {
+		t.Fatal("NoSeccomp set, PROOT_NO_SECCOMP=1 missing")
+	}
+	NoSeccomp = false
+	if has() != before {
+		t.Error("cleared NoSeccomp still changes the environment")
+	}
+}

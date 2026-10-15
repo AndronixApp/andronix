@@ -60,8 +60,16 @@ if command -v dbus-run-session >/dev/null 2>&1; then
     dbus-run-session -- sh -c '/usr/local/bin/andronix session-prep 2>/dev/null; exec @SESSION@'
     rc=$?
     [ $(( $(date +%s) - t0 )) -gt 15 ] && exit $rc
+    command -v dbus-launch >/dev/null 2>&1 || {
+        echo "== dbus-run-session ended after $(( $(date +%s) - t0 ))s (exit $rc), and dbus-launch isn't installed (package dbus-x11): run 'andronix update' in Termux to put it back"
+        exit $rc
+    }
     echo "== dbus-run-session ended after $(( $(date +%s) - t0 ))s (exit $rc); retrying with dbus-launch"
 fi
+command -v dbus-launch >/dev/null 2>&1 || {
+    echo "== neither dbus-run-session nor dbus-launch is installed (package dbus-x11): run 'andronix update' in Termux to put them back"
+    exit 1
+}
 exec dbus-launch --exit-with-session sh -c '/usr/local/bin/andronix session-prep 2>/dev/null; exec @SESSION@'
 `
 
@@ -104,6 +112,9 @@ func setupDesktop(ctx context.Context, in *Inst, de *conf.Desktop, t *proot.Targ
 			os.WriteFile(filepath.Join(dir, n+".desktop"),
 				[]byte("[Desktop Entry]\nType=Application\nName="+n+"\nExec=true\nHidden=true\n"), 0o644)
 		}
+	}
+	if did := trimXfceDefaults(root, de); did != "" {
+		r.Line("xfce defaults: " + did)
 	}
 	phoneDefaults(root)
 	// Modded editions bring their own look; don't overwrite it.
@@ -192,6 +203,24 @@ func xdgConfigDirs(de *conf.Desktop) string {
 		return de.XDGConfigDirs
 	}
 	return "/etc/xdg"
+}
+
+// userSessionFiles copies what the login user's home lacks from
+// /etc/skel (the desktop's session files among them), never overwriting.
+// A user made before the desktop was installed (a desktop added to a
+// command-line install) only got /etc/skel as it was then, so
+// `andronix desktop` had no xstartup for them (support #284). Returns the
+// number of files copied.
+func userSessionFiles(in *Inst) int {
+	b, err := os.ReadFile(filepath.Join(in.Rootfs, "etc/andronix/user"))
+	if err != nil {
+		return 0
+	}
+	uid, gid, home, ok := lookupUser(in.Rootfs, strings.TrimSpace(string(b)))
+	if !ok || home == "" || home == "/" {
+		return 0
+	}
+	return syncSkel(filepath.Join(in.Rootfs, "etc/skel"), filepath.Join(in.Rootfs, home), atoi(uid), atoi(gid))
 }
 
 // writeXstartup (re)writes the session script for root, /etc/skel and
@@ -412,12 +441,25 @@ func plasmaWallpaper(root string) error {
 // firefoxPrefs keep Firefox to a few processes. Android's phantom process
 // killer stops Termux, and the whole desktop with it, once the app has
 // more than 32 processes (Redmi, Android 16: a desktop and Firefox with a
-// few tabs). Site isolation (fission) stays on, as Firefox ships it: at
-// most one content process per site (webIsolated), and few other
-// processes. Defaults only; a user can change them in about:config.
+// few tabs). Site isolation (fission) stays on for high-value sites only
+// (logins and the like), as in Firefox for Android: isolating every site
+// gave 20 content processes for 8 tabs and Android started killing Termux
+// processes (a16 emulator, Oct 7); high-value only stayed at 12. Defaults
+// only; a user can change them in about:config.
 const firefoxPrefs = `// Andronix: fewer Firefox processes, for Android's phantom process killer.
-pref("dom.ipc.processCount", 2);
+pref("fission.webContentIsolationStrategy", 2);
+pref("dom.ipc.processCount", 1);
 pref("dom.ipc.processCount.webIsolated", 1);
+// No fork server (a desktop with Firefox was 37 processes in the app,
+// Oct 7). Firefox ESR 153 ignores extensions.webextensions.remote and
+// browser.tabs.remote.separatePrivilegedContentProcess (measured): its
+// extension and about: processes stay.
+pref("dom.ipc.forkserver.enable", false);
+// A blank home and new-tab page: Firefox's own pages run in a "Privileged
+// Content" process of their own, which then never starts (measured, a16).
+pref("browser.startup.homepage", "about:blank");
+pref("browser.startup.page", 0);
+pref("browser.newtabpage.enabled", false);
 pref("dom.ipc.processPrelaunch.enabled", false);
 pref("browser.preferences.defaultPerformanceSettings.enabled", false);
 pref("network.process.enabled", false);

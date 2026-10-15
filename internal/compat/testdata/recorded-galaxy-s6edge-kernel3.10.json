@@ -1,0 +1,32 @@
+{
+ "source": "recorded 2026-10-14 from support #436's report AX-WQPK0E (andronix report, app 10.1.0): Samsung Galaxy S6 edge+ SM-G925F, Android 7.0, kernel 3.10.61, GitHub Termux 0.119.0-beta.3, Kali. dpkg stopped at systemd-standalone-sysusers, then everything that needs dbus or polkit. probe_version is the report's (not sent).",
+ "distro": "kali",
+ "family": "apt",
+ "de": "kde",
+ "probe": {
+  "probe_version": 4,
+  "kernel": "3.10.61",
+  "sdk": 24,
+  "termux": "github",
+  "syscalls": {
+   "clone3": "ENOSYS",
+   "close_range": "ENOSYS",
+   "faccessat2": "ENOSYS",
+   "fchmodat2": "ENOSYS",
+   "memfd_create": "ENOSYS",
+   "name_to_handle_at": "ENOSYS",
+   "open_tree": "ENOSYS",
+   "openat2": "ENOSYS",
+   "seccomp": "EINVAL",
+   "statx": "ok",
+   "statx_mnt_id": "missing"
+  }
+ },
+ "expect": [
+  "old-syscall-order",
+  "old-kernel-desktop",
+  "mount-id-shim",
+  "ofd-lock-shim",
+  "mount-id-shim-probe"
+ ]
+}

@@ -65,6 +65,7 @@ ac_install_agent() {
 # Andronix test agent. Runs in the Termux app process (see app-context.sh).
 set -m  # each job gets its own process group, so a timeout can stop all of it
 D=$HOME/.ac
+export ANDRONIX_NO_TELEMETRY=1  # test runs never send telemetry (owner rule)
 mkdir -p "$D/q" "$D/run" "$D/out"
 echo $$ >"$D/agent.pid"
 {

@@ -165,6 +165,10 @@ func (l *Logger) Close() {
 	}
 }
 
+// currentLog is the run log this process opened last: a failure's own
+// log for andronix report, whatever kind of error ended the run.
+var currentLog string
+
 // NewLog opens ~/.andronix/logs/<name>-<time>.log and keeps the 10 newest.
 func NewLog(name string) *Logger {
 	p := GetPaths()
@@ -176,6 +180,8 @@ func NewLog(name string) *Logger {
 	}
 	lg := log.NewWithOptions(f, log.Options{ReportTimestamp: true, TimeFormat: time.TimeOnly})
 	rotateLogs(p.Logs, 10, path)
+	currentLog = path
+	sys.DNSLog = func(format string, args ...any) { lg.Printf(format, args...) } // which resolver answered (#141)
 	return &Logger{Logger: lg, Path: path, f: f}
 }
 

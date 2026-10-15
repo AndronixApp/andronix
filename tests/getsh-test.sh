@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.." || exit 1
 box="andronix-getsh-$$"
 pass=0 fail=0
 docker build -q -t andronix-test -f tests/Dockerfile tests >/dev/null 2>&1 || { echo "docker build failed"; exit 1; }
-docker run -d --init --name "$box" -v "$PWD":/src:ro andronix-test sleep infinity >/dev/null
+docker run -d --init -e ANDRONIX_NO_TELEMETRY=1 --name "$box" -v "$PWD":/src:ro andronix-test sleep infinity >/dev/null
 trap 'docker rm -f "$box" >/dev/null 2>&1' EXIT
 run() { docker exec "$box" bash -c "$1"; }
 check() {

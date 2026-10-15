@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
@@ -94,7 +96,7 @@ func TestReportFromFailure(t *testing.T) {
 	var top map[string]any
 	json.Unmarshal(b, &top)
 	allowed := map[string]bool{"schema": true, "source": true, "client_id": true, "consent": true, "created_at": true, "description": true,
-		"install_id": true, "locale": true, "versions": true, "device": true, "termux": true, "install": true, "compat": true, "log": true, "log_name": true}
+		"install_id": true, "related_id": true, "locale": true, "versions": true, "device": true, "termux": true, "install": true, "compat": true, "log": true, "log_name": true}
 	for k := range top {
 		if !allowed[k] {
 			t.Errorf("key %q isn't in reports-v1", k)
@@ -117,7 +119,7 @@ func TestReportDraftFlow(t *testing.T) {
 	t.Setenv("ANDRONIX_DISTRO", "")
 	ui.Yes = true
 	defer func() { ui.Yes = false }()
-	var clientIDs []string
+	var clientIDs, related []string
 	var fin map[string]any
 	var claim string
 	drafts := 0
@@ -132,6 +134,9 @@ func TestReportDraftFlow(t *testing.T) {
 			var body map[string]any
 			json.Unmarshal(b, &body)
 			clientIDs = append(clientIDs, body["client_id"].(string))
+			if s, ok := body["related_id"].(string); ok {
+				related = append(related, s)
+			}
 			if drafts++; drafts == 1 {
 				w.WriteHeader(503)
 				return
@@ -148,8 +153,12 @@ func TestReportDraftFlow(t *testing.T) {
 	}))
 	defer srv.Close()
 	t.Setenv("ANDRONIX_API", srv.URL)
-	if err := Report(context.Background(), false, "desktop stays black", ""); err != nil {
+	if err := Report(context.Background(), false, "desktop stays black", "", " ax-4p9zt2 "); err != nil {
 		t.Fatal(err)
+	}
+	// --attach: the app's report id goes with the draft (each try), normalized.
+	if len(related) != 2 || related[0] != "AX-4P9ZT2" {
+		t.Errorf("related_id: %v", related)
 	}
 	if len(clientIDs) != 2 || clientIDs[0] != clientIDs[1] {
 		t.Errorf("draft retries must reuse client_id: %v", clientIDs)
@@ -219,5 +228,38 @@ func TestReportErrors(t *testing.T) {
 			t.Errorf("finalize %d: accepted", st)
 		}
 		srv.Close()
+	}
+}
+
+// --attach refuses something that isn't a report id, before building anything.
+func TestReportAttachBadID(t *testing.T) {
+	err := Report(context.Background(), true, "", "", "AX-12")
+	var ue *ui.UserError
+	if !errors.As(err, &ue) || ue.Title != "Not a report id" {
+		t.Errorf("got %v", err)
+	}
+}
+
+// A failure that isn't a UserError still reports its own run's log, and a
+// newer retry's log comes after it (support #255: the report carried only
+// the retry's).
+func TestReportLogIsTheFailingRuns(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("ANDRONIX_HOME", "")
+	lg := NewLog("install-kali")
+	lg.Printf("FAILING RUN")
+	lg.Close()
+	SaveFailure("install", "kali", errors.New("could not open a new TTY"))
+	time.Sleep(1100 * time.Millisecond) // the next log's name has a new second
+	retry := NewLog("install-kali")
+	retry.Printf("RETRY RUN")
+	retry.Close()
+	r := buildReport("")
+	if r.LogName != filepath.Base(lg.Path) || !strings.Contains(r.Log, "FAILING RUN") {
+		t.Fatalf("log_name %s, log %q", r.LogName, r.Log)
+	}
+	if i, j := strings.Index(r.Log, "FAILING RUN"), strings.Index(r.Log, "RETRY RUN"); j < i || !strings.Contains(r.Log, "--- newer log: "+filepath.Base(retry.Path)) {
+		t.Errorf("retry's log not after the failing one: %q", r.Log)
 	}
 }

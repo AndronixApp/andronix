@@ -248,6 +248,17 @@ func (t *Target) Env() []string {
 	return env
 }
 
+// Session, when set, readies a session's name lookups (the app's DNS
+// forwarder, card #141) before proot runs; pid is the process whose end
+// ends the session.
+var Session func(rootfs string, pid int)
+
+func (t *Target) session(pid int) {
+	if Session != nil && !t.Local {
+		Session(t.Rootfs, pid)
+	}
+}
+
 // Login replaces this process with a login shell (or `shell -c cmd`,
 // which is how the old start scripts passed arguments).
 func (t *Target) Login(shell string, cmd []string) error {
@@ -269,6 +280,7 @@ func (t *Target) Login(shell string, cmd []string) error {
 	if err != nil {
 		return err
 	}
+	t.session(os.Getpid()) // exec keeps the pid: the forwarder ends with proot
 	return sys.Exec(bin, argv, hostEnv())
 }
 
@@ -287,6 +299,7 @@ func (t *Target) Run(ctx context.Context, cmd string, stdin io.Reader, onLine fu
 		c.Env = hostEnv()
 	}
 	c.Stdin = stdin
+	t.session(os.Getpid()) // this process waits for proot
 	pr, pw := io.Pipe()
 	c.Stdout, c.Stderr = pw, pw
 	if err := c.Start(); err != nil {
@@ -322,8 +335,13 @@ func (t *Target) Interactive(cmd string, asUser bool) error {
 	c := sys.Command(argv[0], argv[1:]...)
 	c.Env = hostEnv()
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	tt.session(os.Getpid())
 	return c.Run()
 }
+
+// Watch readies name lookups for a Command started by the caller, ending
+// with that process (a desktop session outlives this one).
+func (t *Target) Watch(pid int) { t.session(pid) }
 
 // Command is a command inside the distro (as the login user unless the
 // target is root), ready to start. The caller sets stdio.
@@ -353,12 +371,18 @@ func hostEnv() []string {
 			out = append(out, e)
 		}
 	}
-	// Fallback when the rules couldn't load.
-	if os.Getenv("PROOT_NO_SECCOMP") == "" && oldSyscallOrder(sys.KernelRelease()) && !hasKey(compatEnv(), "PROOT_NO_SECCOMP") {
+	// Fallback when the rules couldn't load, or set for the rest of this
+	// run after proot's fake root failed (NoSeccomp).
+	if os.Getenv("PROOT_NO_SECCOMP") == "" && !hasKey(compatEnv(), "PROOT_NO_SECCOMP") && (NoSeccomp || oldSyscallOrder(sys.KernelRelease())) {
 		out = append(out, "PROOT_NO_SECCOMP=1")
 	}
 	return out
 }
+
+// NoSeccomp makes every later proot run of this process use ptrace only
+// (PROOT_NO_SECCOMP=1): set when a program in the distro wasn't root under
+// proot -0 (support #312).
+var NoSeccomp bool
 
 // EnvHook returns environment for every proot run (the compat rules, set
 // by the app). Called once, lazily.

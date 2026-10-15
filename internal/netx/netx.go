@@ -7,11 +7,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/AndronixApp/andronix-distros/internal/sys"
 )
 
 // UserAgent identifies us to mirrors and registries.
@@ -21,7 +22,7 @@ var UserAgent = "andronix"
 var Client = &http.Client{
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 20 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           sys.DialContext, // Android's resolver, then Go's (#141)
 		TLSHandshakeTimeout:   20 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
 		IdleConnTimeout:       60 * time.Second,

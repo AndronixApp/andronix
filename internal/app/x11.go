@@ -169,6 +169,11 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 	// andronix session-prep and the light profile's XDG_CONFIG_DIRS), so
 	// both displays behave the same. Scripts from before session-prep are
 	// refreshed, as install and update do.
+	if t.User != "" {
+		if n := userSessionFiles(in); n > 0 { // a desktop added after the user was made (#284)
+			termux.Logf("x11: copied %d files from /etc/skel to %s's home", n, t.User)
+		}
+	}
 	xs := filepath.Join(in.Rootfs, home, ".config/tigervnc/xstartup")
 	if b, err := os.ReadFile(xs); err != nil || !strings.Contains(string(b), "andronix session-prep") {
 		writeXstartup(in.Rootfs, de)
@@ -243,6 +248,7 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 		return ui.Errorf("The desktop didn't start", err.Error(), "Run andronix desktop "+d.ID+" again.")
 	}
 	run.Proot = c.Process.Pid
+	t.Watch(c.Process.Pid) // DNS through Android for the session (#141)
 	run.write()
 	termux.Logf("x11: %s session started (proot pid %d, user %s)", d.ID, run.Proot, nameOr(t.User, "root"))
 	vncNote := ""

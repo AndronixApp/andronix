@@ -32,6 +32,7 @@
   "old-syscall-order",
   "old-kernel-desktop",
   "mount-id-shim",
+  "mount-id-shim-probe",
   "fchmodat2-bad-errno"
  ]
 }

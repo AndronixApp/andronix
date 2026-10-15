@@ -25,7 +25,7 @@ check() { # check NAME COMMAND
 
 docker build -q -t "$img" -f tests/Dockerfile tests >/dev/null || { echo "docker build failed"; exit 1; }
 docker rm -f "$box" >/dev/null 2>&1
-docker run -d --init --name "$box" -v "$root":/src:ro "$img" sleep infinity >/dev/null
+docker run -d --init -e ANDRONIX_NO_TELEMETRY=1 --name "$box" -v "$root":/src:ro "$img" sleep infinity >/dev/null
 trap 'docker rm -f "$box" >/dev/null 2>&1' EXIT
 
 tarball=$(ls dist/debian-13-aarch64.tar.xz 2>/dev/null | head -1)

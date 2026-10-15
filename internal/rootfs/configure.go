@@ -58,6 +58,9 @@ func Configure(dir, root string, info Info) error {
 	w("etc/hostname", "localhost\n", 0o644)
 
 	tz := sys.Timezone()
+	if z := sys.ResolveZone(root, tz); z != "" {
+		tz = z // Android's old names (Asia/Calcutta) as the distro has them
+	}
 	w("etc/timezone", tz+"\n", 0o644)
 	os.Remove(filepath.Join(root, "etc/localtime"))
 	os.Symlink("/usr/share/zoneinfo/"+tz, filepath.Join(root, "etc/localtime"))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -123,6 +124,11 @@ func install(ctx context.Context, o InstallOpts) error {
 		return err
 	}
 	rep.distro = d.ID
+	unlock, err := lockDistro(d, "install")
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	// Old app keys (LXDE, the window managers) map to a desktop we offer;
 	// if that one isn't offered on this distro, XFCE is. A prefix or a
 	// typo ("xfc") is forgiven, with a note.
@@ -325,6 +331,14 @@ func install(ctx context.Context, o InstallOpts) error {
 			need := spaceNeed(d, de, haveRootfs)
 			free := sys.FreeMB(sys.Home())
 			lg.Printf("free=%dMB need=%dMB", free, need)
+			if free >= 0 && free < need && sys.AndroidSDK() == 0 {
+				// Termux's userland on a PC (termux-docker): no Android to
+				// read, and its free space isn't a phone's (Oct 6: 21
+				// 'not enough space' failures from one x86_64 box).
+				return &ui.UserError{Title: "This doesn't look like an Android phone", Class: "not_android",
+					What: fmt.Sprintf("Andronix runs in Termux on Android phones. Here Android's version can't be read, and the free space reads %d MB (%s with %s needs about %d MB).", free, d.Label(), deLabel, need),
+					Fix:  "Use Termux on an Android phone. On a PC, run the distro there directly."}
+			}
 			if free >= 0 && free < need {
 				return &ui.UserError{Title: "Not enough space", Class: "not_enough_space",
 					What: fmt.Sprintf("Your phone has %d MB free; %s with %s needs about %d MB (with some to spare).", free, d.Label(), deLabel, need),
@@ -488,7 +502,9 @@ func install(ctx context.Context, o InstallOpts) error {
 				if !sys.IsTermux() {
 					return nil
 				}
-				cr.probe(ctx, t, lg)
+				if err := cr.probe(ctx, t, lg); err != nil {
+					return err
+				}
 				if err := cr.refuse(d); err != nil {
 					return err
 				}
@@ -541,7 +557,7 @@ func install(ctx context.Context, o InstallOpts) error {
 			if err := cr.preScripts(ctx, t, r); err != nil {
 				return err
 			}
-			return preUpgrade(ctx, t, d, r)
+			return preUpgrade(ctx, ops, d, r)
 		}},
 		{Label: "Updating " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
 			if prebuilt(in, de) {
@@ -555,6 +571,7 @@ func install(ctx context.Context, o InstallOpts) error {
 			if err := ops.run(ctx, fam.Upgrade, n, r); err != nil {
 				return pkgErr("Couldn't update "+d.Name, err)
 			}
+			run(r, fam.Clean) // the upgrade's downloads go before the desktop's come (support #158)
 			r.Detail(fmt.Sprintf("%d packages", n))
 			return nil
 		}},
@@ -604,7 +621,7 @@ func install(ctx context.Context, o InstallOpts) error {
 				return ui.Skip("already in the image")
 			}
 			r.Label("Installing " + strings.Title(strings.TrimSuffix(b, "-esr")))
-			if err := browserRepo(ctx, d, in.Rootfs, t, fam); err != nil {
+			if err := browserRepo(ctx, d, string(arch), in.Rootfs, t, fam); err != nil {
 				lg.Printf("mozilla repo: %v", err)
 				return ui.Skip("couldn't reach Mozilla; install it later")
 			}
@@ -626,6 +643,10 @@ func install(ctx context.Context, o InstallOpts) error {
 			run(r, "[ -d /etc/ssh ] && command -v ssh-keygen >/dev/null && ssh-keygen -A >/dev/null 2>&1; true")
 			if err := setupDesktop(ctx, in, de, t, r); err != nil {
 				return ui.Errorf("Desktop setup failed", err.Error(), "Run the same command again.")
+			}
+			// A user from an earlier command-line install gets the session files too (#284).
+			if n := userSessionFiles(in); n > 0 {
+				lg.Printf("desktop: copied %d files from /etc/skel to the existing user's home", n)
 			}
 			in.Set("DE", de.ID)
 			in.Set("DE_NAME", deLabel)
@@ -741,8 +762,8 @@ func installShim(root string, arch sys.Arch) error {
 
 // browserRepo adds the browser's own package repository (Mozilla's) and
 // refreshes the package lists; nothing for distros without one.
-func browserRepo(ctx context.Context, d *conf.Distro, root string, t *proot.Target, fam *pkgmgr.Family) error {
-	if d.BrowserRepo != "mozilla" {
+func browserRepo(ctx context.Context, d *conf.Distro, arch, root string, t *proot.Target, fam *pkgmgr.Family) error {
+	if d.BrowserRepoFor(arch) != "mozilla" {
 		return nil
 	}
 	key, _, err := netx.Get(ctx, pkgmgr.MozillaKeyURL, nil)
@@ -1017,9 +1038,37 @@ func downloadErr(err error) error {
 		return &ui.UserError{Title: "Download link expired", Class: "token_refused", What: "The download token was refused (it lasts a limited time, and each purchase has a daily limit).",
 			Fix: "Copy a fresh install command from the Andronix app and run it again.", Err: err}
 	}
-	return &ui.UserError{Title: "Download failed", Class: "download", What: "The download stopped before it finished (" + err.Error() + ").",
-		Fix: "Check your internet connection, then run the same command again. It resumes where it stopped.", Err: err}
+	return &ui.UserError{Title: "Download failed", Class: "download", Kind: downloadKind(err), Detail: pkgmgr.CleanDetail(err.Error()),
+		What: "The download stopped before it finished (" + err.Error() + ").",
+		Fix:  "Check your internet connection, then run the same command again. It resumes where it stopped.", Err: err}
 }
+
+// downloadKind names why a download failed, for telemetry (download
+// failures came with no detail: Ubuntu 26.04 on 32-bit phones, Oct 7).
+func downloadKind(err error) string {
+	var se *netx.StatusError
+	var dns *net.DNSError
+	s := strings.ToLower(err.Error())
+	switch {
+	case errors.As(err, &se):
+		return fmt.Sprintf("http_%d", se.Code)
+	case errors.As(err, &dns):
+		return "network_dns"
+	case errors.Is(err, context.DeadlineExceeded) || strings.Contains(s, "timeout") || strings.Contains(s, "timed out"):
+		return "timeout"
+	case strings.Contains(s, "connection refused") || strings.Contains(s, "connection reset") || strings.Contains(s, "network is unreachable") || strings.Contains(s, "no route to host"):
+		return "network_connect"
+	case strings.Contains(s, "unexpected eof") || strings.Contains(s, "stream error") || strings.Contains(s, "broken pipe"):
+		return "interrupted"
+	case strings.Contains(s, "sha256") || strings.Contains(s, "checksum"):
+		return "checksum"
+	case strings.Contains(s, "no space left"):
+		return "disk_full"
+	}
+	return "other"
+}
+
+var playRepo = termux.PlayRepo // a variable for tests
 
 // termuxPkgErr explains a failed Termux package install (proot, the
 // X server) by what went wrong; manual is the command to do it by hand.
@@ -1040,6 +1089,12 @@ func termuxPkgErr(title, manual string, err error) error {
 	case f.Kind == pkgmgr.KindDiskFull:
 		e.Class, e.Title = "not_enough_space", "Your phone ran out of space"
 		e.Fix = "Free up some space, then run the same command again."
+	case f.Kind.Network() && playRepo():
+		// Play Store Termux has one package server and no mirrors
+		// (support #305: the network refused termux.net).
+		e.Title = "Your network blocks Termux's package server"
+		e.What = "Termux couldn't connect to termux.net (" + f.Detail + "). Termux from the Play Store gets its packages only from there; this network refused or dropped the connection."
+		e.Fix = "Switch between Wi-Fi and mobile data, or turn a VPN on (or off), then run the same command again."
 	case f.Kind.Network():
 		e.What = "Termux's package servers didn't answer, on any mirror we tried (" + f.Detail + ")."
 		e.Fix = "Check your internet (switch between Wi-Fi and mobile data, or turn a VPN off), then run the same command again. Or pick a mirror yourself: termux-change-repo"
@@ -1092,10 +1147,25 @@ func pkgErr(title string, err error) error {
 	switch {
 	case f.Kind == pkgmgr.KindCancelled:
 		return ui.ErrCancelled
+	case f.Kind == pkgmgr.KindLock && strings.HasPrefix(f.Detail, "another andronix"):
+		// support #313: a second install of the same distro (an andronix
+		// without the distro lock, or one in a sandbox we can't see).
+		e.Class = "install_running"
+		e.Title = "Another andronix is using this distro's package manager"
+		e.What = "It is running in another Termux session (" + f.Detail + ")."
+		e.Fix = "Wait for it to finish, or close it, then run the same command again."
 	case f.Kind == pkgmgr.KindDiskFull:
 		e.Class = "not_enough_space"
 		e.Title, e.What = "Your phone ran out of space", "The package manager couldn't write any more files ("+f.Detail+")."
 		e.Fix = "Free up some space (photos, videos, apps you don't use), then run the same command again. It goes on where it stopped."
+	case f.Kind == pkgmgr.KindProotSyscall || f.Kind == "proot_syscall_not_fixed":
+		e.Title = "Linux programs fail under proot on this phone"
+		e.What = "Programs in the distro crash or get 'Function not implemented' from the system (" + f.Detail + "), even after a second try with proot's fast mode off. It isn't your network."
+		e.Fix = "Update Termux (from the Play Store or F-Droid, wherever you got it), then run the same command again. If it still fails, send a report: andronix report."
+	case f.Kind == pkgmgr.KindFakeRoot || f.Kind == "fake_root_not_fixed":
+		e.Title = "The distro's tools don't see root access on this phone"
+		e.What = "A program in the distro refused to run because it isn't root (" + f.Detail + "). proot pretends to be root, and on this phone that didn't work, even after a second try."
+		e.Fix = "Send a report so we can look: andronix report. Meanwhile, another distro (Debian, Ubuntu) may install fine."
 	case f.Kind == pkgmgr.KindKeyring:
 		e.Title = "The package signing keys couldn't be set up"
 		e.What = "The key tool (gpg-agent) wouldn't start under proot on this phone (" + f.Detail + ")."
@@ -1110,12 +1180,24 @@ func pkgErr(title string, err error) error {
 		e.Fix = "Make sure the phone's date and time are set automatically (Settings, Date and time), then run the same command again."
 	case f.Kind == pkgmgr.KindKilled:
 		e.Fix = "Android stopped the install (signal 9). Keep Termux open in front while it runs, and see docs.andronix.app on the phantom process killer; then run the same command again."
+	case f.Kind == pkgmgr.KindMirror:
+		if title == refreshTitle {
+			e.Title = "The package mirrors sent a broken answer"
+		}
+		e.What = "The package mirror redirected in circles or had no package index, on every mirror we tried (" + f.Detail + "). Your network or region is likely redirecting the package servers."
+		e.Fix = "Switch between Wi-Fi and mobile data (or turn a VPN on or off), then run the same command again. It goes on where it stopped."
 	case f.Kind == pkgmgr.KindIntercepted:
 		e.What = "Downloads arrived changed, on every mirror we tried: your network is likely showing a sign-in page or filtering them."
 		e.Fix = "Open a browser and sign in to the Wi-Fi, or switch between Wi-Fi and mobile data (or turn a VPN on or off), then run the same command again."
 	case f.Kind == pkgmgr.KindProotArgs:
 		e.What = "proot refused how Andronix runs it, even with only its basic options. Termux's proot may be broken or very old."
 		e.Fix = "Reinstall it, then run the same command again: pkg reinstall proot"
+	case f.Kind == pkgmgr.KindProotExec:
+		e.What = "proot can't start programs inside the distro on this phone (" + f.Detail + ")."
+		e.Fix = "Send a report so we can look: andronix report"
+	case f.Kind == pkgmgr.KindProotFailed:
+		e.What = "proot stopped with an error (" + f.Detail + ")."
+		e.Fix = "Reinstall it, then run the same command again: pkg reinstall proot. If it still fails, send a report: andronix report"
 	}
 	return e
 }
@@ -1164,9 +1246,9 @@ func finish(in *Inst, de *conf.Desktop, user string, noStart, userStopped bool, 
 	}
 	if start {
 		lines = append(lines, ui.KV("Terminal", "you're going into "+d.Name+"'s terminal now (type exit to leave)"),
-			ui.KV("", "next time, from Termux: ./"+d.MainStart()), "")
+			ui.KV("", "next time, from Termux: andronix start "+d.ID), "")
 	} else {
-		lines = append(lines, ui.KV("Terminal", "./"+d.MainStart()))
+		lines = append(lines, ui.KV("Terminal", "andronix start "+d.ID+" (or ./"+d.MainStart()+")"))
 	}
 	if !de.None() {
 		lines = append(lines, ui.KV("Or VNC", "vncserver-start inside "+d.Name+", then localhost:1 in a VNC viewer"))
@@ -1177,6 +1259,7 @@ func finish(in *Inst, de *conf.Desktop, user string, noStart, userStopped bool, 
 	lines = append(lines, ui.KV("Remove", "andronix remove "+d.ID))
 	if r := in.Get("RENAMED"); r != "" {
 		lines = append(lines, "", "Your older "+d.Name+" is untouched. Start it with ./"+strings.Fields(r)[0])
+		in.Set("RENAMED", "") // said once: later installs of this distro don't repeat it
 	}
 	fmt.Println()
 	title := d.Label() + " is ready"
@@ -1190,6 +1273,10 @@ func finish(in *Inst, de *conf.Desktop, user string, noStart, userStopped bool, 
 		}
 	}
 	ui.Footer()
+	// The last line says how to come back (support #164 #176 #218: after a
+	// command-line install, users didn't know how to start it again).
+	fmt.Println("  " + startLine(d, de))
+	fmt.Println()
 	rep.send("ok") // before the shell: Login replaces this process
 	if start {
 		startSound(context.Background(), true)
@@ -1197,6 +1284,15 @@ func finish(in *Inst, de *conf.Desktop, user string, noStart, userStopped bool, 
 			ui.ShowError(err)
 		}
 	}
+}
+
+// startLine is the install's last line: how to start the distro (or its
+// desktop) again from Termux.
+func startLine(d *conf.Distro, de *conf.Desktop) string {
+	if !de.None() {
+		return ui.Bold("Open the desktop any time, from Termux: andronix desktop " + d.ID)
+	}
+	return ui.Bold("Start " + d.Name + " any time, from Termux: andronix start " + d.ID)
 }
 
 // resolvedID is the id a distro or desktop name resolves to (the name
@@ -1212,12 +1308,16 @@ func resolvedID(what, name string) string {
 	return name
 }
 
-// preUpgrade runs DISTRO_PRE_UPGRADE (after a refresh, before upgrades).
-func preUpgrade(ctx context.Context, t *proot.Target, d *conf.Distro, r ui.Reporter) error {
+// preUpgrade runs DISTRO_PRE_UPGRADE (after a refresh, before upgrades),
+// with the package manager's diagnosis and recoveries: Ubuntu 26.04's
+// switch to GNU coreutils is an apt-get install that runs on every 2.0.x
+// install and failed on Play Termux with no log or retry (support #147).
+func preUpgrade(ctx context.Context, ops *pkgOps, d *conf.Distro, r ui.Reporter) error {
 	if d.PreUpgrade == "" {
 		return nil
 	}
-	if err := t.Run(ctx, d.PreUpgrade, nil, func(l string) { r.Line(l) }); err != nil {
+	ops.lg.Printf("package manager: preparing %s for updates: %s", d.Label(), d.PreUpgrade)
+	if err := ops.run(ctx, d.PreUpgrade, 0, r); err != nil {
 		return pkgErr("Couldn't prepare "+d.Label()+" for updates", err)
 	}
 	return nil

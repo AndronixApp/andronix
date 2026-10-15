@@ -15,14 +15,18 @@ import (
 type Kind string
 
 const (
-	KindDNS       Kind = "network_dns"
-	KindConnect   Kind = "network_connect"
-	KindHTTP404   Kind = "http_404"
-	KindHTTP5xx   Kind = "http_5xx"
-	KindHash      Kind = "hash_mismatch"
-	KindClock     Kind = "clock_skew"
-	KindGPG       Kind = "gpg"
-	KindDpkg      Kind = "dpkg_interrupted"
+	KindDNS     Kind = "network_dns"
+	KindConnect Kind = "network_connect"
+	KindHTTP404 Kind = "http_404"
+	KindHTTP5xx Kind = "http_5xx"
+	KindHash    Kind = "hash_mismatch"
+	KindClock   Kind = "clock_skew"
+	KindGPG     Kind = "gpg"
+	KindDpkg    Kind = "dpkg_interrupted"
+	// A package dpkg left half-unpacked ("very bad inconsistent state; it
+	// should be reinstalled"): an install stopped mid-unpack, then resumed
+	// (support #201 #203: Kali XFCE, TECNO KI7). --configure -a can't fix it.
+	KindReinstreq Kind = "dpkg_reinstreq"
 	KindLock      Kind = "lock"
 	KindBroken    Kind = "broken_deps"
 	KindDiskFull  Kind = "disk_full"
@@ -34,12 +38,33 @@ const (
 	// "InRelease is not signed" on mirrors that are fine: the network
 	// rewrote the plain-HTTP download (a Wi-Fi login page or a filter).
 	KindIntercepted Kind = "network_intercepted"
-	// proot refused one of its options ("see proot --help").
+	// proot refused one of its options ("unknown option", then "see
+	// proot --help").
 	KindProotArgs Kind = "proot_args"
+	// The mirror sent apt in circles ("Redirection loop encountered") or
+	// answered without its index ("does not have a Release file"): Kali's
+	// kali.download and http.kali.org redirect to each other (support
+	// #209-211, realme, Oct 2026).
+	KindMirror Kind = "mirror_unusable"
+	// proot ran but couldn't start any program in the distro: execve
+	// failed (support #171 #124 #110: 32-bit phones, every exec ENOENT).
+	KindProotExec Kind = "proot_exec"
+	// proot stopped with another fatal error ("see proot --help" ends
+	// every proot fatal error, not only option ones).
+	KindProotFailed Kind = "proot_failed"
 	// pacman-key couldn't make the local keyring: gpg-agent didn't start
 	// under proot (support #119: Redmi Note 8 Pro, kernel 4.14).
 	KindKeyring Kind = "keyring"
-	KindOther   Kind = "other"
+	// A program in the distro wasn't root under proot -0 ("pacman-key
+	// needs to be run as root", "are you root?"): proot's fake root didn't
+	// take (support #312: Arch, an Android 16 ROM on kernel 4.14).
+	KindFakeRoot Kind = "fake_root"
+	// Syscalls fail inside the distro under proot: the shell's getcwd()
+	// gets ENOSYS and gpgv dies on a signal, so every InRelease reads
+	// as "not signed" (support #470/#471: Blackview SHARK 8, Android 13,
+	// kernel 5.10, Play Termux 2026.02.11). Not the network.
+	KindProotSyscall Kind = "proot_syscall"
+	KindOther        Kind = "other"
 )
 
 // Most specific first: a 404 or a hash mismatch also prints "Failed to
@@ -48,17 +73,23 @@ var patterns = []struct {
 	kind Kind
 	re   *regexp.Regexp
 }{
+	{KindProotSyscall, regexp.MustCompile(`(?i)getcwd\(\) failed: function not implemented|sub-process /usr/bin/(gpgv|sqv|gpg) exited unexpectedly`)},
 	{KindDiskFull, regexp.MustCompile(`(?i)no space left on device|not enough free space|you don't have enough free space|insufficient disk space`)},
-	{KindProotArgs, regexp.MustCompile(`(?i)see .?proot --help`)},
+	{KindProotExec, regexp.MustCompile(`(?i)proot error: execve\(`)},
+	{KindProotArgs, regexp.MustCompile(`(?i)proot error: .*(unknown|invalid|unrecognized|bad) option|option .*requires an argument`)},
+	{KindProotFailed, regexp.MustCompile(`(?i)see .?proot --help`)},
 	{KindHook, regexp.MustCompile(`(?i)problem executing scripts|post-invoke|^e: sub-process returned an error code$`)},
+	{KindReinstreq, regexp.MustCompile(`(?i)very bad inconsistent state|should be reinstalled before|reinstreq`)},
 	{KindDpkg, regexp.MustCompile(`(?i)dpkg was interrupted|dpkg --configure -a`)},
+	{KindFakeRoot, regexp.MustCompile(`(?i)needs to be run as root|must be run as root|requires superuser privilege|unless you are root|you must be root|are you root\?`)},
 	{KindLock, regexp.MustCompile(`(?i)could not get lock|unable to acquire the dpkg frontend lock|unable to lock database|db\.lck|waiting for cache lock`)},
 	{KindClock, regexp.MustCompile(`(?i)is not valid yet|not valid until|release file .* is expired|invalid for another`)},
 	{KindHash, regexp.MustCompile(`(?i)hash sum mismatch|file has unexpected size|hashes of expected file|mirror sync in progress|invalid or corrupted package|checksum doesn't match|sha256 mismatch`)},
+	{KindMirror, regexp.MustCompile(`(?i)redirection loop|does not have a release file`)},
 	{KindHTTP404, regexp.MustCompile(`(?i)\b404\s+not found|error 404|http/[0-9.]+ 404`)},
 	{KindHTTP5xx, regexp.MustCompile(`(?i)\b50[0-9]\s+(internal|bad gateway|service|gateway)|error 50[0-9]|http/[0-9.]+ 50[0-9]`)},
 	{KindDNS, regexp.MustCompile(`(?i)temporary failure resolving|could not resolve|name or service not known|unknown host|no address associated|resolving timed out`)},
-	{KindConnect, regexp.MustCompile(`(?i)could not connect|connection timed out|connection refused|connection failed|connection reset|network is unreachable|operation timed out|failed to connect|unable to connect|transfer failed|failed retrieving file|couldn't download|reposync|curl error|cannot download|errno 104|ssl connect error|tls handshake|certificate verify failed`)},
+	{KindConnect, regexp.MustCompile(`(?i)could not connect|connection timed out|connection refused|connection failed|connection reset|network is unreachable|operation timed out|failed to connect|unable to connect|transfer failed|failed retrieving file|couldn't download|reposync|curl error|cannot download|errno 104|ssl connect error|tls handshake|certificate verify failed|certificate verification failed|no system certificates available`)},
 	{KindKeyring, regexp.MustCompile(`(?i)gnupg agent unusable|agent_genkey failed|no agent running|no secret key available to sign with|can't connect to the gpg-agent`)},
 	{KindGPG, regexp.MustCompile(`(?i)no_pubkey|invalid signature|expkeysig|badsig|gpg error|public key is not available|signature .* is (unknown|invalid)|key is unknown`)},
 	// After GPG: "not signed" with a real key error is GPG; alone, the

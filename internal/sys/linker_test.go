@@ -39,6 +39,17 @@ func TestLinkerExec(t *testing.T) {
 	if !reflect.DeepEqual(got, []string{"andronix", "install", "alpine"}) {
 		t.Fatalf("linker, other name: %v", got)
 	}
+	// A cgo build: bionic already dropped the path, argv[0] is it.
+	selfPath = ""
+	got = fixLinkerArgs("/system/bin/linker64", "", []string{elf, "__dnsfwd", "/r", "1"})
+	if !reflect.DeepEqual(got, []string{elf, "__dnsfwd", "/r", "1"}) || selfPath != elf {
+		t.Fatalf("cgo, argv[0] is ours: %v %q", got, selfPath)
+	}
+	selfPath = ""
+	got = fixLinkerArgs("/system/bin/linker64", elf, []string{"andronix", "version"})
+	if !reflect.DeepEqual(got, []string{"andronix", "version"}) || selfPath != elf {
+		t.Fatalf("cgo, argv[0] a bare name: %v %q", got, selfPath)
+	}
 	got = fixLinkerArgs("/system/bin/linker64", elf, []string{"andronix", elf, "version"})
 	if p, _ := Executable(); p != elf {
 		t.Errorf("Executable = %s", p)

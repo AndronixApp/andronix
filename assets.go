@@ -13,7 +13,7 @@ var Data embed.FS
 // ci/build-preload.sh): an LD_PRELOAD shim for glibc 2.39+'s fchmodat2,
 // which proot doesn't translate on Linux 6.6+ (docs/ports/void.md).
 //
-//go:embed guest/preload/*/*.so
+//go:embed guest/preload/*/*.so guest/preload/*/*.so.2
 var Preload embed.FS
 
 // SelfBin holds selfbin/andronix-linux.gz in the GOOS=android builds: the

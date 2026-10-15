@@ -1,0 +1,18 @@
+{
+ "source": "recorded 2026-10-14 from support #438's report AX-KY866Z (installer 2.0.8): Amazon Fire 5 (ford) on LineageOS, Android 7.1 (sdk 25), kernel 3.10.108, 32-bit arm, 867 MB RAM, GitHub Termux 0.118.3, Ubuntu 26.04 KDE. systemd's postinst failed with 'Failed to take /etc/passwd lock: Invalid argument'. No in-distro probe (32-bit arm); host facts only.",
+ "distro": "ubuntu",
+ "family": "apt",
+ "de": "kde",
+ "probe": {
+  "probe_version": 4,
+  "kernel": "3.10.108",
+  "sdk": 25,
+  "termux": "github"
+ },
+ "expect": [
+  "old-syscall-order",
+  "old-kernel-desktop",
+  "mount-id-shim",
+  "ofd-lock-shim"
+ ]
+}

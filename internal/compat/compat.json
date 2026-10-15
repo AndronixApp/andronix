@@ -43,7 +43,39 @@
     },
     {
       "id": "mount-id-shim",
-      "why": "Before Linux 5.8 statx has no mount id, and under proot name_to_handle_at isn't there either: systemd 256+'s chase() fails with EUNATCH ('Protocol driver not attached'), so sysusers/tmpfiles can't read their config and sudo, dbus and the desktop stay unconfigured (Kali on a Redmi Note 7 Pro, 4.14; andronix-a9, 4.4). The shim gives statx a mount id per filesystem.",
+      "why": "Before Linux 5.8 statx has no mount id, and under proot name_to_handle_at isn't there either: systemd 256+'s chase() fails with EUNATCH ('Protocol driver not attached'), so sysusers/tmpfiles can't read their config and sudo, dbus and the desktop stay unconfigured (Kali on a Redmi Note 7 Pro, 4.14; andronix-a9, 4.4). The shim gives statx a mount id per filesystem. Keyed on the kernel, not the probe: on 32-bit arm with old kernels Termux's proot crashes the in-distro probe (Go: 'futexwakeup ... returned -38'), so a probe-keyed rule never fired there (Kali armhf, Galaxy A13 5G, 4.14). The shim changes nothing where the kernel gives the mount id.",
+      "when": {
+        "kernel_lt": "5.8",
+        "family": [
+          "apt",
+          "dnf",
+          "pacman",
+          "xbps"
+        ]
+      },
+      "do": {
+        "preload": "mntid"
+      }
+    },
+    {
+      "id": "ofd-lock-shim",
+      "why": "Kernels before 3.15 have no open file description locks (fcntl F_OFD_SETLKW: EINVAL). systemd 256+ takes /etc/.pwd.lock that way, so sysusers and systemd's postinst stop with 'Failed to take /etc/passwd lock: Invalid argument' (support #436 Kali, Galaxy S6 edge+ on 3.10.61; #438 Ubuntu KDE, Fire 5 on 3.10.108). The shim turns F_OFD_* into the classic POSIX lock commands. Keyed on the kernel (32-bit arm can't run the in-distro probe).",
+      "when": {
+        "kernel_lt": "3.15",
+        "family": [
+          "apt",
+          "dnf",
+          "pacman",
+          "xbps"
+        ]
+      },
+      "do": {
+        "preload": "ofdlock"
+      }
+    },
+    {
+      "id": "mount-id-shim-probe",
+      "why": "The same shim wherever the probe sees statx give no mount id, whatever the kernel: ChromeOS ARC on kernel 5.10 reports statx_mnt_id missing (support #326's probe), and mount-id-shim, keyed on kernel < 5.8 (kept for 32-bit arm, where the probe can't run), misses it. The shim fills the id only when the kernel didn't, so it is a no-op elsewhere.",
       "when": {
         "family": [
           "apt",
@@ -59,6 +91,28 @@
       },
       "do": {
         "preload": "mntid"
+      }
+    },
+    {
+      "id": "creat-blocked",
+      "why": "On x86 glibc's creat() is the legacy creat syscall, and Android's x86 app sandbox (ChromeOS ARC on a Chromebook) doesn't allow it: ENOSYS. dnf's key import (librepo) writes every key with creat(), so each Fedora package install failed with 'Failed to create file ... Function not implemented' (support #326, Chromebook grunt, x86_64). The shim makes creat() an open() with O_CREAT|O_WRONLY|O_TRUNC. Other CPUs have no creat syscall (the probe answers ok).",
+      "when": {
+        "family": [
+          "apt",
+          "dnf",
+          "pacman",
+          "xbps"
+        ],
+        "probe": {
+          "creat": [
+            "ENOSYS",
+            "EPERM",
+            "SIGSYS"
+          ]
+        }
+      },
+      "do": {
+        "preload": "creat"
       }
     },
     {

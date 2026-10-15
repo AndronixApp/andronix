@@ -46,6 +46,16 @@ func fixLinkerArgs(exe, self string, args []string) []string {
 		selfPath, _ = filepath.Abs(args[1])
 		return append([]string{args[0]}, args[2:]...)
 	}
+	// A cgo build gets argv from bionic, which already dropped the linker's
+	// argument: args[0] is our path. Without this, Executable was the
+	// linker and every self-exec (the DNS forwarder, probes) ran the linker
+	// with our arguments.
+	switch {
+	case len(args) > 0 && isELF(args[0]):
+		selfPath, _ = filepath.Abs(args[0])
+	case self != "" && isELF(self):
+		selfPath, _ = filepath.Abs(self)
+	}
 	return args
 }
 

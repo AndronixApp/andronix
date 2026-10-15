@@ -39,7 +39,7 @@ esac
 
 docker build -q -t andronix-test -f tests/Dockerfile tests >/dev/null 2>&1
 docker rm -f "$box" >/dev/null 2>&1
-docker run -d --init --name "$box" -v "$PWD":/src:ro andronix-test sleep infinity >/dev/null
+docker run -d --init -e ANDRONIX_NO_TELEMETRY=1 --name "$box" -v "$PWD":/src:ro andronix-test sleep infinity >/dev/null
 trap 'docker rm -f "$box" >/dev/null 2>&1' EXIT
 run() { docker exec -e COLUMNS=60 "$box" bash -c "$1"; }
 

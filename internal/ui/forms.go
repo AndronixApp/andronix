@@ -3,9 +3,11 @@ package ui
 import (
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
 )
 
 // Theme is huh in Andronix colours.
@@ -30,8 +32,22 @@ func Theme() *huh.Theme {
 	return t
 }
 
+// noTerminal is a question asked with no terminal to answer it in (a new
+// error each time: callers fill in its Log).
+// Prompts read os.Stdin, never /dev/tty: bubbletea's fallback to opening
+// /dev/tty failed with "could not open a new TTY: open /dev/tty: no such
+// device or address" in a session without a controlling terminal (#255).
+func noTerminal() *UserError {
+	return &UserError{Class: "needs_a_terminal", Title: "This needs a terminal",
+		What: "Andronix has a question for you, but its input isn't a terminal, so there's nowhere to type the answer.",
+		Fix:  "Run the same command in Termux's own window (type or paste it there), not from a script or another app."}
+}
+
 func run(fields ...huh.Field) error {
-	f := huh.NewForm(huh.NewGroup(fields...)).WithTheme(Theme()).WithWidth(W() - 2).WithShowHelp(false)
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return noTerminal()
+	}
+	f := huh.NewForm(huh.NewGroup(fields...)).WithTheme(Theme()).WithWidth(W() - 2).WithShowHelp(false).WithInput(os.Stdin)
 	if ASCII {
 		f = f.WithAccessible(true)
 	}
@@ -87,12 +103,12 @@ func Input(title, desc, placeholder string, validate func(string) error) (string
 	return v, err
 }
 
-// Password asks twice and checks both match.
+// Password asks twice and checks both match. A mismatch says so and
+// asks for both again (support #226: "Type it again" alone confused).
 func Password(title, desc string, min, max int) (string, error) {
 	if !Interactive {
 		return "", fmt.Errorf("%s: needs a terminal", title)
 	}
-	var a, b string
 	check := func(s string) error {
 		if len(s) < min {
 			return fmt.Errorf("use at least %d characters", min)
@@ -102,14 +118,28 @@ func Password(title, desc string, min, max int) (string, error) {
 		}
 		return nil
 	}
-	err := run(
-		huh.NewInput().Title(title).Description(desc).EchoMode(huh.EchoModePassword).Validate(check).Value(&a),
-		huh.NewInput().Title("Type it again").EchoMode(huh.EchoModePassword).Validate(func(s string) error {
-			if s != a {
-				return errors.New("the passwords don't match")
-			}
-			return nil
-		}).Value(&b),
-	)
-	return a, err
+	for {
+		var a, b string
+		err := run(
+			huh.NewInput().Title(title).Description(passwordDesc(desc)).EchoMode(huh.EchoModePassword).Validate(check).Value(&a),
+			huh.NewInput().Title("Type the same password again").Description("To catch typos.").EchoMode(huh.EchoModePassword).Value(&b),
+		)
+		if err != nil || a == b {
+			return a, err
+		}
+		Warn("The two passwords didn't match. Type both again.")
+	}
+}
+
+// passwordDesc adds what the typing looks like: stars, or nothing at all
+// in the plain (ASCII) prompts, which read like sudo's.
+func passwordDesc(desc string) string {
+	hint := "Each character shows as *."
+	if ASCII {
+		hint = "Nothing shows while you type; that's normal."
+	}
+	if desc == "" {
+		return hint
+	}
+	return desc + " " + hint
 }

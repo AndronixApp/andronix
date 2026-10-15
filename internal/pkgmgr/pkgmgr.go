@@ -100,7 +100,11 @@ func SetMirror(root, family, url string) error {
 }
 
 const aptEnv = "DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none "
-const aptOpts = "-o Dpkg::Use-Pty=0 -o APT::Color=0 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Acquire::Retries=3 "
+
+// APT::Keep-Downloaded-Packages=false: apt-get drops the .debs once a run
+// has installed them (as the apt command does), so a phone with little
+// space doesn't keep them until our clean (support #158).
+const aptOpts = "-o Dpkg::Use-Pty=0 -o APT::Color=0 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Acquire::Retries=3 -o APT::Keep-Downloaded-Packages=false "
 
 var families = map[string]*Family{
 	// Debian, Ubuntu, Kali.

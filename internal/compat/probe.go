@@ -16,7 +16,7 @@ import (
 // ProbeVersion changes whenever the probe's logic or fields change
 // (3: LineageOS detection), so a cached probe from an older andronix is
 // measured again.
-const ProbeVersion = 3
+const ProbeVersion = 4 // 4: creat (support #326)
 
 // Probe is what was measured on this phone.
 type Probe struct {

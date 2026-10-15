@@ -34,6 +34,7 @@ Why:
   ```
   The mirror's certificate itself is valid (checked with curl on the Mac).
 - **Installing `ca-certificates` first isn't enough.** The first try installed it right after `update`, and it fixed a few runs. Then the redirector sent the `ca-certificates` download itself to the https mirror (the line above), and LXQt failed.
+- **Oct 2026, 2.0.7: the rewrite is gone.** kali.download now redirects package indexes to http.kali.org, which can send them back (apt: "Redirection loop encountered", support #209-211; 10 of 20 chains). Kali keeps the image's http.kali.org (0 loops in 20, 2 of 20 to https mirrors, retried). The notes below are the Sept 2026 state.
 - **`kali.download` is Kali's own CDN** (Cloudflare). It serves plain http with no redirects: `HEAD /kali/dists/kali-rolling/InRelease` returns 200 directly.
   - After the rewrite, all 4 Kali combos passed.
   - Package integrity still comes from apt's GPG signatures (`kali-archive-keyring`), not from TLS.

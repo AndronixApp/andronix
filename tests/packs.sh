@@ -19,7 +19,7 @@ box="andronix-packs-$distro-$$"
 mkdir -p dist/packs
 log=dist/packs/$distro.log
 docker build -q -t andronix-test -f tests/Dockerfile tests >/dev/null || { echo "docker build failed"; exit 1; }
-docker run -d --init --name "$box" -v "$PWD":/src:ro andronix-test sleep infinity >/dev/null
+docker run -d --init -e ANDRONIX_NO_TELEMETRY=1 --name "$box" -v "$PWD":/src:ro andronix-test sleep infinity >/dev/null
 trap 'docker rm -f "$box" >/dev/null 2>&1' EXIT
 run() { docker exec -e COLUMNS=80 "$box" bash -c "$1"; }
 A=/home/termux/.local/bin/andronix

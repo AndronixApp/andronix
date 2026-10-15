@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -36,7 +37,7 @@ type args struct {
 }
 
 // valueFlags are the flags that take the next argument as their value.
-var valueFlags = map[string]bool{"de": true, "desktop": true, "wm": true, "user": true, "token": true, "to": true, "profile": true, "manifest": true, "edition": true, "channel": true, "message": true, "open": true}
+var valueFlags = map[string]bool{"de": true, "desktop": true, "wm": true, "user": true, "token": true, "to": true, "profile": true, "manifest": true, "edition": true, "channel": true, "message": true, "open": true, "attach": true}
 
 func parse(in []string, withValue map[string]bool) args {
 	a := args{flags: map[string]string{}}
@@ -118,6 +119,7 @@ func reportHelp() {
 	ui.Row("--message TEXT", "one line about what happened", 16)
 	ui.Row("--dry-run", "only print what would be sent", 16)
 	ui.Row("--open AX-ID", "open a waiting report in the app", 16)
+	ui.Row("--attach AX-ID", "join it to your report from the Andronix app", 16)
 	ui.Row("--yes", "for scripts: send without asking (still prints it)", 16)
 	ui.Footer()
 }
@@ -162,6 +164,15 @@ func main() {
 	all := os.Args[1:]
 	// The compat probe, inside a distro (compat.RunAll runs each syscall in
 	// its own child: `__probe one <name>`).
+	// A session's DNS forwarder (app.DNSForward, card #141).
+	if len(all) == 3 && all[0] == "__dnsfwd" {
+		pid, _ := strconv.Atoi(all[2])
+		if err := app.ForwarderCommand(all[1], pid); err != nil {
+			fmt.Fprintln(os.Stderr, "__dnsfwd:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(all) >= 1 && all[0] == "__probe" {
 		if len(all) == 3 && all[1] == "one" {
 			fmt.Println(compat.RunOne(all[2]))
@@ -256,7 +267,7 @@ func main() {
 	case "list", "ls":
 		err = app.List()
 	case "report":
-		err = app.Report(ctx, a.has("dry-run"), a.flags["message"], a.flags["open"])
+		err = app.Report(ctx, a.has("dry-run"), a.flags["message"], a.flags["open"], a.flags["attach"])
 	case "clean":
 		err = app.Clean()
 	case "backup":

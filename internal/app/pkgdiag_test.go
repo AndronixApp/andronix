@@ -1,12 +1,16 @@
 package app
 
 import (
+	"context"
 	"errors"
+	"github.com/AndronixApp/andronix-distros/internal/netx"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
 	"github.com/AndronixApp/andronix-distros/internal/pkgmgr"
@@ -138,6 +142,23 @@ func TestSpaceNeed(t *testing.T) {
 	if r, f := spaceNeed(deb, xfce, true), spaceNeed(deb, xfce, false); r >= f {
 		t.Errorf("a resume (%d) needs less than a fresh install (%d)", r, f)
 	}
+	// Support #158: Ubuntu 24.04 with MATE peaked at 1579 MB (a16).
+	u24, _ := conf.LoadDistro("ubuntu24")
+	mate, _ := conf.ResolveDesktop("mate")
+	if n := spaceNeed(u24, mate, false); n < 1579 {
+		t.Errorf("ubuntu24 mate: %d MB, below the measured peak", n)
+	}
+	// The other measured peaks (a16, Oct 7), with at least 10% to spare.
+	lxqt, _ := conf.ResolveDesktop("lxqt")
+	for _, c := range []struct {
+		d    *conf.Distro
+		de   *conf.Desktop
+		peak int64
+	}{{deb, xfce, 1179}, {u24, xfce, 1072}, {u24, lxqt, 1374}, {deb, kde, 2194}, {u24, mate, 1579}} {
+		if n := spaceNeed(c.d, c.de, false); n < c.peak*11/10 {
+			t.Errorf("%s %s: %d MB, under 1.1x the measured peak %d", c.d.ID, c.de.ID, n, c.peak)
+		}
+	}
 	if n := spaceNeed(deb, none, false); n <= 0 || n >= spaceNeed(deb, xfce, false) {
 		t.Errorf("none: %d", n)
 	}
@@ -184,4 +205,132 @@ func TestKeyringAgentWrap(t *testing.T) {
 	if strings.Contains(keyringReset, "--daemon") {
 		t.Error("the reset must not start a daemon (its own proot session ends it, and it holds the pipe)")
 	}
+}
+
+// Download failures say why (telemetry error_kind), with no URL or path in
+// the detail.
+func TestDownloadKind(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want string
+	}{
+		{&netx.StatusError{Code: 404}, "http_404"},
+		{&net.DNSError{Err: "no such host", Name: "dl.andronix.app"}, "network_dns"},
+		{errors.New("read tcp 10.0.0.2:5555->1.2.3.4:443: read: connection reset by peer"), "network_connect"},
+		{errors.New("unexpected EOF"), "interrupted"},
+		{errors.New("context deadline exceeded (Client.Timeout exceeded while awaiting headers)"), "timeout"},
+		{errors.New("something else"), "other"},
+	} {
+		if got := downloadKind(c.err); got != c.want {
+			t.Errorf("%v: %s, want %s", c.err, got, c.want)
+		}
+	}
+	e := downloadErr(errors.New(`Get "https://dl.andronix.app/rootfs/ubuntu/26.04/ubuntu-26.04-arm.tar.xz": unexpected EOF`)).(*ui.UserError)
+	if e.Kind != "interrupted" || strings.Contains(e.Detail, "rootfs/") || e.Detail == "" {
+		t.Errorf("kind %q detail %q", e.Kind, e.Detail)
+	}
+}
+
+// A redirect loop or a missing Release file (support #209-211: Kali's
+// kali.download and http.kali.org redirect to each other) moves to the next,
+// direct mirror once; if that fails too, the message names the network.
+func TestMirrorUnusable(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "etc/apt/sources.list.d/kali.sources")
+	os.MkdirAll(filepath.Dir(src), 0o755)
+	os.WriteFile(src, []byte("URIs: http://http.kali.org/kali/\n"), 0o644)
+	d, err := conf.LoadDistro("kali")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fam, _ := pkgmgr.Get(d.Family)
+	lg := NewLog("test")
+	defer lg.Close()
+	p := newPkgOps(&proot.Target{Rootfs: root}, fam, d, lg)
+	f := &pkgmgr.Failure{Kind: pkgmgr.KindMirror, Detail: "Redirection loop encountered", Err: errors.New("exit status 100")}
+	if !p.recover(context.Background(), f, 1, true, nopRep{}) {
+		t.Fatal("no retry on the first mirror_unusable")
+	}
+	if b, _ := os.ReadFile(src); string(b) != "URIs: http://mirrors.ocf.berkeley.edu/kali/\n" {
+		t.Errorf("after the switch: %s", b)
+	}
+	if p.recover(context.Background(), f, 2, true, nopRep{}) {
+		t.Error("retried a second time")
+	}
+	// An install an older version rewrote to kali.download goes to the redirector.
+	os.WriteFile(src, []byte("URIs: http://kali.download/kali/\n"), 0o644)
+	q := newPkgOps(&proot.Target{Rootfs: root}, fam, d, lg)
+	if !q.recover(context.Background(), f, 1, true, nopRep{}) {
+		t.Fatal("no retry from kali.download")
+	}
+	if b, _ := os.ReadFile(src); string(b) != "URIs: http://http.kali.org/kali/\n" {
+		t.Errorf("from kali.download: %s", b)
+	}
+	var ue *ui.UserError
+	if !errors.As(pkgErr(refreshTitle, f), &ue) || ue.Kind != "mirror_unusable" || !strings.Contains(ue.What, "network") || ue.Title != "The package mirrors sent a broken answer" {
+		t.Errorf("message: %+v", ue)
+	}
+}
+
+// The install ends with how to start it again (support #164 #176 #218).
+func TestStartLine(t *testing.T) {
+	k, _ := conf.LoadDistro("kali")
+	none, _, _ := conf.ResolveDesktopCompat("none")
+	xfce, _, _ := conf.ResolveDesktopCompat("xfce")
+	if got := startLine(k, none); !strings.Contains(got, "Start Kali Linux any time, from Termux: andronix start kali") {
+		t.Errorf("command line: %q", got)
+	}
+	if got := startLine(k, xfce); !strings.Contains(got, "andronix desktop kali") {
+		t.Errorf("desktop: %q", got)
+	}
+}
+
+// support #312 (a program that isn't root under proot -0) and #471
+// (getcwd ENOSYS, gpgv dying: every InRelease "not signed") get one retry
+// with PROOT_NO_SECCOMP=1, and the outcome is logged and kept for telemetry
+// (<kind>_retried / <kind>_not_fixed).
+func TestSeccompRetry(t *testing.T) {
+	gpgv := `echo "sh: 0: getcwd() failed: Function not implemented"; echo "Err:1 http://ports.ubuntu.com/ubuntu-ports resolute InRelease"; echo "  Sub-process /usr/bin/gpgv exited unexpectedly"; echo "E: The repository 'http://ports.ubuntu.com/ubuntu-ports resolute InRelease' is not signed."; exit 100`
+	for _, c := range []struct {
+		name, distro string
+		script       string // run in this test's shell: fails once, or always
+		wantErr      bool
+		want         string // pmSaved, or the failure kind
+	}{
+		{"fake root fixed", "arch", `if [ -e "$M" ]; then exit 0; fi; touch "$M"; echo "==> ERROR: pacman-key needs to be run as root for this operation."; exit 1`, false, "fake_root_retried"},
+		{"fake root not fixed", "arch", `echo "==> ERROR: pacman-key needs to be run as root for this operation."; exit 1`, true, "fake_root_not_fixed"},
+		{"gpgv fixed", "ubuntu", `if [ -e "$M" ]; then exit 0; fi; touch "$M"; ` + gpgv, false, "proot_syscall_retried"},
+		{"gpgv not fixed", "ubuntu", gpgv, true, "proot_syscall_not_fixed"},
+	} {
+		d, err := conf.LoadDistro(c.distro)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fam, _ := pkgmgr.Get(d.Family)
+		proot.NoSeccomp, pmSaved = false, ""
+		lg := NewLog("test")
+		p := newPkgOps(&proot.Target{Rootfs: t.TempDir(), Local: true}, fam, d, lg)
+		p.sleep = func(time.Duration) {}
+		t.Setenv("M", filepath.Join(t.TempDir(), "marker"))
+		err = p.do(context.Background(), c.script, 0, nopRep{}, false)
+		lg.Close()
+		b, _ := os.ReadFile(lg.Path)
+		if !proot.NoSeccomp {
+			t.Errorf("%s: PROOT_NO_SECCOMP not set for the retry", c.name)
+		}
+		var f *pkgmgr.Failure
+		switch {
+		case c.wantErr && (!errors.As(err, &f) || string(f.Kind) != c.want):
+			t.Errorf("%s: err %v, want kind %s", c.name, err, c.want)
+		case !c.wantErr && (err != nil || pmSaved != c.want):
+			t.Errorf("%s: err %v, pmSaved %q", c.name, err, pmSaved)
+		}
+		if !strings.Contains(string(b), "the retry with PROOT_NO_SECCOMP=1") {
+			t.Errorf("%s: outcome not logged:\n%s", c.name, b)
+		}
+		if strings.Count(string(b), "trying again with PROOT_NO_SECCOMP=1") != 1 {
+			t.Errorf("%s: retried more than once:\n%s", c.name, b)
+		}
+	}
+	proot.NoSeccomp, pmSaved = false, ""
 }

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/AndronixApp/andronix-distros/internal/rootfs"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
 	"os"
 	"path/filepath"
@@ -209,6 +210,12 @@ func sessionDied(xstartup string) (bool, string) {
 	return true, strings.Join(lines, " / ")
 }
 
+// xServerFileCap is the most Xvnc may write to any one file (its log). A
+// runaway X server is stopped by the kernel there (SIGXFSZ): orphaned when
+// Android killed its proot, Xvfb looped on poll() and wrote 10 GB of log
+// in 20 minutes (a16, Oct 7), which on a phone fills the disk.
+const xServerFileCap = 16 << 20
+
 // startXvnc runs Xvnc and the session directly, detached, and waits for
 // the display socket.
 func startXvnc(num int, size, listen, passwd, xstartup, logf string, extra []string) ([]byte, error) {
@@ -237,6 +244,9 @@ func startXvnc(num int, size, listen, passwd, xstartup, logf string, extra []str
 	if err := x.Start(); err != nil {
 		return nil, err
 	}
+	if err := capFileSize(x.Process.Pid, xServerFileCap); err != nil {
+		fmt.Fprintf(lg, "andronix: no file size cap on Xvnc: %v\n", err)
+	}
 	sock := fmt.Sprintf("/tmp/.X11-unix/X%d", num)
 	for i := 0; i < 20; i++ {
 		if _, err := os.Stat(sock); err == nil {
@@ -251,7 +261,15 @@ func startXvnc(num int, size, listen, passwd, xstartup, logf string, extra []str
 	}
 	s := sys.Command(xstartup)
 	s.Env = append(os.Environ(), fmt.Sprintf("DISPLAY=:%d", num))
-	s.Stdout, s.Stderr = lg, lg
+	// The session has its own log: in Xvnc's, a chatty session would
+	// bring the server to its file cap.
+	sl, err := os.OpenFile(strings.TrimSuffix(logf, ".log")+"-session.log", os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_APPEND, 0o644)
+	if err != nil {
+		sl = lg
+	} else {
+		defer sl.Close()
+	}
+	s.Stdout, s.Stderr = sl, sl
 	s.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := s.Start(); err != nil {
 		return nil, err
@@ -332,6 +350,32 @@ func VNCStop(args []string) error {
 
 var reUser = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 
+// userNameProblem says why s can't be the username typed at the prompt
+// ("" if it can), in words that point at the fix (support #220: a name
+// and a password with symbols typed together into the Username field).
+func userNameProblem(s string) string {
+	switch {
+	case s == "":
+		return "type a name, e.g. alex"
+	case strings.ContainsAny(s, " \t"):
+		return "no spaces: type only the name here; the password comes next"
+	case s == "root":
+		return "pick a name other than root"
+	case len(s) > 32:
+		return "use at most 32 characters"
+	case s != strings.ToLower(s) && userNameProblem(strings.ToLower(s)) == "":
+		return "use lower-case letters: " + strings.ToLower(s)
+	case s[0] < 'a' || s[0] > 'z':
+		return "start with a lower-case letter, e.g. alex"
+	}
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return "'" + string(c) + "' isn't allowed: use only a-z, 0-9, - or _ (the password comes next)"
+		}
+	}
+	return ""
+}
+
 // SetupUser is the first-boot setup: create a normal user with sudo and
 // set the desktop password. Replaces the old blue `dialog` screens.
 func SetupUser(preset string) error {
@@ -362,12 +406,9 @@ func SetupUser(preset string) error {
 	fmt.Println()
 	fmt.Print(ui.Box(ui.BoxBrand, "Set up your user", "Pick a name and password for "+d.Label()+". You'll log in as this user; it can use sudo."))
 	fmt.Println()
-	name, err := ui.Input("Username", "Lower-case letters and numbers, e.g. alex", "alex", func(s string) error {
-		if !reUser.MatchString(s) {
-			return errors.New("use lower-case letters, numbers, - or _")
-		}
-		if s == "root" {
-			return errors.New("pick a name other than root")
+	name, err := ui.Input("Username", "Only the name: you pick the password next. Lower-case letters a-z, digits, - or _, starting with a letter, e.g. alex or alex_2.", "alex", func(s string) error {
+		if p := userNameProblem(s); p != "" {
+			return errors.New(p)
 		}
 		if _, _, _, ok := lookupUser("/", s); ok {
 			return errors.New(s + " already exists")
@@ -400,7 +441,7 @@ func SetupUser(preset string) error {
 		if s == "" {
 			return nil
 		}
-		if _, err := os.Stat("/usr/share/zoneinfo/" + s); err != nil {
+		if sys.ResolveZone("/", s) == "" {
 			return errors.New("unknown time zone; use e.g. Europe/Berlin or Asia/Kolkata")
 		}
 		return nil
@@ -435,13 +476,17 @@ func currentTZ() string {
 // setLocale sets the time zone and the desktop keyboard layout (either
 // may be ""). The layout is applied by xstartup with setxkbmap.
 func setLocale(tz, kb string) error {
-	if tz != "" && tz != currentTZ() {
-		if _, err := os.Stat("/usr/share/zoneinfo/" + tz); err != nil {
-			return ui.Errorf("Unknown time zone", "'"+tz+"' isn't a known time zone.", "Use a name like Europe/Berlin or Asia/Kolkata.")
+	// An unknown zone never fails the user's setup (support #443: the app
+	// passed Android's Asia/Calcutta, which Ubuntu 26.04 ships only in
+	// tzdata-legacy, and a finished install failed at its last step).
+	if tz != "" {
+		if z := sys.ResolveZone("/", tz); z == "" {
+			fmt.Fprintf(os.Stderr, "andronix: time zone %q isn't in this distro; keeping %s\n", tz, currentTZ())
+		} else if z != currentTZ() || sys.ResolveZone("/", currentTZ()) != currentTZ() {
+			os.Remove("/etc/localtime")
+			os.Symlink("/usr/share/zoneinfo/"+z, "/etc/localtime")
+			os.WriteFile("/etc/timezone", []byte(z+"\n"), 0o644)
 		}
-		os.Remove("/etc/localtime")
-		os.Symlink("/usr/share/zoneinfo/"+tz, "/etc/localtime")
-		os.WriteFile("/etc/timezone", []byte(tz+"\n"), 0o644)
 	}
 	if kb != "" {
 		if !regexp.MustCompile(`^[a-z]{2,3}$`).MatchString(kb) {
@@ -494,6 +539,7 @@ func createUser(fam *pkgmgr.Family, d *conf.Distro, name, pass, vncPass string) 
 	default:
 		os.WriteFile("/etc/sudoers.d/andronix", []byte(name+" ALL=(ALL:ALL) ALL\n"), 0o440)
 	}
+	rootfs.QuietSudo("/") // no audit warning on every sudo (support #253)
 	uid, gid, h, _ := lookupUser("/", name)
 	if h != "" {
 		// useradd -m copies only the top of /etc/skel on some kernels

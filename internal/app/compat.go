@@ -10,6 +10,7 @@ import (
 	andronix "github.com/AndronixApp/andronix-distros"
 	"github.com/AndronixApp/andronix-distros/internal/compat"
 	"github.com/AndronixApp/andronix-distros/internal/conf"
+	"github.com/AndronixApp/andronix-distros/internal/pkgmgr"
 	"github.com/AndronixApp/andronix-distros/internal/proot"
 	"github.com/AndronixApp/andronix-distros/internal/rootfs"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
@@ -26,6 +27,23 @@ type compatRun struct {
 	table *compat.Table
 	facts compat.Facts
 	plan  *compat.Plan
+	name  string // the distro's name for messages ("Debian")
+}
+
+// prootExecError is the error when proot can't start the compat probe inside
+// the distro. Play Store Termux's 32-bit proot can't start anything there
+// (support #171), while F-Droid's Termux can, so that case says to switch
+// (owner, #109); every other case asks for a report.
+func prootExecError(detail, distro, termux string, arch sys.Arch) *ui.UserError {
+	e := &ui.UserError{Title: "Linux can't start on this phone", Class: "proot_exec", Kind: string(pkgmgr.KindProotExec), Detail: detail}
+	if termux == "google_play_store" && (arch == "arm" || arch == "i686") {
+		e.What = "Termux from the Play Store can't run Linux on 32-bit phones like this one: its proot can't start programs inside " + distro + ". The download is fine."
+		e.Fix = "Install Termux from F-Droid (f-droid.org/packages/com.termux), then run the same command again. Back up first: switching Termux erases its files."
+		return e
+	}
+	e.What = "proot couldn't start a program inside " + distro + " (" + detail + "). The download is fine; proot can't run it here."
+	e.Fix = "Send a report so we can look: andronix report"
+	return e
 }
 
 func init() {
@@ -55,7 +73,7 @@ func newCompat(d *conf.Distro, de string) *compatRun {
 	}
 	c.facts = compat.Facts{Probe: host, DE: de}
 	if d != nil {
-		c.facts.Distro, c.facts.Family = d.ID, d.Family
+		c.facts.Distro, c.facts.Family, c.name = d.ID, d.Family, d.Name
 	}
 	c.replan()
 	return c
@@ -67,10 +85,13 @@ func (c *compatRun) replan() {
 }
 
 // probe runs `andronix __probe` inside the distro (unless a probe for
-// this phone is cached), then plans again with the results.
-func (c *compatRun) probe(ctx context.Context, t *proot.Target, lg *Logger) {
+// this phone is cached), then plans again with the results. It returns an
+// error only when proot can't start any program in the distro (execve
+// fails: support #171), since nothing after it can work then; a probe
+// that fails otherwise leaves the old checks in charge.
+func (c *compatRun) probe(ctx context.Context, t *proot.Target, lg *Logger) error {
 	if len(c.facts.Probe.Syscalls) > 0 {
-		return
+		return nil
 	}
 	// The prober is the in-distro copy of this andronix: make sure it's current.
 	if !t.Local {
@@ -81,7 +102,12 @@ func (c *compatRun) probe(ctx context.Context, t *proot.Target, lg *Logger) {
 	res := compat.ParseLines(out.String())
 	lg.Printf("compat probe: %v %s", err, strings.TrimSpace(out.String()))
 	if len(res) == 0 {
-		return // the old checks stay in charge (proot's fallback)
+		if err != nil {
+			if f := pkgmgr.Diagnose(strings.Split(out.String(), "\n"), err); f.Kind == pkgmgr.KindProotExec {
+				return prootExecError(f.Detail, c.name, c.facts.Probe.Termux, sys.DetectArch())
+			}
+		}
+		return nil // the old checks stay in charge (proot's fallback)
 	}
 	c.facts.Probe.Syscalls = res
 	c.facts.Probe.Save(GetPaths().Home)
@@ -90,6 +116,7 @@ func (c *compatRun) probe(ctx context.Context, t *proot.Target, lg *Logger) {
 	telemetry.Send("compat", map[string]any{"probe": p.Summary(), "kernel": p.KernelMajorMinor(), "sdk": p.SDK, "rom": p.ROM,
 		"phantom": p.Phantom, "ram": p.RAMBucket(), "termux": p.Termux, "rules": strings.Join(c.plan.IDs, " "),
 		"distro": c.facts.Distro, "de": c.facts.DE})
+	return nil
 }
 
 // warnings shows the plan's warnings (once each).
@@ -195,7 +222,9 @@ func Doctor(ctx context.Context, name string) error {
 		lg := NewLog("doctor")
 		defer lg.Close()
 		rootfs_ := in.Target(true)
-		c.probe(ctx, rootfs_, lg)
+		if err := c.probe(ctx, rootfs_, lg); err != nil {
+			ui.Warn(err.Error())
+		}
 	}
 	p := c.facts.Probe
 	fmt.Print(ui.Banner("Doctor"))

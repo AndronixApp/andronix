@@ -63,6 +63,11 @@ func SaveFailure(cmd, name string, err error) {
 	} else {
 		f.Title, f.What = "Something went wrong", err.Error()
 	}
+	// The failing run's own log, also for errors that don't carry one: a
+	// "Try again" writes a newer log, which isn't this failure's (#255).
+	if f.Log == "" {
+		f.Log = currentLog
+	}
 	b, _ := json.MarshalIndent(f, "", "  ")
 	os.MkdirAll(GetPaths().Home, 0o755)
 	os.WriteFile(failurePath(), b, 0o600)
@@ -83,22 +88,24 @@ func loadFailure() *failure {
 // problemReport is what andronix report sends: POST /v1/reports, schema 1
 // (support-desk docs/contracts/reports-v1.md; support owns the schema).
 type problemReport struct {
-	Schema      int            `json:"schema"`
-	Source      string         `json:"source"`
-	ClientID    string         `json:"client_id"`
-	Consent     bool           `json:"consent"`
-	CreatedAt   int64          `json:"created_at"`
-	Description string         `json:"description,omitempty"`
-	InstallID   string         `json:"install_id,omitempty"`
-	Locale      string         `json:"locale,omitempty"`
-	Versions    reportVersions `json:"versions"`
-	Device      reportDevice   `json:"device"`
-	Termux      *reportTermux  `json:"termux,omitempty"`
-	Install     *reportInstall `json:"install,omitempty"`
-	Compat      *reportCompat  `json:"compat,omitempty"`
-	Doctor      string         `json:"doctor,omitempty"`
-	LogName     string         `json:"log_name,omitempty"`
-	Log         string         `json:"log,omitempty"`
+	Schema      int    `json:"schema"`
+	Source      string `json:"source"`
+	ClientID    string `json:"client_id"`
+	Consent     bool   `json:"consent"`
+	CreatedAt   int64  `json:"created_at"`
+	Description string `json:"description,omitempty"`
+	InstallID   string `json:"install_id,omitempty"`
+	// RelatedReport is the app's own report this one joins (--attach).
+	RelatedReport string         `json:"related_id,omitempty"`
+	Locale        string         `json:"locale,omitempty"`
+	Versions      reportVersions `json:"versions"`
+	Device        reportDevice   `json:"device"`
+	Termux        *reportTermux  `json:"termux,omitempty"`
+	Install       *reportInstall `json:"install,omitempty"`
+	Compat        *reportCompat  `json:"compat,omitempty"`
+	Doctor        string         `json:"doctor,omitempty"`
+	LogName       string         `json:"log_name,omitempty"`
+	Log           string         `json:"log,omitempty"`
 }
 
 type reportVersions struct {
@@ -203,13 +210,21 @@ func buildReport(desc string) *problemReport {
 			logPath = sessionLog() // the desktop session's log (xstartup writes it)
 		}
 	}
+	newest := newestLog()
 	if logPath == "" {
-		logPath = newestLog()
+		logPath = newest
 	}
 	if logPath != "" {
 		if b, err := os.ReadFile(logPath); err == nil {
 			r.LogName = filepath.Base(logPath)
 			r.Log = tail(string(b), reportLogLines, reportLogBytes)
+			// A newer run since (a retry) goes after it, shorter.
+			if newest != "" && newest != logPath {
+				if b2, err := os.ReadFile(newest); err == nil {
+					r.Log = tail(r.Log, reportLogLines*3/4, reportLogBytes*3/4) +
+						"\n--- newer log: " + filepath.Base(newest) + " ---\n" + tail(string(b2), reportLogLines/4, reportLogBytes/4)
+				}
+			}
 		}
 	}
 	red := newRedactor()
@@ -403,17 +418,24 @@ func (r *redactor) do(s string) string {
 	return s
 }
 
-// Report is `andronix report [--dry-run] [--message TEXT] [--open AX-ID]`.
+// Report is `andronix report [--dry-run] [--message TEXT] [--open AX-ID]
+// [--attach AX-ID]`: --attach joins this report to the app's report AX-ID
+// (support links the two; android, 2.0.7).
 // It uploads the report as a draft (reports-v1 draft 3) and opens the
 // Andronix app on it, where the user adds details or photos and sends it.
 // Without the app (or inside a distro, where Android's am isn't reachable)
 // it prints the link and can send the report as it is.
-func Report(ctx context.Context, dryRun bool, message, openID string) error {
+func Report(ctx context.Context, dryRun bool, message, openID, attach string) error {
 	if openID != "" {
 		return openDraft(ctx, strings.ToUpper(strings.TrimSpace(openID)))
 	}
+	attach = strings.ToUpper(strings.TrimSpace(attach))
+	if attach != "" && !reportIDRe.MatchString(attach) {
+		return ui.Errorf("Not a report id", "'"+attach+"' doesn't look like AX-XXXXXX.", "Copy the id the Andronix app showed for your report.")
+	}
 	desc := clip(strings.TrimSpace(message), reportDescMax)
 	rep := buildReport(desc)
+	rep.RelatedReport = attach
 	body, _ := json.MarshalIndent(rep, "", "  ")
 	if dryRun {
 		fmt.Println(string(body))
@@ -421,6 +443,9 @@ func Report(ctx context.Context, dryRun bool, message, openID string) error {
 	}
 	fmt.Println()
 	ui.Section("This is everything that will be sent to Andronix")
+	if attach != "" {
+		ui.Note("It joins your report " + attach + " from the Andronix app.")
+	}
 	ui.Note("Tokens, download links, email addresses, user names and your home folder were removed.")
 	fmt.Println()
 	fmt.Println(string(body))

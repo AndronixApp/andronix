@@ -104,7 +104,7 @@ with_timeout() {
 tsh() {
     local tmp; tmp=$(mktemp)
     {
-        echo "export PREFIX=$T_PREFIX HOME=$T_HOME TMPDIR=$T_PREFIX/tmp LANG=en_US.UTF-8"
+        echo "export PREFIX=$T_PREFIX HOME=$T_HOME TMPDIR=$T_PREFIX/tmp LANG=en_US.UTF-8 ANDRONIX_NO_TELEMETRY=1"
         echo "export PATH=$T_HOME/.local/bin:$T_PREFIX/bin LD_PRELOAD=$T_PREFIX/lib/libtermux-exec.so"
         echo "cd \$HOME"
         cat

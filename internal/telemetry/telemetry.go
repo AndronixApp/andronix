@@ -72,10 +72,31 @@ func Enabled() bool {
 	if home == "" || os.Getenv("ANDRONIX_NO_TELEMETRY") != "" || os.Getenv("DO_NOT_TRACK") == "1" {
 		return false
 	}
+	if !production() && !testEndpoint() {
+		return false
+	}
 	if _, err := os.Stat("/etc/andronix-release"); err == nil {
 		return false // inside a distro; the Termux side reports
 	}
 	return state().Get("ENABLED") != "no"
+}
+
+// releaseBuild is set to "1" by ci/build-go.sh, and only for a plain x.y.z
+// VERSION (-X …/internal/telemetry.releaseBuild=1).
+var releaseBuild string
+
+var plainVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// production: a release build of a released version. Owner rule (Oct 7):
+// only those send telemetry; rc, dev, test and local builds, CI and our
+// test scripts send nothing, so test runs never mix into the numbers.
+func production() bool { return releaseBuild == "1" && plainVersion.MatchString(version) }
+
+// testEndpoint: ANDRONIX_TELEMETRY_URL points somewhere that isn't ours
+// (tests post to a local server); any build may send there, and only there.
+func testEndpoint() bool {
+	u := os.Getenv("ANDRONIX_TELEMETRY_URL")
+	return u != "" && !strings.Contains(u, "andronix")
 }
 
 // SetEnabled is `andronix telemetry on|off`.
@@ -208,23 +229,8 @@ func postEvent(url, body string) error {
 	return nil
 }
 
-var sdkOnce sync.Once
-var sdk int
-
 // androidSDK is ro.build.version.sdk (0 off Android).
-func androidSDK() int {
-	sdkOnce.Do(func() {
-		if out, err := sys.Command("getprop", "ro.build.version.sdk").Output(); err == nil {
-			for _, c := range strings.TrimSpace(string(out)) {
-				if c < '0' || c > '9' {
-					return
-				}
-				sdk = sdk*10 + int(c-'0')
-			}
-		}
-	})
-	return sdk
-}
+func androidSDK() int { return sys.AndroidSDK() }
 
 // host is where andronix runs, exactly one of products-api's enum: termux,
 // standalone (Andronix's own app: ANDRONIX_HOST=standalone), distro

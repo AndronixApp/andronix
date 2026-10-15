@@ -30,6 +30,7 @@
  },
  "expect": [
   "mount-id-shim",
+  "mount-id-shim-probe",
   "phantom-process"
  ]
 }

@@ -16,7 +16,7 @@ import (
 
 // Syscalls are what the probe tries, in order.
 var Syscalls = []string{"statx", "statx_mnt_id", "openat2", "faccessat2", "fchmodat2", "close_range", "open_tree",
-	"name_to_handle_at", "memfd_create", "clone3", "seccomp"}
+	"name_to_handle_at", "memfd_create", "clone3", "seccomp", "creat"}
 
 // RunAll runs every probe syscall in its own child (`self __probe one
 // <name>`), so a seccomp kill costs only that child: it's recorded as the
@@ -27,6 +27,7 @@ func RunAll(self string) map[string]string {
 	for _, n := range Syscalls {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		b, err := sys.CommandContext(ctx, self, "__probe", "one", n).Output()
+		timedOut := ctx.Err() == context.DeadlineExceeded // before cancel(), which sets Err too
 		cancel()
 		var ee *exec.ExitError
 		switch {
@@ -38,7 +39,7 @@ func RunAll(self string) map[string]string {
 			} else {
 				out[n] = fmt.Sprintf("exit%d", ee.ExitCode())
 			}
-		case ctx.Err() != nil:
+		case timedOut:
 			out[n] = "timeout"
 		default:
 			out[n] = "error"

@@ -1,7 +1,8 @@
 /*
  * libandronix-mntid.so: preloaded (/etc/ld.so.preload) where statx() can't
  * report a mount id and name_to_handle_at() isn't there either: kernels
- * before 5.8 under proot (the compat probe: statx_mnt_id missing).
+ * before 5.8 under proot (compat rule mount-id-shim: kernel_lt 5.8), and
+ * wherever the probe sees no mount id (mount-id-shim-probe: ChromeOS ARC).
  *
  * systemd 256+ resolves every path with chase(), which needs mount ids.
  * Without them it fails with EUNATCH ("Protocol driver not attached"):

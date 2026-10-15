@@ -114,6 +114,11 @@ func removeEdition(ctx context.Context, ed *conf.Edition, legacy bool) error {
 	if err != nil {
 		return err
 	}
+	unlock, err := lockDistro(d, "remove")
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	in := Open(d)
 	_, statErr := os.Stat(in.Dir)
 	have := ""

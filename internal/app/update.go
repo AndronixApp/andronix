@@ -78,6 +78,15 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 		}
 	}
 
+	// Each distro's lock, for the whole update (support #313).
+	for _, in := range targets {
+		unlock, err := lockDistro(in.D, "update")
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+
 	n = len(targets)
 	var steps []ui.Step
 	if !o.NoSelf {
@@ -121,13 +130,15 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 				// the compat rules' scripts (from the cached probe), then the distro's.
 				cr := newCompat(d, in.Get("DE"))
 				if sys.IsTermux() {
-					cr.probe(ctx, t, lg) // measured once per kernel/Android/Termux, then cached
+					if err := cr.probe(ctx, t, lg); err != nil { // measured once per kernel/Android/Termux, then cached
+						return err
+					}
 					cr.apply(in.Rootfs, sys.DetectArch(), lg)
 				}
 				if err := cr.preScripts(ctx, t, r); err != nil {
 					return err
 				}
-				return preUpgrade(ctx, t, d, r)
+				return preUpgrade(ctx, ops, d, r)
 			}},
 			ui.Step{Label: "Updating " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
 				n := count(ctx, t, fam.SimUpgrade, fam)
@@ -145,16 +156,74 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 		// The browser's video codecs on installs from before they were part
 		// of the browser install (2.0.0 had none: no AAC or H.264).
 		steps = append(steps, ui.Step{Label: "Web browser", Run: func(ctx context.Context, r ui.Reporter) error {
-			b := d.BrowserFor(string(sys.DetectArch()))
+			arch := string(sys.DetectArch())
+			b := d.BrowserFor(arch)
 			if b == "" || !hasAny(in.Rootfs, "usr/bin/firefox", "usr/bin/firefox-esr", "usr/lib/firefox", "usr/lib/firefox-esr", "usr/lib64/firefox") {
 				return ui.Skip("no browser")
 			}
-			if !installCodecs(ctx, t, fam, d, r, lg) {
+			did := false
+			// A distro that now gets Mozilla's Firefox (Kali, #183: its
+			// Firefox ESR 140 can't load FFmpeg 9, so no H.264 or AAC):
+			// install it and make it the default. The old firefox-esr goes
+			// only if nothing else would go with it (a metapackage such as
+			// kali-linux-default depends on it); the profile (~/.mozilla) stays.
+			if d.BrowserRepoFor(arch) == "mozilla" && !hasAny(in.Rootfs, "usr/lib/firefox/firefox") {
+				r.Label("Installing Firefox (Mozilla's)")
+				if err := browserRepo(ctx, d, arch, in.Rootfs, t, fam); err != nil {
+					lg.Printf("mozilla repo: %v", err)
+					return ui.Skip("couldn't reach Mozilla; try again later")
+				}
+				n := count(ctx, t, fam.SimInstall([]string{b}), fam)
+				if err := pkgRun(ctx, t, fam, fam.Install([]string{b}), n, r); err != nil {
+					lg.Printf("browser: %v", err)
+					return ui.Skip("failed; try again later")
+				}
+				t.Run(ctx, "update-alternatives --set x-www-browser /usr/bin/"+b+" >/dev/null 2>&1; update-alternatives --set gnome-www-browser /usr/bin/"+b+" >/dev/null 2>&1; true", nil, nil)
+				if d.Family == "apt" && hasAny(in.Rootfs, "usr/lib/firefox-esr") {
+					t.Run(ctx, esrRemove, nil, func(l string) { lg.Printf("firefox-esr: %s", l) })
+				}
+				did = true
+			}
+			// After the switch (now or in an earlier update): the user's
+			// ESR profile and the panel's browser carry over (#183).
+			if d.BrowserRepoFor(arch) == "mozilla" && hasAny(in.Rootfs, "usr/lib/firefox/firefox") {
+				if u := carryFirefoxProfile(in.Rootfs); len(u) > 0 {
+					lg.Printf("firefox: ESR profile carried over for %s", strings.Join(u, ", "))
+					did = true
+				}
+				if f := panelBrowserESR(in.Rootfs); len(f) > 0 {
+					lg.Printf("firefox: panel now names firefox in %s", strings.Join(f, ", "))
+					did = true
+				}
+			}
+			if installCodecs(ctx, t, fam, d, r, lg) {
+				did = true
+			}
+			if !did {
 				return ui.Skip("up to date")
 			}
 			t.Run(ctx, fam.Clean, nil, nil)
 			return nil
 		}})
+		// The desktop's own packages, when some went missing since the
+		// install (support #458: Kali XFCE without dbus-x11, so the session's
+		// dbus-launch fallback wasn't there and the desktop quit at once).
+		if de, err := conf.ResolveDesktop(in.Get("DE")); err == nil && !de.None() && len(de.Packages(d.Family)) > 0 {
+			steps = append(steps, ui.Step{Label: "Desktop packages", Run: func(ctx context.Context, r ui.Reporter) error {
+				pkgs := append(append([]string{}, de.Packages(d.Family)...), fam.VNC...)
+				n := count(ctx, t, fam.SimInstall(pkgs), fam)
+				if n == 0 {
+					return ui.Skip("all there")
+				}
+				lg.Printf("desktop packages: %d missing, installing %s", n, strings.Join(pkgs, " "))
+				if err := ops.run(ctx, fam.Install(pkgs), n, r); err != nil {
+					return pkgErr("Couldn't put back "+de.Name+"'s packages", err)
+				}
+				t.Run(ctx, fam.Clean, nil, nil)
+				r.Detail(fmt.Sprintf("%d packages", n))
+				return nil
+			}})
+		}
 		if moddedVersion(in.Rootfs) != "" {
 			steps = append(steps, ui.Step{Label: "Updating the Modded edition", Run: func(ctx context.Context, r ui.Reporter) error {
 				return moddedUpdate(ctx, in, o, r, lg)
@@ -163,6 +232,7 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 		steps = append(steps, ui.Step{Label: "Tidying " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
 			rootfs.EnsureBwrapShim(in.Rootfs)
 			rootfs.RefreshProfile(in.Rootfs) // e.g. Firefox's sandbox switches
+			rootfs.QuietSudo(in.Rootfs)
 			if de, err := conf.ResolveDesktop(in.Get("DE")); err == nil && !de.None() {
 				writeXstartup(in.Rootfs, de)
 				phoneDefaults(in.Rootfs) // e.g. a Firefox installed or updated since
@@ -621,3 +691,9 @@ func betaResolve(ctx context.Context, token string) (*Resolved, error) {
 	return nil, &ui.UserError{Title: "Couldn't reach the beta channel", Class: "download",
 		What: "The Andronix server didn't answer.", Fix: "Check your connection and run the same command again.", Err: err}
 }
+
+// esrRemove removes Debian's firefox-esr (and its language packs) when
+// apt would remove nothing else; otherwise it says what keeps it.
+const esrRemove = `others=$(apt-get -s remove firefox-esr 2>/dev/null | awk '/^Remv /{print $2}' | grep -v '^firefox-esr'); ` +
+	`if [ -z "$others" ]; then DEBIAN_FRONTEND=noninteractive apt-get remove -y firefox-esr 'firefox-esr-l10n-*' >/dev/null 2>&1 && echo removed; ` +
+	`else echo "kept: removing it would also remove $(echo $others)"; fi; true`

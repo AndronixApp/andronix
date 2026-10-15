@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -115,8 +116,17 @@ func Home() string {
 // 8.8.8.8 and 1.1.1.1, and loopback ones last. Each dial takes the next
 // server, so the resolver's own retries walk the list (a UDP dial never
 // fails by itself; a refused or silent server only shows on read).
+//
+// With Android's resolver linked in (cgo builds), the default resolver stays
+// Android's and this list is the fallback (LookupIP, DialContext).
 func FixDNS() {
-	net.DefaultResolver = resolverFor(dnsServers(readFile("/etc/resolv.conf"), readFile(filepath.Join(Prefix(), "etc/resolv.conf"))))
+	goResolver = resolverFor(dnsServers(readFile("/etc/resolv.conf"), readFile(filepath.Join(Prefix(), "etc/resolv.conf"))))
+	if !haveSystemDNS {
+		net.DefaultResolver = goResolver
+	}
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		t.DialContext = DialContext // problem reports and telemetry use the default client
+	}
 	// Termux ships a CA bundle too; Go already reads Android's
 	// /system/etc/security/cacerts, this is a fallback.
 	if os.Getenv("SSL_CERT_FILE") == "" {

@@ -49,11 +49,12 @@ func TestFixtures(t *testing.T) {
 	}
 }
 
-// Rules with probe conditions wait for the probe; kernel rules don't.
+// Rules with probe conditions wait for the probe; kernel rules (old syscall
+// order, the mount-id shim) don't.
 func TestBeforeProbe(t *testing.T) {
 	tab, _ := Default()
 	p := PlanFor(tab.Match(Facts{Probe: &Probe{Kernel: "4.4.302", SDK: 28, Phantom: "off"}, Distro: "void", Family: "xbps", DE: "none"}))
-	if !reflect.DeepEqual(p.IDs, []string{"old-syscall-order"}) || p.Env["PROOT_NO_SECCOMP"] != "1" {
+	if !reflect.DeepEqual(p.IDs, []string{"old-syscall-order", "mount-id-shim"}) || p.Env["PROOT_NO_SECCOMP"] != "1" {
 		t.Errorf("before the probe on 4.4 with no desktop: %v %v", p.IDs, p.Env)
 	}
 	if p := PlanFor(tab.Match(Facts{Probe: &Probe{}})); len(p.IDs) != 0 {

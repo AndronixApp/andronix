@@ -1,0 +1,14 @@
+{
+ "source": "recorded 2026-10-07 on AWS Device Farm (session cc3a20a1, support #171 part 4): Samsung Galaxy A13 5G, kernel 4.14.186, 32-bit Termux (armv8l), GitHub Termux, installer 2.0.6. The in-distro probe crashed under proot ('compat probe: exit status 2 futexwakeup addr=0xcd44eb24 returned -38'), so no syscall results and no probe.json; Kali's systemd-sysusers then failed with EUNATCH. Host facts only; sdk and RAM weren't captured.",
+ "distro": "kali",
+ "family": "apt",
+ "de": "none",
+ "probe": {
+  "probe_version": 2,
+  "kernel": "4.14.186",
+  "termux": "github"
+ },
+ "expect": [
+  "mount-id-shim"
+ ]
+}

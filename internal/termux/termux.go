@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -79,17 +80,30 @@ func pkgInstall(ctx context.Context, onLine func(string), pkgs ...string) error 
 	defer cancel()
 	keep := []string{"-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"}
 	install := append(append([]string{"-y"}, keep...), append([]string{"install"}, pkgs...)...)
-	update := func() { termuxRun(ctx, onLine, "apt-get", "update") } // stale lists still let install try
+	unreachable := ""  // a package server the last update couldn't connect to
+	update := func() { // stale lists still let install try; why it failed goes to the log
+		out, err := termuxRun(ctx, onLine, "apt-get", "update")
+		if err != nil {
+			Logf("apt-get: update: %v", err)
+		}
+		unreachable = unreachableHost(out)
+	}
 	update()
 	var f *pkgmgr.Failure
 	seen := map[pkgmgr.Kind]int{}
-	upgraded := false
+	upgraded, relisted := false, false
 	for attempt := 1; attempt <= 5; attempt++ {
 		out, err := termuxRun(ctx, onLine, "apt-get", install...)
 		if err == nil {
 			return nil
 		}
 		f = pkgmgr.Diagnose(tailOf(out, 60), err)
+		if unreachable != "" && strings.Contains(out, "Unable to locate package") {
+			// No lists because the server refused or dropped the
+			// connection (support #305): a network failure, not a
+			// missing package.
+			f = &pkgmgr.Failure{Kind: pkgmgr.KindConnect, Detail: "couldn't connect to " + unreachable, Err: err}
+		}
 		seen[f.Kind]++
 		n := seen[f.Kind]
 		Logf("apt-get: install %s failed (attempt %d): %s: %s", strings.Join(pkgs, " "), attempt, f.Kind, f.Detail)
@@ -118,6 +132,14 @@ func pkgInstall(ctx context.Context, onLine func(string), pkgs ...string) error 
 			update()
 		case (f.Kind == pkgmgr.KindGPG || f.Kind == pkgmgr.KindClock) && n == 1 && nextMirror():
 			update()
+		case !relisted && strings.Contains(out, "Unable to locate package"):
+			// Termux's package lists are empty or broken (the update
+			// before failed): another mirror, fresh lists, once (support
+			// #122 #155 #161: 'Unable to locate package proot').
+			relisted = true
+			Logf("apt-get: no package lists for %s; switching mirror and refreshing", strings.Join(pkgs, " "))
+			nextMirror()
+			update()
 		case !upgraded:
 			upgraded = true
 			Logf("apt-get: upgrading Termux's packages (apt-get full-upgrade), then retrying")
@@ -137,6 +159,24 @@ func tailOf(s string, n int) []string {
 		lines = lines[len(lines)-n:]
 	}
 	return lines
+}
+
+var unreachableRe = regexp.MustCompile(`(?:Unable to connect to|Could not connect to) ([A-Za-z0-9.-]+\.[A-Za-z]{2,})[:]`)
+
+// unreachableHost is the package server apt-get update couldn't connect
+// to ("Unable to connect to termux.net:https:"), or "".
+func unreachableHost(out string) string {
+	if m := unreachableRe.FindStringSubmatch(out); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// PlayRepo reports whether Termux's packages come from termux.net (Play
+// Store Termux): one server, no mirrors to switch to.
+func PlayRepo() bool {
+	b, _ := os.ReadFile(filepath.Join(sys.Prefix(), "etc/apt/sources.list.d/termux.sources"))
+	return strings.Contains(string(b), "termux.net")
 }
 
 // termuxMirrors are Termux's main and x11 repositories on mirrors that

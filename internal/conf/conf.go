@@ -63,6 +63,10 @@ type Distro struct {
 	// downloads to https mirrors before a CA store exists).
 	MirrorRewrite [2]string
 	BrowserArches []string
+	// BrowserFallback is DISTRO_BROWSER_FALLBACK: the browser on the CPUs
+	// BrowserArches leaves out (Kali: firefox-esr on 32-bit, which
+	// Mozilla's repo doesn't build for).
+	BrowserFallback string
 	// BrowserCodecs are DISTRO_BROWSER_CODECS: libraries the browser loads
 	// for H.264 (YouTube falls back to it on phones), installed with it.
 	BrowserCodecs      []string
@@ -132,9 +136,18 @@ func (d *Distro) BrowserFor(arch string) string {
 		return ""
 	}
 	if len(d.BrowserArches) > 0 && !contains(d.BrowserArches, arch) {
-		return ""
+		return d.BrowserFallback
 	}
 	return d.Browser
+}
+
+// BrowserRepoFor is the repo the browser comes from on arch ("mozilla"),
+// or "" for the distro's own (and for the fallback browser).
+func (d *Distro) BrowserRepoFor(arch string) string {
+	if d.Browser == "" || len(d.BrowserArches) > 0 && !contains(d.BrowserArches, arch) {
+		return ""
+	}
+	return d.BrowserRepo
 }
 
 // Desktop is desktops/<id>.conf.
@@ -164,7 +177,13 @@ type Desktop struct {
 	// AutostartHide lists /etc/xdg/autostart entries that fail under proot
 	// (no polkitd, logind or upower); they are hidden for every user.
 	AutostartHide []string
-	raw           Values
+	// SessionDrop (DE_SESSION_DROP): failsafe session clients left out of
+	// XFCE's system defaults, by command (Thunar: its daemon). PanelDrop
+	// (DE_PANEL_DROP): panel plugin types left out of the default panel
+	// (systray). Fewer processes for Android's phantom process killer.
+	SessionDrop []string
+	PanelDrop   []string
+	raw         Values
 }
 
 // Packages for a package-manager family.
@@ -261,7 +280,7 @@ func LoadDistro(id string) (*Distro, error) {
 		Shell: v.Get("DISTRO_SHELL"), Arches: v.List("DISTRO_ARCHES"), BasePkgs: v.List("DISTRO_BASE_PKGS"),
 		StartScripts: v.List("DISTRO_START_SCRIPTS"), LegacyFS: v.List("DISTRO_LEGACY_FS"),
 		Aliases: v.List("DISTRO_ALIASES"), Browser: v.Get("DISTRO_BROWSER"),
-		BrowserRepo: v.Get("DISTRO_BROWSER_REPO"), BrowserArches: v.List("DISTRO_BROWSER_ARCHES"),
+		BrowserRepo: v.Get("DISTRO_BROWSER_REPO"), BrowserArches: v.List("DISTRO_BROWSER_ARCHES"), BrowserFallback: v.Get("DISTRO_BROWSER_FALLBACK"),
 		BrowserCodecs: v.List("DISTRO_BROWSER_CODECS"),
 		NoSnap:        v.Bool("DISTRO_NO_SNAP"), DownloadMB: v.Int("DISTRO_DOWNLOAD_MB"), DiskMB: v.Int("DISTRO_DISK_MB"),
 		BindsDir: v.Get("DISTRO_BINDS_DIR"), Lang: v.Get("DISTRO_LANG"), Sudo: v.Get("DISTRO_SUDO"),
@@ -346,6 +365,7 @@ func ResolveDesktop(name string) (*Desktop, error) {
 	}
 	return &Desktop{ID: v.Get("DE_ID"), Name: v.Get("DE_NAME"), Session: v.Get("DE_SESSION"),
 		DiskMB: v.Int("DE_DISK_MB"), MinRAMMB: v.Int("DE_MIN_RAM_MB"), AutostartHide: v.List("DE_AUTOSTART_HIDE"),
+		SessionDrop: v.List("DE_SESSION_DROP"), PanelDrop: v.List("DE_PANEL_DROP"),
 		Distros:            v.List("DE_DISTROS"),
 		DesktopEdits:       splitNonEmpty(v.Get("DE_DESKTOP_EDITS"), ";"),
 		XDGConfig:          splitNonEmpty(v.Get("DE_XDG_CONFIG"), ";"),

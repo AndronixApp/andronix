@@ -7,3 +7,5 @@
 /tests/emulator/results/
 .venv/
 /selfbin/*.gz
+/tests/devicefarm-termux/andronix-termux-flow-tests.zip
+/tests/devicefarm-termux/pkg/tests/app-context.sh

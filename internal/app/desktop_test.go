@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
+	"github.com/AndronixApp/andronix-distros/internal/sys"
 )
 
 // The XFCE wallpaper defaults must parse (xfconfd drops a broken channel)
@@ -163,5 +164,37 @@ func TestProfileEmptyFile(t *testing.T) {
 	}
 	if err := ApplyProfile(root, nil, "light"); err != nil || !profileSet(root) || Profile(root) != "light" {
 		t.Errorf("after ApplyProfile: %v", err)
+	}
+}
+
+// Support #458: dbus-x11 gone from a Kali XFCE install, so after a session
+// that ended fast the fallback 'exec dbus-launch' failed with "exec: " and
+// "dbus-launch: not found". xstartup now says which package and what to run.
+func TestXstartupNoDbusLaunch(t *testing.T) {
+	i := strings.Index(xstartup, "if command -v dbus-run-session")
+	if i < 0 {
+		t.Fatal("xstartup: dbus-run-session block missing")
+	}
+	tail := strings.ReplaceAll(xstartup[i:], "@SESSION@", "true")
+	bin := t.TempDir()
+	for _, p := range []string{"sh", "date"} {
+		real, err := sys.LookPath(p)
+		if err != nil {
+			t.Skip(p + " not found")
+		}
+		os.Symlink(real, filepath.Join(bin, p))
+	}
+	run := func() (string, int) {
+		c := sys.Command(filepath.Join(bin, "sh"), "-c", tail)
+		c.Env = []string{"PATH=" + bin}
+		out, _ := c.CombinedOutput()
+		return string(out), c.ProcessState.ExitCode()
+	}
+	if out, rc := run(); rc != 1 || !strings.Contains(out, "neither dbus-run-session nor dbus-launch is installed (package dbus-x11)") {
+		t.Errorf("no dbus tools: exit %d, %q", rc, out)
+	}
+	os.WriteFile(filepath.Join(bin, "dbus-run-session"), []byte("#!"+filepath.Join(bin, "sh")+"\nexit 3\n"), 0o755)
+	if out, rc := run(); rc != 3 || !strings.Contains(out, "dbus-launch isn't installed (package dbus-x11): run 'andronix update'") {
+		t.Errorf("fast-ending session, no dbus-launch: exit %d, %q", rc, out)
 	}
 }

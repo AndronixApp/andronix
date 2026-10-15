@@ -41,6 +41,7 @@ func Start(name string, asRoot bool, cmd []string) error {
 		return ui.Errorf("proot is missing", "Andronix needs proot to run Linux inside Termux.", "Install it: pkg install proot -y")
 	}
 	rootfs.EnsureBwrapShim(in.Rootfs) // self-heal after the user's own updates
+	rootfs.QuietSudo(in.Rootfs)       // and after a switch to sudo-rs
 	startSound(context.Background(), len(cmd) == 0 && ui.Interactive)
 	telemetry.Send("start", map[string]any{"distro": d.ID, "de": in.Get("DE"), "root": asRoot, "command": len(cmd) > 0})
 	return in.Target(asRoot).Login(d.Shell, cmd)
@@ -55,6 +56,11 @@ func Remove(ctx context.Context, name string, legacy bool) error {
 	if err != nil {
 		return err
 	}
+	unlock, err := lockDistro(d, "remove")
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	in := Open(d)
 	var old []string
 	if legacy {
@@ -345,6 +351,11 @@ func Restore(ctx context.Context, file string) error {
 	if id == "" || err != nil {
 		return ui.Errorf("Not an Andronix backup", "'"+file+"' doesn't look like a backup from 'andronix backup'.", "Check you picked the right file.")
 	}
+	unlock, err := lockDistro(d, "restore")
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	in := Open(d)
 	if exists(in.Dir) {
 		fmt.Println()

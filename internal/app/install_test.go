@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
+	"github.com/AndronixApp/andronix-distros/internal/pkgmgr"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
+	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
 
 func TestKernelNewer(t *testing.T) {
@@ -227,5 +229,20 @@ func TestExitCode(t *testing.T) {
 	}
 	if exitCode(errors.New("no such file")) != -1 {
 		t.Error("not run: want -1")
+	}
+}
+
+func TestTermuxPkgErrPlayRepo(t *testing.T) {
+	old := playRepo
+	defer func() { playRepo = old }()
+	f := &pkgmgr.Failure{Kind: pkgmgr.KindConnect, Detail: "couldn't connect to termux.net"}
+	playRepo = func() bool { return true }
+	var e *ui.UserError
+	if !errors.As(termuxPkgErr("Couldn't install proot", "pkg install proot", f), &e) || !strings.Contains(e.Title, "blocks Termux's package server") || strings.Contains(e.Fix, "termux-change-repo") {
+		t.Fatalf("Play: %+v", e)
+	}
+	playRepo = func() bool { return false }
+	if !errors.As(termuxPkgErr("Couldn't install proot", "pkg install proot", f), &e) || !strings.Contains(e.Fix, "termux-change-repo") {
+		t.Fatalf("GitHub/F-Droid: %+v", e)
 	}
 }

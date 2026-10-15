@@ -64,7 +64,7 @@ var Messages = map[string]string{
 }
 
 // Preloads are the shims preload can name (guest/preload/<cpu>/libandronix-<name>.so).
-var Preloads = map[string]bool{"fchmodat": true, "mntid": true}
+var Preloads = map[string]bool{"fchmodat": true, "mntid": true, "creat": true, "ofdlock": true}
 
 // Facts are what rules test.
 type Facts struct {

@@ -29,10 +29,33 @@ type pkgOps struct {
 	cur     []int
 	sleep   func(time.Duration)
 	ready   bool // the sources were read (they exist once the rootfs is unpacked)
+	// liveHolder: the package lock belongs to another running andronix
+	// (its pid), support #313.
+	liveHolder int
+	// seccompRetry: the next attempt is a retry with proot on ptrace only
+	// (PROOT_NO_SECCOMP=1), for this kind (#312 fake_root, #471 proot_syscall).
+	seccompRetry pkgmgr.Kind
 	// keyringAgent: start gpg-agent ourselves inside each retried run
 	// (a keyring failure, support #119).
 	keyringAgent bool
+	// noUpdateHooks: refresh without apt's APT::Update hooks (one failed,
+	// and no hook file we know of matched it).
+	noUpdateHooks bool
 }
+
+// withoutUpdateHooks points the first apt-get in cmd (the update, not the
+// ca-certificates install after it) at noUpdateHooksConf.
+func withoutUpdateHooks(cmd string) string {
+	return strings.Replace(cmd, "apt-get ", "apt-get -c "+noUpdateHooksConf+" ", 1)
+}
+
+// noUpdateHooksText is noUpdateHooksConf's content.
+const noUpdateHooksText = "// Andronix: one refresh without apt's update hooks (one failed under proot).\n" +
+	"#clear APT::Update::Pre-Invoke;\n#clear APT::Update::Post-Invoke;\n#clear APT::Update::Post-Invoke-Success;\n"
+
+// noUpdateHooksConf clears apt's update hooks for one run (apt-get -c
+// reads it after apt.conf.d, so the #clear wins).
+const noUpdateHooksConf = "/etc/apt/andronix-no-update-hooks.conf"
 
 // pkgAttempts caps the runs of one command (first try included).
 const pkgAttempts = 5
@@ -92,6 +115,9 @@ func (p *pkgOps) do(ctx context.Context, cmd string, n int, r ui.Reporter, isUpd
 		if p.keyringAgent {
 			run = keyringAgentWrap(cmd)
 		}
+		if p.noUpdateHooks && isUpdate {
+			run = withoutUpdateHooks(run)
+		}
 		err := pkgRunWatch(ctx, p.t, p.fam, run, n, r, func(l string) {
 			if lines = append(lines, l); len(lines) > 60 {
 				lines = lines[1:]
@@ -104,11 +130,35 @@ func (p *pkgOps) do(ctx context.Context, cmd string, n int, r ui.Reporter, isUpd
 			if attempt > 1 {
 				p.lg.Printf("package manager: worked on attempt %d", attempt)
 			}
+			if p.noUpdateHooks && isUpdate {
+				p.lg.Printf("package manager: the refresh worked without apt's update hooks")
+				pmSaved = "apt_hook_retried"
+			}
+			if p.seccompRetry != "" {
+				p.lg.Printf("package manager: %s: the retry with PROOT_NO_SECCOMP=1 worked", p.seccompRetry)
+				pmSaved = string(p.seccompRetry) + "_retried"
+				p.seccompRetry = ""
+			}
 			return nil
 		}
 		f = pkgmgr.Diagnose(lines, err)
+		if f.Kind == pkgmgr.KindOther && p.fam.ID == "apt" {
+			// dpkg doesn't always say "very bad inconsistent state": with
+			// a dependent configured first it says the half-installed
+			// package "is not installed" (support #201). Ask dpkg.
+			if half := p.halfInstalled(ctx); half != "" {
+				f.Kind, f.Detail = pkgmgr.KindReinstreq, "half-installed: "+half
+			}
+		}
 		seen[f.Kind]++
 		p.lg.Printf("package manager: attempt %d failed: %s: %s", attempt, f.Kind, f.Detail)
+		if k := p.seccompRetry; k != "" {
+			p.seccompRetry = ""
+			p.lg.Printf("package manager: %s: the retry with PROOT_NO_SECCOMP=1 didn't help (%s)", k, f.Kind)
+			if f.Kind == k {
+				f.Kind = k + "_not_fixed"
+			}
+		}
 		if attempt == pkgAttempts || !p.recover(ctx, f, seen[f.Kind], isUpdate, r) {
 			break
 		}
@@ -121,6 +171,17 @@ func (p *pkgOps) do(ctx context.Context, cmd string, n int, r ui.Reporter, isUpd
 		return nil
 	}
 	return f
+}
+
+// halfInstalled lists the packages dpkg left half-installed, space-separated.
+func (p *pkgOps) halfInstalled(ctx context.Context) string {
+	var out []string
+	p.t.Run(ctx, halfInstalledQuery, nil, func(l string) {
+		if l = strings.TrimSpace(l); l != "" && !strings.ContainsAny(l, " \t") {
+			out = append(out, l)
+		}
+	})
+	return strings.Join(out, " ")
 }
 
 // recover prepares the next try for this failure (the n-th of its kind),
@@ -186,11 +247,46 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 		}
 		sh("dpkg --configure -a")
 		return true
+	case pkgmgr.KindReinstreq:
+		if !apt || n > 2 {
+			return false
+		}
+		p.lg.Printf("package manager: dpkg has half-installed packages; reinstalling them")
+		sh(reinstreqFix)
+		return true
+	case pkgmgr.KindFakeRoot, pkgmgr.KindProotSyscall:
+		// Once, with proot on ptrace only for the rest of this run: the
+		// experiment for #312 (whether the retry fixed it is logged and
+		// sent as fake_root_retried / fake_root_not_fixed).
+		if n > 1 || proot.NoSeccomp {
+			return false
+		}
+		proot.NoSeccomp = true
+		p.seccompRetry = f.Kind
+		p.lg.Printf("package manager: %s under proot (%s); trying again with PROOT_NO_SECCOMP=1", f.Kind, f.Detail)
+		return true
 	case pkgmgr.KindLock:
 		if n > 2 {
 			return false
 		}
-		if p.fam.ID == "pacman" {
+		// An earlier run of this distro still holding it (support #296):
+		// wait for it, or stop it; then finish what dpkg was doing.
+		if p.waitOrStopHolder(ctx, f.Line, r) {
+			if apt {
+				sh("dpkg --configure -a")
+			}
+			if p.fam.ID == "pacman" && findLockHolder(p.t.Rootfs, "") == nil {
+				sh("rm -f /var/lib/pacman/db.lck")
+			}
+			return true
+		}
+		if p.liveHolder != 0 {
+			f.Detail = fmt.Sprintf("another andronix (process %d) is using it", p.liveHolder)
+			return false
+		}
+		// pacman leaves db.lck behind when it's killed; only remove it with
+		// no pacman of this distro running.
+		if p.fam.ID == "pacman" && findLockHolder(p.t.Rootfs, "") == nil {
 			sh("rm -f /var/lib/pacman/db.lck")
 		}
 		p.sleep(10 * time.Second)
@@ -204,16 +300,37 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 	case pkgmgr.KindHook:
 		// An optional apt hook failed (command-not-found's database and
 		// the like): clear them and try again (support #83 #85 #87).
-		if !apt || n > 1 {
+		if !apt || n > 2 {
 			return false
 		}
-		off := disableFailingHooks(p.t.Rootfs, f.Line)
-		if len(off) == 0 {
+		if n == 1 {
+			if off := disableFailingHooks(p.t.Rootfs, f.Line); len(off) > 0 {
+				p.lg.Printf("package manager: an apt hook failed; turned off %s", strings.Join(off, ", "))
+				r.Line("Turned off apt's " + strings.Join(off, ", ") + " hook (it fails under proot); to turn it back on, see /etc/andronix/apt-hooks-disabled.txt")
+				return true
+			}
 			p.lg.Printf("package manager: an apt hook failed (%s), but none of apt's hook files matches it", f.Detail)
+		}
+		// A refresh: once more with apt's update hooks cleared for this
+		// run only (support #147: Ubuntu 26.04, no lists at all, so not a
+		// Post-Invoke hook after them). The hooks are logged first. A
+		// rescued install says so in telemetry (apt_hook_retried, lead).
+		if !isUpdate || p.noUpdateHooks {
 			return false
 		}
-		p.lg.Printf("package manager: an apt hook failed; turned off %s", strings.Join(off, ", "))
-		r.Line("Turned off apt's " + strings.Join(off, ", ") + " hook (it fails under proot); to turn it back on, see /etc/andronix/apt-hooks-disabled.txt")
+		p.t.Run(ctx, "apt-config dump 2>/dev/null | grep -i -A3 'Update::.*Invoke'", nil, func(l string) { p.lg.Printf("apt hooks: %s", l) })
+		pkgmgr.WriteFile(p.t.Rootfs, strings.TrimPrefix(noUpdateHooksConf, "/"), noUpdateHooksText)
+		p.noUpdateHooks = true
+		p.lg.Printf("package manager: refreshing again without apt's update hooks")
+		r.Line("Refreshing again without apt's update hooks (one failed under proot).")
+		return true
+	case pkgmgr.KindMirror:
+		// Once on the next mirror, a direct one (not a redirector); if it
+		// happens there too, it's the network (the message says so).
+		if n > 1 || !p.nextMirror(r) {
+			return false
+		}
+		refresh()
 		return true
 	case pkgmgr.KindIntercepted:
 		// One other mirror, in case it's that mirror; if it happens there
@@ -223,6 +340,8 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 		}
 		refresh()
 		return true
+	case pkgmgr.KindProotExec:
+		return false // the same exec fails again; nothing to change from here
 	case pkgmgr.KindProotArgs:
 		if n > 1 {
 			return false
@@ -275,6 +394,21 @@ func keyringAgentWrap(cmd string) string {
 		`echo "andronix: gpg-agent started: $?" >>` + keyringAgentLog + `; ` +
 		`{ ` + cmd + `; }; s=$?; gpgconf --homedir "$G" --kill gpg-agent 2>/dev/null; exit $s`
 }
+
+// halfInstalledQuery prints the packages dpkg flags reinst-required (R) or
+// half-installed (H), one per line.
+const halfInstalledQuery = `dpkg-query -W -f='${db:Status-Abbrev}|${binary:Package}\n' 2>/dev/null | awk -F'|' 'substr($1,3,1)=="R" || substr($1,2,1)=="H" {print $2}'`
+
+// reinstreqFix repairs packages dpkg left half-unpacked (support #201): the
+// ones dpkg itself flags (reinst-required or half-installed, read from
+// dpkg, not from apt's message) are reinstalled; any still flagged are
+// removed, so the retry installs them afresh; then the rest is configured.
+const reinstreqFix = `bad() { ` + halfInstalledQuery + `; }
+p=$(bad); [ -n "$p" ] || exit 0
+echo "Reinstalling half-installed packages: $p"
+DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -y install --reinstall $p
+p=$(bad); [ -z "$p" ] || dpkg --remove --force-remove-reinstreq --force-depends $p
+dpkg --configure -a`
 
 const aptFix = "DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -y -f install"
 

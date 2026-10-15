@@ -8,10 +8,12 @@
 port=$1
 . /etc/profile.d/andronix.sh 2>/dev/null   # the installer's Firefox switches
 for v in ${FF_UNSET:-}; do unset "$v"; done   # e.g. FF_UNSET=MOZ_SHM_NO_SEALS: the check without one
-FF=$(command -v firefox-esr || command -v firefox)
+FF=$(command -v firefox || command -v firefox-esr)
 [ -n "$FF" ] || { echo "RESULT no-browser"; exit 0; }
 P=$(mktemp -d)
 echo 'user_pref("browser.dom.window.dump.enabled", true);' >"$P/user.js"
+# FF_PREFS: extra user.js lines, e.g. 'user_pref("security.sandbox.content.level", 1);'
+[ -n "${FF_PREFS:-}" ] && printf '%s\n' "$FF_PREFS" >>"$P/user.js"
 echo "RESULT browser=$($FF --version 2>/dev/null | tr ' ' '_')"
 mode=--headless
 if [ -n "${FF_DISPLAY:-}" ]; then

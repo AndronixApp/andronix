@@ -77,6 +77,11 @@ func RunOne(name string) string {
 		if e == unix.EINVAL {
 			e = 0
 		}
+	case "creat":
+		var ok bool
+		if e, ok = creatSyscall(); !ok {
+			return "setup-failed"
+		}
 	case "seccomp":
 		action := uint32(unix.SECCOMP_RET_KILL_PROCESS)
 		_, _, e = unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_GET_ACTION_AVAIL, 0, uintptr(unsafe.Pointer(&action)))

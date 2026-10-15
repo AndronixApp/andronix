@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/AndronixApp/andronix-distros/internal/pkgmgr"
 )
 
 func TestDisableFailingHooks(t *testing.T) {
@@ -45,5 +47,42 @@ func TestDisableFailingHooks(t *testing.T) {
 	// Nothing left to match: nothing turned off.
 	if off := disableFailingHooks(root, "E: Sub-process returned an error code"); len(off) != 0 {
 		t.Fatalf("again: %v", off)
+	}
+}
+
+// The no-hooks refresh changes only the update (the first apt-get), and
+// its config clears every update hook.
+func TestWithoutUpdateHooks(t *testing.T) {
+	fam, err := pkgmgr.Get("apt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := withoutUpdateHooks(fam.Update)
+	if strings.Count(got, "-c "+noUpdateHooksConf) != 1 || !strings.Contains(got, "apt-get -c "+noUpdateHooksConf+" ") {
+		t.Fatalf("got %q", got)
+	}
+	if i, j := strings.Index(got, noUpdateHooksConf), strings.Index(got, " update"); i < 0 || j < i {
+		t.Errorf("the config isn't on the update: %q", got)
+	}
+	for _, k := range []string{"Pre-Invoke", "Post-Invoke", "Post-Invoke-Success"} {
+		if !strings.Contains(noUpdateHooksText, "#clear APT::Update::"+k+";") {
+			t.Errorf("%s isn't cleared", k)
+		}
+	}
+}
+
+// A result a recovery saved says which one; a failure keeps its own kind.
+func TestPMSavedKind(t *testing.T) {
+	defer func() { pmSaved = "" }()
+	pmSaved = "apt_hook_retried"
+	ok := map[string]any{"ok": true}
+	addPMFailure(ok)
+	if ok["error_kind"] != "apt_hook_retried" {
+		t.Errorf("ok: %v", ok)
+	}
+	fail := map[string]any{"ok": false, "error_class": "network", "error_kind": "network_dns"}
+	addPMFailure(fail)
+	if fail["error_kind"] != "network_dns" {
+		t.Errorf("failed: %v", fail)
 	}
 }

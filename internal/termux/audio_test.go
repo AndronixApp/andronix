@@ -2,6 +2,7 @@ package termux
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -179,5 +180,37 @@ func TestPkgInstallLock(t *testing.T) {
 	defer unlock()
 	if err := pkgInstall(context.Background(), nil, "pulseaudio"); err == nil || !strings.Contains(err.Error(), "another andronix") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// Where Termux runs programs through Android's linker, 'pulseaudio --check'
+// says "Daemon not running" with a daemon up: the daemon's own socket
+// answering must be enough, or each start adds a daemon (a16, Oct 15).
+func TestEnsureAudioCheckWrongButDaemonUp(t *testing.T) {
+	dir := fakePulse(t, true, false, "0\tmodule-native-protocol-tcp\t"+TCPArgs+"\t\n")
+	run, err := os.MkdirTemp("/tmp", "pa") // short: unix socket paths are limited
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(run)
+	l, err := net.Listen("unix", filepath.Join(run, "native"))
+	if err != nil {
+		t.Skip("no unix sockets here:", err)
+	}
+	defer l.Close()
+	home := filepath.Join(dir, "h")
+	os.MkdirAll(filepath.Join(home, ".config/pulse"), 0o700)
+	os.Symlink(run, filepath.Join(home, ".config/pulse/0123-runtime"))
+	t.Setenv("HOME", home)
+	did, err := EnsureAudio(context.Background(), false, nil)
+	if err != nil || did != "" {
+		t.Fatalf("did = %q, err = %v", did, err)
+	}
+	if c := calls(dir); strings.Contains(c, "--start") {
+		t.Errorf("started a second daemon:\n%s", c)
+	}
+	l.Close()
+	if did, _ := EnsureAudio(context.Background(), false, nil); did != "started PulseAudio" {
+		t.Errorf("nothing listening: did = %q", did)
 	}
 }

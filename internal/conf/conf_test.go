@@ -30,7 +30,8 @@ func TestAppKeys(t *testing.T) {
 		t.Errorf("ubuntu 24.04 start scripts: %v", u24.StartScripts)
 	}
 	k, _ := LoadDistro("kali")
-	if k.MirrorRewrite[1] != "http://kali.download/kali/" {
+	// Kali keeps the image's http.kali.org: kali.download loops (support #209-211).
+	if k.MirrorRewrite[0] != "" {
 		t.Errorf("kali mirror rewrite: %v", k.MirrorRewrite)
 	}
 	x, _ := ResolveDesktop("xfce")
@@ -262,5 +263,29 @@ func TestEarlyEdition(t *testing.T) {
 	}
 	if _, err := ResolveEdition("bad"); err == nil {
 		t.Error("a third field other than 'early' must be refused")
+	}
+}
+
+// Kali gets Mozilla's Firefox where Mozilla builds it, firefox-esr on
+// 32-bit (#183); Ubuntu's 32-bit still has none.
+func TestBrowserFallback(t *testing.T) {
+	k, err := ResolveDistro("kali")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ arch, browser, repo string }{
+		{"aarch64", "firefox", "mozilla"}, {"x86_64", "firefox", "mozilla"},
+		{"arm", "firefox-esr", ""}, {"i686", "firefox-esr", ""},
+	} {
+		if b, r := k.BrowserFor(c.arch), k.BrowserRepoFor(c.arch); b != c.browser || r != c.repo {
+			t.Errorf("kali %s: %q from %q, want %q from %q", c.arch, b, r, c.browser, c.repo)
+		}
+	}
+	u, _ := ResolveDistro("ubuntu")
+	if b, r := u.BrowserFor("arm"), u.BrowserRepoFor("arm"); b != "" || r != "" {
+		t.Errorf("ubuntu arm: %q from %q, want none", b, r)
+	}
+	if b, r := u.BrowserFor("aarch64"), u.BrowserRepoFor("aarch64"); b != "firefox" || r != "mozilla" {
+		t.Errorf("ubuntu aarch64: %q from %q", b, r)
 	}
 }

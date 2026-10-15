@@ -1,0 +1,36 @@
+{
+ "source": "support #326 / AX-DBEKFH (Chromebook grunt, x86_64 ARC, Android 11, kernel 5.10, Play Termux, 2.0.8): the probe as recorded (version 3), plus creat ENOSYS, which probe version 4 measures. Synthetic until a probe-4 recording from such a device arrives.",
+ "distro": "fedora",
+ "family": "dnf",
+ "de": "xfce",
+ "probe": {
+  "probe_version": 4,
+  "time": "2026-10-10T20:27:04Z",
+  "kernel": "5.10.237-26374-g2a1a492d40b4",
+  "sdk": 30,
+  "rom": "pixel",
+  "phantom": "unknown",
+  "ram_mb": 3867,
+  "free_mb": 13396,
+  "termux": "google_play_store",
+  "termux_version": "googleplay.2026.10.09",
+  "syscalls": {
+   "clone3": "ENOSYS",
+   "close_range": "ENOSYS",
+   "creat": "ENOSYS",
+   "faccessat2": "ENOSYS",
+   "fchmodat2": "ENOSYS",
+   "memfd_create": "ok",
+   "name_to_handle_at": "ENOSYS",
+   "open_tree": "ENOSYS",
+   "openat2": "ok",
+   "seccomp": "ok",
+   "statx": "ok",
+   "statx_mnt_id": "missing"
+  }
+ },
+ "expect": [
+  "mount-id-shim-probe",
+  "creat-blocked"
+ ]
+}

@@ -2,6 +2,7 @@ package termux
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,27 @@ func pulseEnv(in []string) []string {
 		}
 	}
 	return env
+}
+
+// pulseListening reports whether a PulseAudio daemon answers on its native
+// socket (~/.config/pulse/<machine>-runtime/native). 'pulseaudio --check'
+// says "Daemon not running" where Termux starts programs through Android's
+// linker (its pid check compares /proc/<pid>/exe), so every andronix start
+// launched one more daemon: 12 after a dozen starts on the a16 emulator,
+// each one a process toward Android's limit of 32.
+func pulseListening() bool {
+	links, _ := filepath.Glob(filepath.Join(sys.Home(), ".config/pulse/*-runtime"))
+	for _, l := range links {
+		if r, err := filepath.EvalSymlinks(l); err == nil {
+			l = r // shorter: a unix socket path has a length limit
+		}
+		c, err := net.DialTimeout("unix", filepath.Join(l, "native"), 500*time.Millisecond)
+		if err == nil {
+			c.Close()
+			return true
+		}
+	}
+	return false
 }
 
 func pulse(ctx context.Context, name string, args ...string) (string, error) {
@@ -90,7 +112,7 @@ func EnsureAudio(ctx context.Context, install bool, onLine func(string)) (string
 		os.Remove(backoffFile())
 		did = append(did, "installed PulseAudio")
 	}
-	if _, err := pulse(ctx, "pulseaudio", "--check"); err != nil {
+	if _, err := pulse(ctx, "pulseaudio", "--check"); err != nil && !pulseListening() {
 		// Start it without --load: a TCP module in the user's default.pa
 		// (older Andronix docs) would clash on port 4713 and stop the
 		// daemon. The module is checked and loaded below instead.

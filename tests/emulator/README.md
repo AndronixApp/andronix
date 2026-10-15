@@ -12,6 +12,14 @@ By default every command runs through `adb shell run-as com.termux`, which has n
 - `syscall-probe/run.sh -s SERIAL` shows which Go stdlib paths survive the filter for a `GOOS=linux` and a `GOOS=android` build.
 - AVDs for old Android: `andronix-a9` (API 28) and `andronix-a11` (API 30), both Google APIs arm64, 4 GB RAM, 16 GB data. Gate Android 8 to 11 there with `--app-context`.
 
+## Play Store Termux (`play-termux.sh`)
+
+Play Store Termux (`googleplay.*`) runs binaries through Android's linker and targets a newer SDK; most `apt_hook` and package-script failures in telemetry come from it, and the GitHub Termux on the other AVDs never shows them. The release skill runs `play-termux.sh -s emulator-NNNN --snapshot play-termux-fresh` (Ubuntu 26.04 and Debian, XFCE) on `andronix-a16-play`.
+
+- That AVD's Termux is the Play build pulled from a phone (`~/andronix/play-termux-googleplay.2026.06.21/`: `adb -s <serial> install-multiple base.apk split_config.arm64_v8a.apk split_config.en.apk split_config.xxhdpi.apk`). Snapshot `play-termux-fresh` is that Termux bootstrapped, nothing else.
+- It isn't debuggable, so `app-context.sh` (run-as) can't drive it. Each step is a script pushed to `/data/local/tmp` (the app can read a file there by name), typed into Termux as `sh <file>`, and its output comes back through logcat (`/system/bin/log`).
+- `--bin FILE` tests a local build instead of what `get.sh` serves.
+
 ## Results
 
 Every run writes to `results/<timestamp>/`, which is kept out of git (as is any `.venv/`):

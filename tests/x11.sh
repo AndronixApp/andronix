@@ -27,7 +27,7 @@ check() { # check NAME COMMAND
 docker build -q -t andronix-test-x11-base -f tests/Dockerfile tests >/dev/null &&
     docker build -q -t andronix-test-x11 tests/x11 >/dev/null || { echo "docker build failed"; exit 1; }
 docker rm -f "$box" >/dev/null 2>&1
-docker run -d --init --name "$box" -v "$root":/src:ro andronix-test-x11 sleep infinity >/dev/null
+docker run -d --init -e ANDRONIX_NO_TELEMETRY=1 --name "$box" -v "$root":/src:ro andronix-test-x11 sleep infinity >/dev/null
 [ -n "${KEEP:-}" ] || trap 'docker rm -f "$box" >/dev/null 2>&1' EXIT  # KEEP=1 keeps the box
 
 case $distro in

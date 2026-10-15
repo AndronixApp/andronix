@@ -15,7 +15,48 @@ import (
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
 
+// Only a release build of a released version sends (owner rule), or any
+// build to a test endpoint that isn't ours.
+func TestOnlyReleaseBuilds(t *testing.T) {
+	defer func(r string) { releaseBuild = r }(releaseBuild)
+	t.Setenv("ANDRONIX_NO_TELEMETRY", "")
+	t.Setenv("DO_NOT_TRACK", "")
+	t.Setenv("ANDRONIX_TELEMETRY_URL", "")
+	if _, err := os.Stat("/etc/andronix-release"); err == nil {
+		t.Skip("inside a distro")
+	}
+	for _, c := range []struct {
+		release, ver string
+		want         bool
+	}{
+		{"1", "2.0.7", true},
+		{"1", "2.0.7-rc1", false},
+		{"1", "2.1.0-dev21", false},
+		{"1", "v2.0.6-21-gabc", false},
+		{"", "2.0.7", false}, // a local build that calls itself 2.0.7
+		{"", "2.0.0-dev", false},
+	} {
+		releaseBuild = c.release
+		Init(t.TempDir(), c.ver)
+		if got := Enabled(); got != c.want {
+			t.Errorf("release=%q %s: %v, want %v", c.release, c.ver, got, c.want)
+		}
+	}
+	releaseBuild = ""
+	Init(t.TempDir(), "2.0.7-rc1")
+	t.Setenv("ANDRONIX_TELEMETRY_URL", "http://127.0.0.1:9/v1/events")
+	if !Enabled() {
+		t.Error("a test endpoint takes any build")
+	}
+	t.Setenv("ANDRONIX_TELEMETRY_URL", "https://api.andronix.app/v1/events")
+	if Enabled() {
+		t.Error("our own endpoint from a test build")
+	}
+}
+
 func TestOnOffAndID(t *testing.T) {
+	defer func(r string) { releaseBuild = r }(releaseBuild)
+	releaseBuild = "1"
 	Init(t.TempDir(), "2.0.0")
 	t.Setenv("ANDRONIX_NO_TELEMETRY", "")
 	t.Setenv("DO_NOT_TRACK", "")

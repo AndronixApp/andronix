@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
 )
 
 // Reporter is how a running step talks to the screen.
@@ -359,9 +360,11 @@ func (m *stepModel) View() string {
 
 func runTea(ctx context.Context, steps []Step, log Logger) error {
 	m := newStepModel(ctx, steps, log)
-	opts := []tea.ProgramOption{tea.WithOutput(os.Stdout)}
-	if !Interactive {
-		opts = append(opts, tea.WithInput(nil))
+	// Keys come from os.Stdin when it's a terminal, else none: never
+	// bubbletea's /dev/tty fallback (#255).
+	opts := []tea.ProgramOption{tea.WithOutput(os.Stdout), tea.WithInput(nil)}
+	if Interactive && term.IsTerminal(int(os.Stdin.Fd())) {
+		opts = append(opts, tea.WithInput(os.Stdin))
 	}
 	p := tea.NewProgram(m, opts...)
 	m.rep = &teaRep{send: p.Send, log: log}
