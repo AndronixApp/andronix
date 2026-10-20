@@ -5,10 +5,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-// The extra-keys bar is hidden on the first desktop only: later runs leave
-// the user's choice (a swipe down brings it back) alone.
+// The bar is hidden by turning off the extra-keys feature (showAdditionalKbd),
+// which the app applies to every window. The first write is lost (the app
+// resets its preferences when it first starts), so the loop retries; once the
+// read-back confirms it's off the marker is written, and a later desktop
+// leaves the user's choice alone.
 func TestHideExtraKeysOnce(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "bin")
@@ -17,7 +21,7 @@ func TestHideExtraKeysOnce(t *testing.T) {
 	// set is lost, like on a fresh install before the app first starts.
 	os.WriteFile(filepath.Join(bin, "termux-x11-preference"), []byte(`#!/bin/sh
 d=`+dir+`
-if [ "$1" = list ]; then echo "\"additionalKbdVisible\"=\"$(cat $d/value 2>/dev/null || echo true)\""; exit 0; fi
+if [ "$1" = list ]; then echo "\"showAdditionalKbd\"=\"$(cat $d/value 2>/dev/null || echo true)\""; exit 0; fi
 echo "$*" >>$d/calls
 if [ -e $d/started ]; then echo "${1#*:}" >$d/value; else touch $d/started; fi
 `), 0o755)
@@ -35,24 +39,26 @@ if [ -e $d/started ]; then echo "${1#*:}" >$d/value; else touch $d/started; fi
 		t.Fatal("second desktop changed the setting again")
 	}
 	b, _ := os.ReadFile(filepath.Join(dir, "calls"))
-	if strings.Count(string(b), "additionalKbdVisible:false") != 2 {
+	if strings.Count(string(b), "showAdditionalKbd:false") != 2 {
 		t.Fatalf("want a retry after the lost first set; calls: %q", b)
 	}
 }
 
-// Never marked done when the setting doesn't stick: the next desktop
-// tries again.
+// Never marked done when the setting doesn't stick: the next desktop tries
+// again.
 func TestHideExtraKeysNotMarkedOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "bin")
 	os.MkdirAll(bin, 0o755)
-	os.WriteFile(filepath.Join(bin, "termux-x11-preference"), []byte("#!/bin/sh\n[ \"$1\" = list ] && echo '\"additionalKbdVisible\"=\"true\"'\nexit 0\n"), 0o755)
+	os.WriteFile(filepath.Join(bin, "termux-x11-preference"), []byte("#!/bin/sh\n[ \"$1\" = list ] && echo '\"showAdditionalKbd\"=\"true\"'\nexit 0\n"), 0o755)
 	t.Setenv("PATH", bin+":/usr/bin:/bin")
 	t.Setenv("ANDRONIX_HOME", filepath.Join(dir, "home"))
 	old := isTermux
 	isTermux = func() bool { return true }
 	t.Cleanup(func() { isTermux = old })
 	extraKeysWait = 0
+	extraKeysDeadline = 20 * time.Millisecond
+	t.Cleanup(func() { extraKeysDeadline = 30 * time.Second })
 	if HideExtraKeysOnce() {
 		t.Fatal("reported hidden although the setting reads true")
 	}

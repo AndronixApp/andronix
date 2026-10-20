@@ -71,14 +71,14 @@ func desktopDistro() (string, error) {
 	case len(opts) == 1:
 		return opts[0].Value, nil
 	case len(opts) == 0:
-		return "", ui.Errorf("No desktop installed yet", "Termux:X11 shows a distro's desktop, and none of yours has one.",
+		return "", ui.Errorf("no_desktop_installed_yet", "No desktop installed yet", "Termux:X11 shows a distro's desktop, and none of yours has one.",
 			"Install one first, e.g. andronix install debian --de xfce")
 	case !ui.Interactive:
 		var ids []string
 		for _, o := range opts {
 			ids = append(ids, o.Value)
 		}
-		return "", ui.Errorf("Which distro?", "More than one distro has a desktop: "+strings.Join(ids, ", ")+".",
+		return "", ui.Errorf("which_distro", "Which distro?", "More than one distro has a desktop: "+strings.Join(ids, ", ")+".",
 			"Name it, e.g. andronix desktop "+ids[0])
 	}
 	return ui.Choose("Which desktop should I open?", "", opts, opts[0].Value)
@@ -135,15 +135,15 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 	}
 	in := Open(d)
 	if !in.Installed() {
-		return ui.Errorf(d.Label()+" isn't installed", "There's no desktop to show yet.", "Install it first: andronix install "+d.ID+" --de xfce")
+		return ui.Errorf("not_installed", d.Label()+" isn't installed", "There's no desktop to show yet.", "Install it first: andronix install "+d.ID+" --de xfce")
 	}
 	de, err := conf.ResolveDesktop(in.Get("DE"))
 	if err != nil || de.None() {
-		return ui.Errorf(d.Label()+" has no desktop", "It was installed as command line only.", "Add one: andronix install "+d.ID+" --de xfce")
+		return ui.Errorf("no_desktop", d.Label()+" has no desktop", "It was installed as command line only.", "Add one: andronix install "+d.ID+" --de xfce")
 	}
 	if run, ok := readX11State(); ok {
 		if run.Distro != d.ID {
-			return ui.Errorf("Another desktop is on Termux:X11", "The "+run.Distro+" desktop is running there now.",
+			return ui.Errorf("another_desktop_is_on_termux_x11", "Another desktop is on Termux:X11", "The "+run.Distro+" desktop is running there now.",
 				"Stop it first: andronix desktop stop")
 		}
 		termux.OpenX11App()
@@ -157,7 +157,7 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 	// first login would.
 	if _, err := os.Stat(filepath.Join(in.Rootfs, "etc/andronix/firstboot")); err == nil && ui.Interactive {
 		if err := in.Target(true).Interactive("/usr/local/bin/andronix setup-user", false); err != nil {
-			return ui.Errorf("User setup didn't finish", err.Error(), "Run ./"+d.MainStart()+" once to set up your user, then andronix desktop "+d.ID)
+			return ui.Errorf("user_setup_didn_t_finish", "User setup didn't finish", err.Error(), "Run ./"+d.MainStart()+" once to set up your user, then andronix desktop "+d.ID)
 		}
 	}
 	t := in.Target(false)
@@ -178,7 +178,7 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 	if b, err := os.ReadFile(xs); err != nil || !strings.Contains(string(b), "andronix session-prep") {
 		writeXstartup(in.Rootfs, de)
 		if _, err := os.Stat(xs); err != nil {
-			return ui.Errorf("The desktop session is missing", "There's no session script at ~/.config/tigervnc/xstartup for "+nameOr(t.User, "root")+".",
+			return ui.Errorf("the_desktop_session_is_missing", "The desktop session is missing", "There's no session script at ~/.config/tigervnc/xstartup for "+nameOr(t.User, "root")+".",
 				"Reinstall the desktop: andronix install "+d.ID+" --de "+de.ID)
 		}
 	}
@@ -230,10 +230,9 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 		return x11Error(err, serverLog, d.ID)
 	}
 	termux.OpenX11App()
-	// After the app is open (see HideExtraKeysOnce); it can take a few
-	// seconds, so the session starts meanwhile.
-	hidden := make(chan bool, 1)
-	go func() { hidden <- termux.HideExtraKeysOnce() }()
+	// Hide the extra-keys bar in the background: it waits for the X session
+	// to connect (see HideExtraKeysOnce), so it must not block the box below.
+	go termux.HideExtraKeysOnce()
 	rootfs.EnsureBwrapShim(in.Rootfs)
 
 	t.Display = fmt.Sprintf(":%d", termux.X11Display)
@@ -245,7 +244,7 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 	start := time.Now()
 	if err := c.Start(); err != nil {
 		stopOurServer(run)
-		return ui.Errorf("The desktop didn't start", err.Error(), "Run andronix desktop "+d.ID+" again.")
+		return ui.Errorf("the_desktop_didn_t_start", "The desktop didn't start", err.Error(), "Run andronix desktop "+d.ID+" again.")
 	}
 	run.Proot = c.Process.Pid
 	t.Watch(c.Process.Pid) // DNS through Android for the session (#141)
@@ -259,9 +258,7 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 		"Switch to the Termux:X11 app to use it. If it didn't open, open Termux:X11 from your app drawer.",
 		"Keep this Termux session open while you use the desktop.", "",
 		ui.KV("Stop", "log out, press Ctrl-C here,"), ui.KV("", "or run: andronix desktop stop")}
-	if <-hidden {
-		lines = append(lines, "", "Termux:X11's extra-keys bar is hidden so the desktop's bottom panel shows. Swipe down with three fingers in Termux:X11 to bring it back.")
-	}
+	lines = append(lines, "", "Termux:X11's extra-keys bar is hidden so the desktop's bottom panel shows. Turn it back on in Termux:X11's settings (Show additional keys).")
 	if vncNote != "" {
 		lines = append(lines, "", vncNote)
 	}
@@ -281,6 +278,7 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 				props["drew"] = *drew
 			}
 			telemetry.Send("start", props)
+			desktopStart(in, "x11", props)
 		})
 	}
 	if n := termux.PhantomNote(); n != "" {
@@ -332,7 +330,7 @@ func Desktop(ctx context.Context, name string, x11 DesktopX11) error {
 		if len(tail) > 3 {
 			tail = tail[len(tail)-3:]
 		}
-		return ui.Errorf("The desktop session stopped", "The desktop quit right after starting: "+strings.Join(tail, " / "),
+		return ui.Errorf("the_desktop_session_stopped", "The desktop session stopped", "The desktop quit right after starting: "+strings.Join(tail, " / "),
 			"Run andronix desktop "+d.ID+" again. If it happens again, send us /tmp/andronix-session-"+uid+".log from inside "+d.Name+" (Discord or email).")
 	}
 	fmt.Println()
@@ -350,11 +348,22 @@ type DesktopX11 struct {
 // insideDistroNote answers a Termux-only command typed inside a distro:
 // not an error (people filed it as one), just where to type it.
 func insideDistroNote(distro, cmd string) {
+	if standaloneHost() {
+		fmt.Println()
+		fmt.Print(ui.Box(ui.BoxBrand, "You're inside "+distroName(distro), "In the app, start desktops from Home > Your Linux."))
+		fmt.Println()
+		return
+	}
 	insideNote(distro, cmd, "The desktop opens from Termux, outside %s. Two steps:")
 }
 
 // insideNote is insideDistroNote with its own first line (%s: the distro).
 func insideNote(distro, cmd, what string) {
+	insideNoteSteps(distro, what, "2. Then run: "+cmd)
+}
+
+// insideNoteSteps is insideNote with its own second step.
+func insideNoteSteps(distro, what, step2 string) {
 	name := distro
 	if d, err := conf.ResolveDistro(distro); err == nil {
 		name = d.Label()
@@ -363,7 +372,7 @@ func insideNote(distro, cmd, what string) {
 	fmt.Print(ui.Box(ui.BoxBrand, "You're inside "+name,
 		fmt.Sprintf(what, name), "",
 		"1. Type exit (this leaves "+name+").",
-		"2. Then run: "+cmd))
+		step2))
 	fmt.Println()
 }
 
@@ -452,10 +461,10 @@ func x11Error(err error, serverLog, distro string) error {
 			What: "andronix desktop needs the Termux:X11 app (" + termux.X11App + ")."})
 		return ErrExplained
 	case errors.Is(err, termux.ErrX11AppSignature):
-		return ui.Errorf("Termux:X11 doesn't match", "The Termux:X11 app and the termux-x11 package come from different builds.",
+		return ui.Errorf("termux_x11_doesn_t_match", "Termux:X11 doesn't match", "The Termux:X11 app and the termux-x11 package come from different builds.",
 			"Install the app again from "+termux.X11AppURL+", then run: pkg reinstall "+termux.X11Package)
 	case errors.Is(err, termux.ErrX11OldAndroid):
-		return ui.Errorf("Termux:X11 needs Android 7+", "This phone's Android is too old for Termux:X11.",
+		return ui.Errorf("termux_x11_needs_android_7", "Termux:X11 needs Android 7+", "This phone's Android is too old for Termux:X11.",
 			"Use VNC instead: start the distro and run vncserver-start")
 	}
 	var ue *ui.UserError
@@ -468,7 +477,7 @@ func x11Error(err error, serverLog, distro string) error {
 		// failed): the likeliest cause comes first.
 		fix = "If the Termux:X11 app isn't installed: get " + termux.X11AppAPK + " from " + termux.X11AppURL + " (help: " + termux.X11Docs + "). Otherwise: " + fix
 	}
-	return &ui.UserError{Title: "Termux:X11 didn't start", What: err.Error(), Fix: fix, Log: serverLog}
+	return &ui.UserError{Class: "termux_x11_didn_t_start", Title: "Termux:X11 didn't start", What: err.Error(), Fix: fix, Log: serverLog}
 }
 
 // x11AppBox is the box for a missing Termux:X11 app; last is its third step.

@@ -72,11 +72,11 @@ func editionDistro(ed *conf.Edition, cmd string) (*conf.Distro, error) {
 	}
 	in := Open(d)
 	if _, err := os.Stat(in.Rootfs); err != nil {
-		return nil, ui.Errorf(editionLabel(d, ed.ID)+" isn't installed", "There's nothing to "+cmd+".",
+		return nil, ui.Errorf("not_installed", editionLabel(d, ed.ID)+" isn't installed", "There's nothing to "+cmd+".",
 			"Install it from the Andronix app.")
 	}
 	if have := installedEdition(in); have != ed.ID {
-		return nil, ui.Errorf(editionLabel(d, ed.ID)+" isn't installed", "The "+d.Name+" that's installed is "+editionLabel(d, have)+".",
+		return nil, ui.Errorf("not_installed", editionLabel(d, ed.ID)+" isn't installed", "The "+d.Name+" that's installed is "+editionLabel(d, have)+".",
 			"Use: andronix "+cmd+" "+d.ID)
 	}
 	return d, nil
@@ -181,7 +181,7 @@ func removeEdition(ctx context.Context, ed *conf.Edition, legacy bool) error {
 	if mine {
 		steps = append(steps, ui.Step{Label: "Removing " + label, Run: func(ctx context.Context, r ui.Reporter) error {
 			if err := rootfs.Remove(in.Dir); err != nil {
-				return ui.Errorf("Couldn't remove everything", err.Error(), "Exit every "+d.Name+" session (and vncserver-stop), then try again.")
+				return ui.Errorf("couldn_t_remove_everything", "Couldn't remove everything", err.Error(), "Exit every "+d.Name+" session (and vncserver-stop), then try again.")
 			}
 			RemoveLaunchers(d)
 			removeCache(cacheEntries(GetPaths().Cache, d.ID))
@@ -193,7 +193,7 @@ func removeEdition(ctx context.Context, ed *conf.Edition, legacy bool) error {
 			for _, p := range old {
 				if st, err := os.Stat(p); err == nil && st.IsDir() {
 					if err := rootfs.Remove(p); err != nil {
-						return ui.Errorf("Couldn't remove the old copy", err.Error(), "Exit every session of it, then try again.")
+						return ui.Errorf("couldn_t_remove_the_old_copy", "Couldn't remove the old copy", err.Error(), "Exit every session of it, then try again.")
 					}
 				} else {
 					os.Remove(p)

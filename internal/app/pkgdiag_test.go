@@ -170,6 +170,46 @@ func TestSpaceNeed(t *testing.T) {
 	}
 }
 
+func TestPackagesPlural(t *testing.T) {
+	if packages(1) != "1 package" || packages(252) != "252 packages" || packages(0) != "0 packages" {
+		t.Errorf("%q %q %q", packages(1), packages(252), packages(0))
+	}
+}
+
+func TestStandaloneExtras(t *testing.T) {
+	xfce, _ := conf.ResolveDesktop("xfce")
+	none, _ := conf.ResolveDesktop("none")
+	for _, id := range conf.DistroIDs() {
+		d, _ := conf.LoadDistro(id)
+		got := standaloneExtras(d, xfce, true)
+		if len(got) != 2 || got[0] != d.Xvfb() || got[1] != d.Pulse() {
+			t.Errorf("%s standalone: %v, want [%s %s]", id, got, d.Xvfb(), d.Pulse())
+		}
+		if got := standaloneExtras(d, xfce, false); got != nil {
+			t.Errorf("%s Termux: %v, want none", id, got)
+		}
+		if got := standaloneExtras(d, none, true); got != nil {
+			t.Errorf("%s command line: %v, want none", id, got)
+		}
+	}
+}
+
+func TestSpaceNeedStandalone(t *testing.T) {
+	deb, _ := conf.LoadDistro("debian")
+	xfce, _ := conf.ResolveDesktop("xfce")
+	none, _ := conf.ResolveDesktop("none")
+	t.Setenv("ANDRONIX_HOST", "")
+	termux, termuxNone := spaceNeed(deb, xfce, false), spaceNeed(deb, none, false)
+	t.Setenv("ANDRONIX_HOST", "standalone")
+	t.Setenv("ANDRONIX_DISTRO", "")
+	if n := spaceNeed(deb, xfce, false); n != termux+int64(float64(standaloneExtrasMB)*1.2) {
+		t.Errorf("standalone xfce: %d, Termux %d", n, termux)
+	}
+	if n := spaceNeed(deb, none, false); n != termuxNone {
+		t.Errorf("standalone command line: %d, Termux %d", n, termuxNone)
+	}
+}
+
 // A refresh that fails for a non-network reason doesn't say the servers
 // were unreachable; the keyring case has its own message (support #119).
 func TestPkgErrRefreshTitles(t *testing.T) {
@@ -225,9 +265,23 @@ func TestDownloadKind(t *testing.T) {
 			t.Errorf("%v: %s, want %s", c.err, got, c.want)
 		}
 	}
-	e := downloadErr(errors.New(`Get "https://dl.andronix.app/rootfs/ubuntu/26.04/ubuntu-26.04-arm.tar.xz": unexpected EOF`)).(*ui.UserError)
+	e := downloadErr(errors.New(`Get "https://dl.andronix.app/rootfs/ubuntu/26.04/ubuntu-26.04-arm.tar.xz": unexpected EOF`), false).(*ui.UserError)
 	if e.Kind != "interrupted" || strings.Contains(e.Detail, "rootfs/") || e.Detail == "" {
 		t.Errorf("kind %q detail %q", e.Kind, e.Detail)
+	}
+	// #243: a 401 on a free source (tarball, registry) is a download error,
+	// not the user's token being refused.
+	free := downloadErr(&netx.StatusError{Code: 401}, false).(*ui.UserError)
+	if free.Class != "download" {
+		t.Errorf("free 401 class = %q, want download", free.Class)
+	}
+	// products-api (Modded/beta) 401/403 keep the token classes.
+	paid := downloadErr(&netx.StatusError{Code: 401}, true).(*ui.UserError)
+	if paid.Class != "token_refused" {
+		t.Errorf("paid 401 class = %q, want token_refused", paid.Class)
+	}
+	if e403 := downloadErr(&netx.StatusError{Code: 403}, true).(*ui.UserError); e403.Class != "token_other_edition" {
+		t.Errorf("paid 403 class = %q, want token_other_edition", e403.Class)
 	}
 }
 

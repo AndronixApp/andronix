@@ -75,3 +75,47 @@ func TestDialContextLogs(t *testing.T) {
 		t.Errorf("logged %d times, want once: %v", len(lines), lines)
 	}
 }
+
+// #243/AX-G6WNB0: Android's resolver can answer IPv6-only on a v6 network,
+// leaving no IPv4 to escape an IPv6 black hole. When every address from
+// Android fails, DialContext asks Go's resolver and dials the IPv4 it adds.
+func TestDialContextCrossResolverV4(t *testing.T) {
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(l.Addr().String())
+
+	oldS, oldG, oldU, oldLog := lookupSystem, lookupGo, useSystemDNS, DNSLog
+	defer func() { lookupSystem, lookupGo, useSystemDNS, DNSLog = oldS, oldG, oldU, oldLog }()
+	DNSLog = nil
+	useSystemDNS = true
+	// Android: IPv6-only, and nothing listens on [::1]:port, so it fails fast.
+	lookupSystem = func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("::1")}}, nil
+	}
+	var goCalls int
+	// Go resolver: the reachable IPv4.
+	lookupGo = func(context.Context, string) ([]net.IPAddr, error) {
+		goCalls++
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+	c, err := DialContext(context.Background(), "tcp", net.JoinHostPort("v6only.invalid", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	c.Close()
+	if goCalls == 0 {
+		t.Error("Go resolver not consulted for the IPv4 fallback")
+	}
+}

@@ -16,7 +16,7 @@ import (
 // ProbeVersion changes whenever the probe's logic or fields change
 // (3: LineageOS detection), so a cached probe from an older andronix is
 // measured again.
-const ProbeVersion = 4 // 4: creat (support #326)
+const ProbeVersion = 6 // 6: sve_masked (#192); 5: getcwd (support #229); 4: creat (support #326)
 
 // Probe is what was measured on this phone.
 type Probe struct {
@@ -31,6 +31,11 @@ type Probe struct {
 	Termux   string            `json:"termux"` // f_droid, github, google_play_store, or ""
 	TermuxV  string            `json:"termux_version"`
 	Syscalls map[string]string `json:"syscalls,omitempty"` // name -> ok, ENOSYS, EPERM, EUNATCH, SIGSYS, ...
+	// SVEMasked is set when this phone's cores make Mesa's llvmpipe assume SVE
+	// but the kernel has it off, so andronix binds a corrected /proc/cpuinfo
+	// (#192). SVEParts is the ARM part numbers it affects. No other CPU data.
+	SVEMasked bool     `json:"sve_masked,omitempty"`
+	SVEParts  []string `json:"sve_parts,omitempty"`
 }
 
 // Key is the cache key: a new kernel, Android, Termux or probe measures again.
@@ -45,11 +50,9 @@ func Host() *Probe {
 	p.SDK, _ = strconv.Atoi(getprop("ro.build.version.sdk"))
 	p.ROM = romFamily()
 	p.Phantom = phantom(p.SDK)
-	p.Termux = strings.ToLower(os.Getenv("TERMUX_APK_RELEASE"))
-	if p.Termux == "" && strings.HasPrefix(os.Getenv("TERMUX_VERSION"), "googleplay") {
-		p.Termux = "google_play_store"
-	}
-	p.TermuxV = os.Getenv("TERMUX_VERSION")
+	p.Termux = sys.TermuxFlavor()
+	p.TermuxV = sys.TermuxVersion()
+	p.SVEMasked, p.SVEParts = sys.SVEMasked()
 	return p
 }
 

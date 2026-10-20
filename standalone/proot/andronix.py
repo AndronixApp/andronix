@@ -43,3 +43,39 @@ rep('src/extension/kompat/kompat.c', '''static FilteredSysnum filtered_sysnums[]
 /* The full list (kernels before 2.6.30), unused on Android.  */
 static FilteredSysnum filtered_sysnums_old_kernels[] UNUSED = {
 	{ PR_accept4,		FILTER_SYSEXIT },''')
+
+# 3. The SysV-IPC shm helper re-execs proot ("proot --shm-helper") through
+#    /proc/self/exe. Under Android's linker (Play Store Termux's W^X exec
+#    path, and the app when native libraries unpack without the exec bit,
+#    support #229), /proc/self/exe is the linker, not proot, so this became
+#    `linker64 --shm-helper`, which the linker rejects ("expected absolute
+#    path: --shm-helper") and the desktop started without shared-memory
+#    frames. andronix leaves proot's real path in TERMUX_EXEC__PROC_SELF_EXE
+#    when it starts proot that way, so re-exec through the linker with it.
+rep('src/extension/sysvipc/sysvipc_shm.c', '''#include <string.h> /* memset */''', '''#include <string.h> /* memset, str*(3) (Andronix) */
+#include <stdlib.h> /* getenv (Andronix) */
+#include <limits.h> /* PATH_MAX (Andronix) */''')
+rep('src/extension/sysvipc/sysvipc_shm.c', '''			execl("/proc/self/exe", "proot", "--shm-helper", NULL);
+				perror("proot-shm-helper: execl");
+				_exit(1);''', '''			/* Andronix (#229): started through Android's linker,
+				 * /proc/self/exe is the linker and proot's real path is
+				 * in TERMUX_EXEC__PROC_SELF_EXE; re-exec through the
+				 * linker so the helper is proot, not "--shm-helper".  */
+				const char *self = getenv("TERMUX_EXEC__PROC_SELF_EXE");
+				if (self != NULL && self[0] != '\\0') {
+					char linker[PATH_MAX] = "/system/bin/linker64";
+					char exe[PATH_MAX];
+					ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+					if (n > 0) {
+						exe[n] = '\\0';
+						const char *b = strrchr(exe, '/');
+						if (strncmp(b != NULL ? b + 1 : exe, "linker", 6) == 0)
+							strcpy(linker, exe);
+					}
+					execl(linker, linker, self, "--shm-helper", (char *)NULL);
+					perror("proot-shm-helper: execl linker");
+					_exit(1);
+				}
+				execl("/proc/self/exe", "proot", "--shm-helper", (char *)NULL);
+				perror("proot-shm-helper: execl");
+				_exit(1);''')

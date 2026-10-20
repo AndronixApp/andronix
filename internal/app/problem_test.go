@@ -263,3 +263,20 @@ func TestReportLogIsTheFailingRuns(t *testing.T) {
 		t.Errorf("retry's log not after the failing one: %q", r.Log)
 	}
 }
+
+// support #498: a report from inside a distro sent proot's stand-in kernel
+// (6.12.0-andronix), and the desk closed it as our test device.
+func TestGuestKernel(t *testing.T) {
+	stand := "Linux version 6.12.0-andronix (andronix@localhost) (clang) #1 SMP PREEMPT\n"
+	for _, c := range []struct{ osrelease, version, want string }{
+		{"5.10.177-android12-9\n", stand, "5.10.177-android12-9"},
+		{"6.12.0-andronix\n", "Linux version 4.19.191-g6e5440f6a542 (builder@x) #1\n", "4.19.191-g6e5440f6a542"},
+		{"6.12.0-andronix\n", stand, ""},
+		{"", stand, ""},
+		{"", "", ""},
+	} {
+		if got := guestKernel(c.osrelease, c.version); got != c.want {
+			t.Errorf("guestKernel(%q, %q) = %q, want %q", c.osrelease, c.version, got, c.want)
+		}
+	}
+}

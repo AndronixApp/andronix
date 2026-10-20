@@ -62,10 +62,10 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 			in := Open(d)
 			if !in.Installed() {
 				if _, err := os.Stat(in.Rootfs); err == nil {
-					return ui.Errorf(d.Label()+" isn't finished", "The last install stopped part way, so there's nothing to update yet.",
+					return ui.Errorf("not_finished", d.Label()+" isn't finished", "The last install stopped part way, so there's nothing to update yet.",
 						"Run: andronix install "+d.ID+" (it picks up where it stopped).")
 				}
-				return ui.Errorf(d.Label()+" isn't installed", "There's nothing to update.", "Install it first: andronix install "+d.ID)
+				return ui.Errorf("not_installed", d.Label()+" isn't installed", "There's nothing to update.", "Install it first: andronix install "+d.ID)
 			}
 			targets = append(targets, in)
 		} else {
@@ -89,7 +89,8 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 
 	n = len(targets)
 	var steps []ui.Step
-	if !o.NoSelf {
+	// The standalone app ships andronix in its APK: it updates with the app.
+	if !o.NoSelf && !sys.Standalone() {
 		updated := false
 		self := ui.Step{Label: "Updating andronix", Run: func(ctx context.Context, r ui.Reporter) error {
 			return selfUpdate(ctx, r, lg, &updated, o)
@@ -129,17 +130,21 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 				// Before the upgrade, also on installs made before it existed:
 				// the compat rules' scripts (from the cached probe), then the distro's.
 				cr := newCompat(d, in.Get("DE"))
-				if sys.IsTermux() {
+				if sys.OnAndroid() {
 					if err := cr.probe(ctx, t, lg); err != nil { // measured once per kernel/Android/Termux, then cached
 						return err
 					}
 					cr.apply(in.Rootfs, sys.DetectArch(), lg)
 				}
-				if err := cr.preScripts(ctx, t, r); err != nil {
-					return err
-				}
-				return preUpgrade(ctx, ops, d, r)
+				return cr.preScripts(ctx, t, r)
 			}},
+		)
+		if d.PreUpgrade != "" { // its own step, as in install
+			steps = append(steps, ui.Step{Key: "prepare", Label: "Preparing " + d.Label() + " for updates", Run: func(ctx context.Context, r ui.Reporter) error {
+				return preUpgrade(ctx, ops, d, r)
+			}})
+		}
+		steps = append(steps,
 			ui.Step{Label: "Updating " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
 				n := count(ctx, t, fam.SimUpgrade, fam)
 				if n == 0 {
@@ -149,7 +154,7 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 					return pkgErr("Couldn't update "+d.Name, err)
 				}
 				t.Run(ctx, fam.Clean, nil, nil)
-				r.Detail(fmt.Sprintf("%d packages", n))
+				ui.DetailOf(r, "packages", packages(n), map[string]any{"count": n})
 				return nil
 			}},
 		)
@@ -220,7 +225,7 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 					return pkgErr("Couldn't put back "+de.Name+"'s packages", err)
 				}
 				t.Run(ctx, fam.Clean, nil, nil)
-				r.Detail(fmt.Sprintf("%d packages", n))
+				ui.DetailOf(r, "packages", packages(n), map[string]any{"count": n})
 				return nil
 			}})
 		}
@@ -274,7 +279,7 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 func selfUpdate(ctx context.Context, r ui.Reporter, lg *Logger, updated *bool, o UpdateOpts) error {
 	beta := o.Channel == "beta"
 	if o.Channel != "" && o.Channel != "beta" && o.Channel != "stable" {
-		return ui.Errorf("Unknown channel '"+o.Channel+"'", "The update channels are stable and beta.", "Run: andronix update --channel beta --token '<token from the app>'")
+		return ui.Errorf("unknown_channel", "Unknown channel '"+o.Channel+"'", "The update channels are stable and beta.", "Run: andronix update --channel beta --token '<token from the app>'")
 	}
 	if !beta && !strings.HasPrefix(VersionLabel(), "v") && os.Getenv("ANDRONIX_SELF_UPDATE") == "" {
 		return ui.Skip("development build (" + Version + ")")
@@ -340,11 +345,11 @@ func selfUpdate(ctx context.Context, r ui.Reporter, lg *Logger, updated *bool, o
 	}
 	if err != nil {
 		os.Remove(tmp)
-		return downloadErr(err)
+		return downloadErr(err, false) // self-update binary; beta-token refusal is caught in betaResolve
 	}
 	if got != want {
 		os.Remove(tmp)
-		return ui.Errorf("Update is damaged", "The downloaded andronix doesn't match its checksum, so it wasn't installed.", "Run andronix update again.")
+		return ui.Errorf("update_is_damaged", "Update is damaged", "The downloaded andronix doesn't match its checksum, so it wasn't installed.", "Run andronix update again.")
 	}
 	os.Chmod(tmp, 0o755)
 	if mirrorVersion == "" && !downgradeOK {
@@ -361,9 +366,9 @@ func selfUpdate(ctx context.Context, r ui.Reporter, lg *Logger, updated *bool, o
 	}
 	if err := os.Rename(tmp, self); err != nil {
 		os.Remove(tmp)
-		return ui.Errorf("Couldn't replace andronix", err.Error(), "Check that Termux can write to "+filepath.Dir(self)+".")
+		return ui.Errorf("couldn_t_replace_andronix", "Couldn't replace andronix", err.Error(), "Check that Termux can write to "+filepath.Dir(self)+".")
 	}
-	r.Detail("new version installed")
+	ui.DetailOf(r, "update.installed", "new version installed", nil)
 	*updated = true
 	return nil
 }
@@ -558,15 +563,15 @@ func moddedUpdate(ctx context.Context, in *Inst, o UpdateOpts, r ui.Reporter, lg
 		raw, err = os.ReadFile(src)
 	}
 	if err != nil {
-		return ui.Errorf("Couldn't read the update list", err.Error(), "Get a fresh update link from the Andronix app.")
+		return ui.Errorf("couldn_t_read_the_update_list", "Couldn't read the update list", err.Error(), "Get a fresh update link from the Andronix app.")
 	}
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return ui.Errorf("The update list is damaged", err.Error(), "Get a fresh update link from the Andronix app.")
+		return ui.Errorf("the_update_list_is_damaged", "The update list is damaged", err.Error(), "Get a fresh update link from the Andronix app.")
 	}
 	arch := string(sys.DetectArch())
 	if (m.Distro != "" && m.Distro != in.D.ID) || (m.Arch != "" && m.Arch != arch) || (m.DE != "" && m.DE != in.Get("DE")) {
-		return ui.Errorf("Wrong update list", fmt.Sprintf("This list is for %s %s on %s, not this install.", m.Distro, m.DE, m.Arch),
+		return ui.Errorf("wrong_update_list", "Wrong update list", fmt.Sprintf("This list is for %s %s on %s, not this install.", m.Distro, m.DE, m.Arch),
 			"Get the update link for this edition from the Andronix app.")
 	}
 	cur := moddedVersion(in.Rootfs)
@@ -584,7 +589,7 @@ func moddedUpdate(ctx context.Context, in *Inst, o UpdateOpts, r ui.Reporter, lg
 			}
 		}
 		if next < 0 || len(chain) > 50 {
-			return ui.Errorf("No update path", "There's no update from "+cur+" to "+m.Latest+".",
+			return ui.Errorf("no_update_path", "No update path", "There's no update from "+cur+" to "+m.Latest+".",
 				"Reinstall the edition from the Andronix app to get "+m.Latest+".")
 		}
 		chain = append(chain, m.Deltas[next])
@@ -594,7 +599,7 @@ func moddedUpdate(ctx context.Context, in *Inst, o UpdateOpts, r ui.Reporter, lg
 	os.MkdirAll(cache, 0o755)
 	for _, d := range chain {
 		if strings.ContainsAny(d.File, "/\\") || strings.HasPrefix(d.File, ".") {
-			return ui.Errorf("The update list is damaged", "Bad file name "+d.File+".", "Get a fresh update link from the Andronix app.")
+			return ui.Errorf("the_update_list_is_damaged", "The update list is damaged", "Bad file name "+d.File+".", "Get a fresh update link from the Andronix app.")
 		}
 		r.Label(fmt.Sprintf("Updating the Modded edition to %s", d.To))
 		file := filepath.Join(cache, d.File)
@@ -605,16 +610,16 @@ func moddedUpdate(ctx context.Context, in *Inst, o UpdateOpts, r ui.Reporter, lg
 				return err
 			}
 			if _, err := netx.Download(ctx, ms, file+".part", nil, d.Size, func(c, t int64) { r.Progress(c, t, "bytes") }); err != nil {
-				return downloadErr(err)
+				return downloadErr(err, true) // products-api (Modded edition update)
 			}
 			os.Rename(file+".part", file)
 		case remote:
-			return ui.Errorf("Missing download token", "Modded updates need the token from the Andronix app.", "Copy the update command from the app; it includes --token.")
+			return ui.Errorf("missing_download_token", "Missing download token", "Modded updates need the token from the Andronix app.", "Copy the update command from the app; it includes --token.")
 		default: // a local manifest: files sit next to it
 			file = filepath.Join(filepath.Dir(src), d.File)
 		}
 		if sum, _ := netx.FileSHA256(file); d.SHA256 != "" && sum != d.SHA256 {
-			return ui.Errorf("Update is damaged", d.File+" doesn't match its checksum.", "Run andronix update again.")
+			return ui.Errorf("update_is_damaged", "Update is damaged", d.File+" doesn't match its checksum.", "Run andronix update again.")
 		}
 		st, _ := os.Stat(file)
 		x := &rootfs.Extractor{Root: in.Rootfs, Layers: true, Progress: func(c, t int64) { r.Progress(c, t, "bytes") }}
@@ -622,7 +627,7 @@ func moddedUpdate(ctx context.Context, in *Inst, o UpdateOpts, r ui.Reporter, lg
 			x.Total = st.Size()
 		}
 		if err := x.ExtractFile(file); err != nil {
-			return ui.Errorf("Couldn't apply the update", err.Error(), "Free up some space, then run andronix update again.")
+			return ui.Errorf("couldn_t_apply_the_update", "Couldn't apply the update", err.Error(), "Free up some space, then run andronix update again.")
 		}
 		x.Finish()
 		for _, w := range x.Warnings {
@@ -633,7 +638,7 @@ func moddedUpdate(ctx context.Context, in *Inst, o UpdateOpts, r ui.Reporter, lg
 			os.Remove(file)
 		}
 	}
-	r.Detail(cur + " → " + m.Latest)
+	ui.DetailOf(r, "update.version", cur+" → "+m.Latest, map[string]any{"from": cur, "to": m.Latest})
 	return nil
 }
 
@@ -671,7 +676,7 @@ func betaResolve(ctx context.Context, token string) (*Resolved, error) {
 	get := "Copy the command again from the Andronix app (Premium, Early access): andronix update --channel beta --token '<token>'"
 	q, err := url.ParseQuery(strings.TrimPrefix(strings.TrimSpace(token), "?"))
 	if err != nil || token == "" {
-		return nil, ui.Errorf("Beta needs a token", "The beta channel is for Andronix Premium; the app gives you the command with its token.", get)
+		return nil, ui.Errorf("beta_needs_a_token", "Beta needs a token", "The beta channel is for Andronix Premium; the app gives you the command with its token.", get)
 	}
 	q.Del("f")
 	q.Set("channel", "beta")

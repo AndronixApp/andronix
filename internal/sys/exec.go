@@ -46,7 +46,10 @@ func LookPath(file string) (string, error) {
 
 func executable(p string) bool {
 	fi, err := os.Stat(p)
-	return err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	return fi.Mode().Perm()&0o111 != 0 || linkerRuns(p)
 }
 
 // Command is exec.Command with the lookup above.

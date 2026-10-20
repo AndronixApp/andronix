@@ -10,8 +10,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -38,6 +42,12 @@ type Target struct {
 	// Local runs commands directly, for andronix running inside the
 	// distro (Rootfs is then "/").
 	Local bool
+	// ExtraEnv sets variables for this session only (secrets for
+	// setup-user go here, never on a command line).
+	ExtraEnv map[string]string
+	// XDGDefault is the desktop session's own default XDG_CONFIG_DIRS
+	// (DE_XDG_CONFIG_DIRS; "" means /etc/xdg), after the standalone layers.
+	XDGDefault string
 }
 
 var (
@@ -45,10 +55,37 @@ var (
 	helpText string
 )
 
+// PulseServer is where the distro's apps play sound: Termux's PulseAudio
+// over TCP, or in the standalone app the distro's own (andronix sound).
+func PulseServer() string {
+	if os.Getenv("ANDRONIX_HOST") == "standalone" {
+		return "unix:/tmp/.andronix-pulse/native"
+	}
+	return "127.0.0.1"
+}
+
+// Binary is the proot to run: PROOT_BIN (or ANDRONIX_PROOT) in the
+// standalone app, where it's libproot.so in nativeLibraryDir; else proot
+// from PATH (Termux's).
+func Binary() string {
+	for _, k := range []string{"PROOT_BIN", "ANDRONIX_PROOT"} {
+		if p := os.Getenv(k); p != "" {
+			return p
+		}
+	}
+	return "proot"
+}
+
+// Available reports whether there's a proot to run.
+func Available() bool {
+	_, err := sys.LookPath(Binary())
+	return err == nil
+}
+
 // Has reports whether this proot supports flag.
 func Has(flag string) bool {
 	helpOnce.Do(func() {
-		c := sys.Command("proot", "--help")
+		c := sys.Command(Binary(), "--help")
 		c.Env = hostEnv()
 		out, _ := c.CombinedOutput()
 		helpText = string(out)
@@ -63,6 +100,10 @@ func Has(flag string) bool {
 	}
 	return strings.Contains(helpText, flag)
 }
+
+// alwaysStandIn are the /proc stand-ins used on Android without probing
+// the real file first.
+var alwaysStandIn = map[string]bool{"max_user_watches": true, "overflowuid": true, "overflowgid": true, "filesystems": true}
 
 func readable(p string) bool {
 	f, err := os.Open(p)
@@ -108,7 +149,7 @@ func Version() string {
 
 // Args returns proot's argument list (without the command to run).
 func (t *Target) Args() []string {
-	a := []string{"proot"}
+	a := []string{Binary()}
 	optional := []string{"--kill-on-exit", "--link2symlink", "--sysvipc", "-L"}
 	if Minimal {
 		optional = []string{"--link2symlink"}
@@ -146,8 +187,13 @@ func (t *Target) Args() []string {
 		{"/proc/sys/kernel/cap_last_cap", "cap_last_cap"},
 		{"/proc/sys/fs/inotify/max_user_watches", "max_user_watches"},
 		{"/proc/sys/kernel/overflowuid", "overflowuid"}, {"/proc/sys/kernel/overflowgid", "overflowgid"},
+		{"/proc/filesystems", "filesystems"},
 	} {
-		if !readable(e[0]) && exists(filepath.Join(sd, e[1])) {
+		// These Android 11+ denies to apps outright; even looking (the
+		// readable probe) logs an SELinux AVC, so on Android the stand-in
+		// is used without asking.
+		always := runtime.GOOS == "android" && alwaysStandIn[e[1]]
+		if (always || !readable(e[0])) && exists(filepath.Join(sd, e[1])) {
 			a = append(a, "-b", filepath.Join(sd, e[1])+":"+e[0])
 		}
 	}
@@ -155,11 +201,25 @@ func (t *Target) Args() []string {
 	if exists(filepath.Join(sd, "memfd_noexec")) {
 		a = append(a, "-b", filepath.Join(sd, "memfd_noexec")+":/proc/sys/vm/memfd_noexec")
 	}
+	// SVE cpuinfo mask (#192): on Qualcomm chips whose cores LLVM thinks have
+	// SVE but that ship with SVE off, Mesa's llvmpipe JIT SIGILLs on the first
+	// GL draw. When present (written only for such phones, see
+	// rootfs.writeCpuinfoStandIn), bind the corrected cpuinfo over the real
+	// one. Gated on existence, not readability: /proc/cpuinfo is readable; we
+	// override it deliberately, and this bind (after -b /proc) shadows it.
+	if exists(filepath.Join(sd, "cpuinfo")) {
+		a = append(a, "-b", filepath.Join(sd, "cpuinfo")+":/proc/cpuinfo")
+	}
 	if exists("/sys/fs/selinux") && exists(filepath.Join(sd, "empty")) {
 		a = append(a, "-b", filepath.Join(sd, "empty")+":/sys/fs/selinux")
 	}
-	// Shared storage at /sdcard (after termux-setup-storage).
-	if readable("/storage/emulated/0") || dirReadable("/storage/emulated/0") {
+	// Shared storage at /sdcard (after termux-setup-storage). Not in the
+	// standalone app: there the app passes the folders it may share
+	// (ANDRONIX_BINDS, below), and a half-readable /sdcard only confuses.
+	standalone := os.Getenv("ANDRONIX_HOST") == "standalone"
+	if standalone {
+		// nothing
+	} else if readable("/storage/emulated/0") || dirReadable("/storage/emulated/0") {
 		a = append(a, "-b", "/storage/emulated/0:/sdcard")
 		if dirReadable("/storage") {
 			a = append(a, "-b", "/storage")
@@ -175,9 +235,97 @@ func (t *Target) Args() []string {
 	}
 	a = append(a, legacyBinds(t.BindsDir)...)
 	for _, b := range strings.Fields(os.Getenv("ANDRONIX_BINDS")) {
-		a = append(a, "-b", b)
+		if arg, ok := t.bindArg(b, standalone); ok {
+			a = append(a, "-b", arg)
+		}
 	}
 	return a
+}
+
+// sharedStorage matches the phone folders the standalone app may share
+// into a distro: Andronix's own folders in Download and Documents, for any
+// Android user (/storage/emulated/<N>).
+var sharedStorage = regexp.MustCompile(`^/storage/emulated/[0-9]+/(Download/Andronix|Documents/Andronix)(/.*)?$`)
+
+// bindArg turns an ANDRONIX_BINDS entry "<src>:<dst>[:ro]" into proot's
+// "-b src:dst". In the standalone app a leading ~ in dst is the session
+// user's home, a shared phone folder gets its mount point made (owned by
+// that user) and ~/Android/README.txt, and only shared folders or the
+// app's own files are allowed. ":ro" is a label: proot can't make a bind
+// read-only, Android's permissions do. Termux passes entries unchanged.
+func (t *Target) bindArg(entry string, standalone bool) (string, bool) {
+	if !standalone {
+		return entry, true
+	}
+	parts := strings.Split(entry, ":")
+	if len(parts) == 3 && parts[2] == "ro" {
+		parts = parts[:2]
+	}
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		termux.Logf("binds: %q isn't <src>:<dst>[:ro]; skipped", entry)
+		return "", false
+	}
+	src, dst := filepath.Clean(parts[0]), parts[1]
+	home := t.Home
+	if home == "" {
+		home = "/root"
+	}
+	if dst == "~" || strings.HasPrefix(dst, "~/") {
+		dst = home + strings.TrimPrefix(dst, "~")
+	}
+	dst = path.Clean(dst)
+	appHome := os.Getenv("ANDRONIX_HOME")
+	if appHome == "" {
+		appHome = filepath.Join(sys.Home(), ".andronix")
+	}
+	appOwn := strings.HasPrefix(src+"/", filepath.Clean(appHome)+"/")
+	shared := sharedStorage.MatchString(src)
+	// A Unix socket (the app's GPU server) shares no files.
+	sock := false
+	if st, err := os.Stat(src); err == nil && st.Mode()&os.ModeSocket != 0 {
+		sock = true
+	}
+	if !appOwn && !shared && !sock {
+		termux.Logf("binds: %s isn't a folder the app may share; skipped", src)
+		return "", false
+	}
+	if shared && t.Rootfs != "" && strings.HasPrefix(dst, "/") {
+		t.makeMountPoint(dst, home)
+	}
+	return src + ":" + dst, true
+}
+
+// makeMountPoint creates dst in the rootfs (and the README in
+// ~/Android), owned by the session user, so the shared folder shows up as
+// a real folder in their home.
+func (t *Target) makeMountPoint(dst, home string) {
+	uid, _ := strconv.Atoi(t.UID)
+	gid, _ := strconv.Atoi(t.GID)
+	chown := func(p string) {
+		if t.User != "" {
+			os.Lchown(p, uid, gid)
+		}
+	}
+	// Each missing folder from the home down gets the user as owner.
+	rel := strings.TrimPrefix(dst, "/")
+	cur := t.Rootfs
+	for _, c := range strings.Split(rel, "/") {
+		cur = filepath.Join(cur, c)
+		if _, err := os.Stat(cur); err != nil {
+			if os.Mkdir(cur, 0o755) == nil {
+				chown(cur)
+			}
+		}
+	}
+	if path.Dir(dst) == path.Join(home, "Android") {
+		readme := filepath.Join(t.Rootfs, home, "Android", "README.txt")
+		if _, err := os.Stat(readme); err != nil {
+			os.WriteFile(readme, []byte("These folders are on your phone:\n"+
+				"  Download and Documents are the Andronix folders in the phone's Download and Documents.\n"+
+				"  Files you put here show up in both places.\n"), 0o644)
+			chown(readme)
+		}
+	}
 }
 
 func dirReadable(p string) bool {
@@ -228,7 +376,7 @@ func (t *Target) Env() []string {
 	env := []string{"/usr/bin/env", "-i",
 		"HOME=" + home, "USER=" + user, "LOGNAME=" + user, "SHELL=" + shell, "TERM=" + term, "LANG=" + lang,
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/games:/usr/games",
-		"PULSE_SERVER=127.0.0.1", "TMPDIR=/tmp", "ANDRONIX_DISTRO=" + t.ID}
+		"PULSE_SERVER=" + PulseServer(), "TMPDIR=/tmp", "ANDRONIX_DISTRO=" + t.ID}
 	if t.Display != "" {
 		env = append(env, "DISPLAY="+t.Display)
 	}
@@ -240,12 +388,60 @@ func (t *Target) Env() []string {
 	if os.Getenv("ANDRONIX_DRI3") != "1" {
 		env = append(env, "LIBGL_DRI3_DISABLE=1")
 	}
-	for _, k := range []string{"COLORTERM", "NO_COLOR", "COLUMNS", "ANDRONIX_ASCII", "ANDRONIX_PLAIN"} {
+	for _, k := range []string{"COLORTERM", "NO_COLOR", "COLUMNS", "ANDRONIX_ASCII", "ANDRONIX_PLAIN", "ANDRONIX_HOST", "ANDRONIX_TRACE", "ANDRONIX_FOLD_FIX", "ANDRONIX_BLOCKED_DESKTOPS"} {
 		if v := os.Getenv(k); v != "" {
 			env = append(env, k+"="+v)
 		}
 	}
+	if x := t.xdgConfigDirs(); x != "" {
+		env = append(env, "XDG_CONFIG_DIRS="+x)
+	}
+	for _, k := range sortedKeys(t.ExtraEnv) {
+		env = append(env, k+"="+t.ExtraEnv[k])
+	}
 	return env
+}
+
+// xdgConfigDirs is, in the standalone app, the same XDG_CONFIG_DIRS the
+// desktop session gets (xstartup): the standalone layer, then the light
+// profile's, then /etc/xdg. Without it an xfce program started from a
+// shell runs its own xfconfd that sees only /etc/xdg, and its first
+// settings write saves the stock channel (compositing on) into the
+// user's home, where it wins over the layers for every later session.
+// Empty in Termux (unchanged there).
+func (t *Target) xdgConfigDirs() string {
+	if os.Getenv("ANDRONIX_HOST") != "standalone" || t.Rootfs == "" {
+		return ""
+	}
+	isDir := func(rel string) bool {
+		st, err := os.Stat(filepath.Join(t.Rootfs, rel))
+		return err == nil && st.IsDir()
+	}
+	var dirs []string
+	if isDir("etc/xdg/andronix-standalone") {
+		dirs = append(dirs, "/etc/xdg/andronix-standalone")
+	}
+	if b, err := os.ReadFile(filepath.Join(t.Rootfs, "etc/andronix/profile")); err == nil &&
+		strings.TrimSpace(string(b)) == "light" && isDir("etc/xdg/andronix-light") {
+		dirs = append(dirs, "/etc/xdg/andronix-light")
+	}
+	if len(dirs) == 0 {
+		return ""
+	}
+	tail := t.XDGDefault
+	if tail == "" {
+		tail = "/etc/xdg"
+	}
+	return strings.Join(append(dirs, tail), ":")
+}
+
+func sortedKeys(m map[string]string) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
 }
 
 // Session, when set, readies a session's name lookups (the app's DNS
@@ -276,7 +472,7 @@ func (t *Target) Login(shell string, cmd []string) error {
 		argv = append(argv, "-c", `exec "$@"`, "andronix")
 		argv = append(argv, cmd...)
 	}
-	bin, err := sys.LookPath("proot")
+	bin, err := sys.LookPath(Binary())
 	if err != nil {
 		return err
 	}

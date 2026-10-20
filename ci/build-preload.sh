@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the guest preload libraries (fchmodat.c, shm.c, mntid.c, creat.c, ofdlock.c) for every CPU
+# Build the guest preload libraries (fchmodat.c, shm.c, mntid.c, creat.c, ofdlock.c, getcwdshim.c) for every CPU
 # Andronix ships, in a Debian container with cross compilers. Output:
-# guest/preload/<arch>/libandronix-{fchmodat,shm,mntid,ofdlock}.so (and -creat.so on x86) and libnss_andronix.so.2
+# guest/preload/<arch>/libandronix-{fchmodat,shm,mntid,ofdlock,getcwd}.so (and -creat.so on x86) and libnss_andronix.so.2
 #
 #   ci/build-preload.sh
 set -euo pipefail
@@ -29,6 +29,11 @@ docker run --rm -v "$PWD/guest/preload":/w -w /w debian:13 bash -c '
         $cc -shared -fPIC $page -O2 -Wall -Wextra -nostartfiles \
             -Wl,-soname,libandronix-ofdlock.so -o "$a/libandronix-ofdlock.so" ofdlock.c -ldl
         ${t#*:}-strip "$a/libandronix-ofdlock.so"
+        # getcwdshim.c (#229): proot answers getcwd with ENOSYS on some
+        # ROMs; readlink /proc/self/cwd fallback. -ldl for dlsym.
+        $cc -shared -fPIC $page -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64 -nostartfiles \
+            -Wl,-soname,libandronix-getcwd.so -o "$a/libandronix-getcwd.so" getcwdshim.c -ldl
+        ${t#*:}-strip "$a/libandronix-getcwd.so"
         # creat.c (#326): x86 only, the CPUs with a creat syscall; plain open(),
         # no _FILE_OFFSET_BITS (creat64 is its own symbol).
         case $a in i686|x86_64)

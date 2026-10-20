@@ -1,0 +1,37 @@
+{
+ "source": "support #229 / AX-N73QZG (Blackview SHARK 8, Android 13, kernel 5.10.177 rockchip, Play Termux googleplay.2026.02.11, app 10.0.8): the probe as reported, plus getcwd ENOSYS, which probe version 5 measures (the report's probe was version 1 and did not). proot answers getcwd with ENOSYS so sh/apt/dpkg die with 'getcwd() failed: Function not implemented'. Synthetic until a probe-5 recording from such a device arrives.",
+ "distro": "debian",
+ "family": "apt",
+ "de": "xfce",
+ "probe": {
+  "probe_version": 5,
+  "time": "2026-10-16T06:43:39Z",
+  "kernel": "5.10.177-android13-3-33470412",
+  "sdk": 33,
+  "rom": "other",
+  "phantom": "on",
+  "ram_mb": 7771,
+  "free_mb": 14917,
+  "termux": "google_play_store",
+  "termux_version": "googleplay.2026.02.11",
+  "syscalls": {
+   "clone3": "ENOSYS",
+   "close_range": "ok",
+   "creat": "ok",
+   "faccessat2": "ENOSYS",
+   "fchmodat2": "ENOSYS",
+   "getcwd": "ENOSYS",
+   "memfd_create": "ok",
+   "name_to_handle_at": "ENOSYS",
+   "open_tree": "ENOSYS",
+   "openat2": "ok",
+   "seccomp": "ok",
+   "statx": "ok",
+   "statx_mnt_id": "ok"
+  }
+ },
+ "expect": [
+  "getcwd-shim",
+  "phantom-process"
+ ]
+}

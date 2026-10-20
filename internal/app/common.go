@@ -15,6 +15,7 @@ import (
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
 	"github.com/AndronixApp/andronix-distros/internal/proot"
+	"github.com/AndronixApp/andronix-distros/internal/rootfs"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
@@ -131,6 +132,12 @@ func (in *Inst) Target(asRoot bool) *proot.Target {
 			}
 		}
 	}
+	if de, err := conf.ResolveDesktop(in.Get("DE")); err == nil && !de.None() {
+		t.XDGDefault = de.XDGConfigDirs // LXQt's /usr/share (xdgConfigDirs)
+	}
+	writeHostKind(in.Rootfs)    // for andronix inside, after sudo (guest.go)
+	applyDisplayGPU(t, in.D.ID) // while a GPU display runs (displaygpu.go)
+	rootfs.EnsureSysdata(filepath.Join(in.Dir, "sysdata"))
 	return t
 }
 
@@ -181,6 +188,9 @@ func NewLog(name string) *Logger {
 	lg := log.NewWithOptions(f, log.Options{ReportTimestamp: true, TimeFormat: time.TimeOnly})
 	rotateLogs(p.Logs, 10, path)
 	currentLog = path
+	if ui.JSON {
+		ui.SetEventLog(func(ev string) { lg.Print("progress: " + ev) })
+	}
 	sys.DNSLog = func(format string, args ...any) { lg.Printf(format, args...) } // which resolver answered (#141)
 	return &Logger{Logger: lg, Path: path, f: f}
 }
@@ -265,7 +275,7 @@ func RemoveLaunchers(d *conf.Distro) {
 // resolveDistro turns a user-given name into a distro, or explains.
 func resolveDistro(name, cmd string) (*conf.Distro, error) {
 	if name == "" {
-		return nil, ui.Errorf("Which distro?", "Add the distro's name to the command.",
+		return nil, ui.Errorf("which_distro", "Which distro?", "Add the distro's name to the command.",
 			"Run 'andronix list' to see them, e.g. andronix "+cmd+" debian")
 	}
 	d, err := conf.ResolveDistro(name)
@@ -282,13 +292,13 @@ func resolveDistro(name, cmd string) (*conf.Distro, error) {
 		if g, guess, gerr := conf.ForgiveDistro(name); gerr == nil && guess {
 			switch cmd {
 			case "install", "start", "desktop", "login", "run":
-				ui.Note("'" + name + "' isn't a distro name; using " + g.Label() + ".")
+				ui.NoteKey("corrected_distro", "'"+name+"' isn't a distro name; using "+g.Label()+".")
 				return g, nil
 			}
-			return nil, ui.Errorf("Unknown distro '"+name+"'", "Andronix doesn't have a distro called '"+name+"'.",
+			return nil, ui.Errorf("unknown_distro", "Unknown distro '"+name+"'", "Andronix doesn't have a distro called '"+name+"'.",
 				"Did you mean "+g.ID+"? andronix "+cmd+" "+g.ID)
 		}
-		return nil, ui.Errorf("Unknown distro '"+name+"'", "Andronix doesn't have a distro called '"+name+"' yet.",
+		return nil, ui.Errorf("unknown_distro", "Unknown distro '"+name+"'", "Andronix doesn't have a distro called '"+name+"' yet.",
 			"Run 'andronix list' to see the ones you can install.")
 	}
 	return d, nil

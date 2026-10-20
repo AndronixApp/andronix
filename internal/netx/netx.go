@@ -83,13 +83,14 @@ func Head(ctx context.Context, url string) (int, int64, error) {
 	return resp.StatusCode, resp.ContentLength, nil
 }
 
-// Download fetches url into dst, resuming a partial file, with up to 5
-// attempts. progress gets (bytes so far, total). Returns the sha256 of
-// the finished file.
+// Download fetches url into dst, resuming a partial file, with up to 8
+// attempts (#286: flaky mobile links stalled through the old 5). progress
+// gets (bytes so far, total). Returns the sha256 of the finished file.
 func Download(ctx context.Context, url, dst string, headers map[string]string, total int64, progress func(cur, total int64)) (string, error) {
 	var lastErr error
-	for try := 0; try < 5; try++ {
-		err := downloadOnce(ctx, url, dst, headers, total, progress)
+	var validator string // ETag/Last-Modified of the object, for If-Range across resumes
+	for try := 0; try < 8; try++ {
+		err := downloadOnce(ctx, url, dst, headers, total, progress, &validator)
 		if err == nil {
 			return FileSHA256(dst)
 		}
@@ -104,7 +105,7 @@ func Download(ctx context.Context, url, dst string, headers map[string]string, t
 	return "", lastErr
 }
 
-func downloadOnce(ctx context.Context, url, dst string, headers map[string]string, total int64, progress func(cur, total int64)) error {
+func downloadOnce(ctx context.Context, url, dst string, headers map[string]string, total int64, progress func(cur, total int64), validator *string) error {
 	var have int64
 	if st, err := os.Stat(dst); err == nil {
 		have = st.Size()
@@ -123,12 +124,25 @@ func downloadOnce(ctx context.Context, url, dst string, headers map[string]strin
 	}
 	if have > 0 {
 		req.Header.Set("Range", "bytes="+strconv.FormatInt(have, 10)+"-")
+		// If-Range ties the resume to the object the partial came from: a
+		// changed object answers 200 (restart, truncating below) instead of
+		// appending the new object's bytes onto the old partial (#243).
+		if validator != nil && *validator != "" {
+			req.Header.Set("If-Range", *validator)
+		}
 	}
 	resp, err := Client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if validator != nil && *validator == "" {
+		if et := resp.Header.Get("ETag"); et != "" {
+			*validator = et
+		} else if lm := resp.Header.Get("Last-Modified"); lm != "" {
+			*validator = lm
+		}
+	}
 	flags := os.O_CREATE | os.O_WRONLY
 	switch resp.StatusCode {
 	case 206:

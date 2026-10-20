@@ -63,6 +63,10 @@ func distroBusy(d *conf.Distro, holder string) error {
 	if _, err := strconv.Atoi(pid); err == nil {
 		what = "Another andronix (process " + pid + ") is working on " + d.Label() + " right now, and two at once would get in each other's way."
 	}
+	if InApp() {
+		return &ui.UserError{Title: d.Label() + " is being " + doing + " in the Andronix app already", Class: "install_running",
+			What: "Two at once would get in each other's way.", Fix: "Wait for it to finish, then try again."}
+	}
 	return &ui.UserError{Title: d.Label() + " is being " + doing + " in another Termux session", Class: "install_running",
 		What: what, Fix: "Wait for it to finish, or close it, then run the same command again."}
 }

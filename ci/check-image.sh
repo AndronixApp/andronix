@@ -38,12 +38,15 @@ if [ -d "$target" ]; then
         chmod "$m" "$f" 2>/dev/null
     }
 else
-    case "$target" in *.xz) z=J ;; *.gz) z=z ;; *.zst) z=--zstd ;; *) z= ;; esac
-    tar -t"${z#--}"vf "$target" 2>/dev/null | awk '{ t = substr($1, 1, 1); if (t == "-") t = "f"; n = $6; for (i = 7; i <= NF; i++) n = n " " $i; sub(/^\.\//, "", n); print t, $3, n }' >"$tmp/list"
+    case "$target" in *.xz) z=J ;; *.gz) z=z ;; *) z= ;; esac
+    # zstd through a pipe: neither GNU tar's nor bsdtar's short flags take it.
+    unz() { case "$target" in *.zst) zstd -dcq "$target" ;; *) cat "$target" ;; esac; }
+    case "$target" in *.zst) z= ;; esac
+    unz | tar -t"$z"vf - 2>/dev/null | awk '{ t = substr($1, 1, 1); if (t == "-") t = "f"; n = $6; for (i = 7; i <= NF; i++) n = n " " $i; sub(/^\.\//, "", n); print t, $3, n }' >"$tmp/list"
     mkdir -p "$tmp/x"
     # Straight to stdout: an extracted copy keeps the member's mode, and
     # Fedora ships /etc/shadow as 0000 (unreadable to a non-root checker).
-    get() { tar -x"${z#--}"Of "$target" "./$1" 2>/dev/null || tar -x"${z#--}"Of "$target" "$1" 2>/dev/null; }
+    get() { unz | tar -x"$z"Of - "./$1" 2>/dev/null || unz | tar -x"$z"Of - "$1" 2>/dev/null; }
 fi
 [ -s "$tmp/list" ] || { echo "can't read $target"; exit 2; }
 names() { awk '{ $1 = ""; $2 = ""; sub(/^  /, ""); print }' "$tmp/list"; }
@@ -120,5 +123,16 @@ homes=$(names | grep -E '^home/[^/]+/?$' | sed 's#/$##' | tr '\n' ' ')
 [ -z "$users$homes" ] && ok "no human users or home directories" || bad "users/homes present: ${users}${homes}"
 
 echo
+# 9. Ready-made desktop images (IMAGE=1, ci/build-image.sh): packages
+# only, nothing per phone or of ours (ci/scrub-image.sh).
+if [ -n "${IMAGE:-}" ]; then
+    hits=$(names | grep -xE 'etc/andronix(/.*)?|etc/andronix-release|etc/profile\.d/andronix\.sh|usr/local/bin/(andronix|bwrap|vncserver-start|vncserver-stop)|usr/local/lib/andronix(/.*)?|etc/apt/apt\.conf\.d/90andronix|etc/resolv\.conf|etc/hosts|etc/hostname|etc/ssh/ssh_host_.*|var/lib/systemd/random-seed|var/lib/urandom/random-seed|var/lib/random-seed|var/lib/apt/lists/.+|var/cache/apt/archives/.+\.deb' | head -5)
+    [ -z "$hits" ] && ok "image: nothing of ours or per phone" || bad "image has per-phone or Andronix files: $hits"
+    mid=$(get etc/machine-id)
+    [ -z "$mid" ] && ok "image: machine-id empty" || bad "image: /etc/machine-id isn't empty"
+    hits=$(names | grep -xE 'var/log/.+' | while read -r f; do s=$(awk -v f="$f" '$3 == f && $1 == "f" { print $2 }' "$tmp/list"); [ "${s:-0}" != 0 ] && echo "$f"; done | head -3)
+    [ -z "$hits" ] && ok "image: logs empty" || bad "image: logs not empty: $hits"
+fi
+
 [ "$fail" = 0 ] && echo "PASS: image is clean" || echo "FAIL: fix the items above before publishing"
 exit "$fail"

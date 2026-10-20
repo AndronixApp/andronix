@@ -120,7 +120,7 @@ func TestErrorClass(t *testing.T) {
 		ui.ErrCancelled:  "cancelled",
 		context.Canceled: "cancelled",
 		&ui.UserError{Title: "x", Class: "download"}: "download",
-		ui.Errorf("Not enough space", "", ""):        "not_enough_space",
+		&ui.UserError{Title: "Not enough space"}:     "not_enough_space",
 		errors.New("boom"):                           "other",
 	} {
 		if got := ErrorClass(err); got != want {
@@ -153,5 +153,41 @@ func TestHostAndTermuxPackage(t *testing.T) {
 	t.Setenv("TERMUX_APP__PACKAGE_NAME", "com.termux.zerotermux")
 	if got := termuxPackage(); got != "com.termux.zerotermux" {
 		t.Errorf("pkg %q", got)
+	}
+}
+
+// products-api takes display (display|vnc) and sound (a JSON boolean, not
+// a string) on start events only.
+func TestDisplayStartProps(t *testing.T) {
+	Init(t.TempDir(), "2.0.0") // its state file goes there, not into the package
+	b, err := json.Marshal(build("start", map[string]any{"display": "vnc", "sound": true, "ok": true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"display":"vnc"`, `"sound":true`, `"ok":true`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("%s lacks %s", b, want)
+		}
+	}
+}
+
+// Play Termux's applib link and a run without Termux's environment go with
+// every Termux event (support #358); F-Droid's Termux has no applib.
+func TestAppLibAndTermuxEnv(t *testing.T) {
+	for _, k := range []string{"TERMUX_APP__APK_RELEASE", "TERMUX_APK_RELEASE", "TERMUX_VERSION", "TERMUX_APP__APP_VERSION_NAME", "ANDRONIX_HOST", "ANDRONIX_DISTRO"} {
+		t.Setenv(k, "")
+	}
+	files := filepath.Join(t.TempDir(), "data", "com.termux", "files")
+	os.MkdirAll(filepath.Join(files, "usr"), 0o755)
+	t.Setenv("PREFIX", filepath.Join(files, "usr"))
+	p := build("install_result", nil).Props
+	if _, ok := p["applib"]; ok || p["termux_env"] != "missing" || p["termux_flavor"] != "unknown" {
+		t.Errorf("no applib, no environment: %v", p)
+	}
+	os.MkdirAll(filepath.Join(files, "applib"), 0o755)
+	t.Setenv("TERMUX_VERSION", "googleplay.2026.10.09")
+	p = build("install_result", nil).Props
+	if p["applib"] != "dir" || p["termux_env"] != nil || p["termux_flavor"] != "google_play_store" {
+		t.Errorf("Play, applib a folder: %v", p)
 	}
 }

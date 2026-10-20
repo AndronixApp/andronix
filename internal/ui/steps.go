@@ -30,6 +30,9 @@ type Reporter interface {
 
 // Step is one line in the step list.
 type Step struct {
+	// Key names the step in --progress json (stable, for translations);
+	// empty means a slug of Label.
+	Key   string
 	Label string
 	Run   func(ctx context.Context, r Reporter) error
 }
@@ -67,6 +70,9 @@ func RunSteps(ctx context.Context, steps []Step, log Logger) error {
 			}
 			return err
 		}
+	}
+	if JSON {
+		return runJSON(ctx, steps, log)
 	}
 	if Plain {
 		return runPlain(ctx, steps, log)

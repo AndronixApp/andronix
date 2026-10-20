@@ -1,14 +1,19 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +36,11 @@ type InstallOpts struct {
 	Distro, Desktop    string
 	NoBrowser, NoStart bool
 	Reinstall, NoUser  bool
+	// User sets up this user at the end, without questions (the
+	// standalone app): its password and the optional VNC password, time
+	// zone and keyboard come from ANDRONIX_USER_PASSWORD,
+	// ANDRONIX_VNC_PASSWORD, ANDRONIX_TZ and ANDRONIX_KEYBOARD.
+	User string
 	// Modded installs a paid Modded edition: Token (from the app) signs a
 	// products-api download of the edition's tarball.
 	Modded bool
@@ -38,7 +48,12 @@ type InstallOpts struct {
 	// Edition is a Modded edition id (editions.conf), e.g. legacy-debian.
 	// It implies Modded and picks the distro and desktop.
 	Edition string
-	report  *installReport
+	// ImageBuild (ci/build-image.sh, on a Linux build host): run the
+	// phone's package steps, add what the app installs lazily (Xvfb,
+	// PulseAudio), and stop. The rootfs is then cleaned and exported as a
+	// ready-made image (image.go). Not in help; refused on Android.
+	ImageBuild bool
+	report     *installReport
 }
 
 // DefaultMirror is the public URL of the Andronix R2 bucket (decided:
@@ -64,6 +79,8 @@ type source struct {
 	size  int64
 	sha   string
 	image *oci.Image
+	// unpacked is a ready-made image's unpacked size (its .meta), 0 if unknown.
+	unpacked int64
 	// sumURL is where a Modded download's sha256 comes from (the same
 	// token check, <file>.sha256).
 	sumURL string
@@ -73,7 +90,7 @@ type source struct {
 // Install is `andronix install`. It tells the Andronix app how the
 // install went when the app asked (see report.go).
 func Install(ctx context.Context, o InstallOpts) error {
-	o.report = &installReport{distro: o.Distro, de: o.Desktop, modded: o.Modded || o.Edition != "", started: time.Now()}
+	o.report = newInstallReport(o.Distro, o.Desktop, o.Modded || o.Edition != "")
 	telemetry.Notice()
 	err := install(ctx, o)
 	if err != nil {
@@ -90,7 +107,7 @@ func install(ctx context.Context, o InstallOpts) error {
 	if o.Edition != "" {
 		var err error
 		if ed, err = conf.ResolveEdition(o.Edition); err != nil {
-			return ui.Errorf("Unknown edition '"+o.Edition+"'", "Andronix has no Modded edition called '"+o.Edition+"'.",
+			return ui.Errorf("unknown_edition", "Unknown edition '"+o.Edition+"'", "Andronix has no Modded edition called '"+o.Edition+"'.",
 				"Copy the install command from the Andronix app again. Editions: "+strings.Join(conf.EditionIDs(), ", "))
 		}
 		o.Modded = true
@@ -101,7 +118,7 @@ func install(ctx context.Context, o InstallOpts) error {
 			if *f.got == "" {
 				*f.got = f.want
 			} else if n := resolvedID(f.what, *f.got); n != f.want {
-				return ui.Errorf("That edition doesn't match", "The "+ed.ID+" edition is "+ed.Distro+" with "+ed.Desktop+", not "+*f.got+".",
+				return ui.Errorf("that_edition_doesn_t_match", "That edition doesn't match", "The "+ed.ID+" edition is "+ed.Distro+" with "+ed.Desktop+", not "+*f.got+".",
 					"Copy the install command from the Andronix app again.")
 			}
 		}
@@ -137,7 +154,7 @@ func install(ctx context.Context, o InstallOpts) error {
 			de, _ = conf.ResolveDesktop("xfce")
 			notice = o.Desktop + " isn't offered any more. Installing XFCE instead."
 		}
-		ui.Warn(notice)
+		ui.WarnKey("corrected_desktop", notice)
 		o.Desktop = de.ID
 	}
 	if o.Desktop == "" {
@@ -181,6 +198,16 @@ func install(ctx context.Context, o InstallOpts) error {
 	arch := sys.DetectArch()
 	in := Open(d)
 	deLabel := de.Name
+	if o.ImageBuild {
+		if sys.OnAndroid() {
+			return ui.Errorf("not_on_a_phone", "Not on a phone", "--image-build makes ready-made images on a Linux build host.", "Run it in ci/build-image.sh.")
+		}
+		if de.None() {
+			return ui.Errorf("no_desktop", "No desktop", "An image is for a desktop install.", "Pass --de xfce (or another desktop).")
+		}
+		// The browser is installed on the phone, never baked in (owner, 2026-10-05).
+		o.NoBrowser, o.NoUser, o.NoStart = true, true, true
+	}
 
 	fmt.Print(ui.Banner("Linux on Android " + ui.GSep + " " + VersionLabel()))
 
@@ -213,6 +240,8 @@ func install(ctx context.Context, o InstallOpts) error {
 		}
 		if !replace {
 			rep.outcome = "already_installed"
+			ui.SetDone("outcome", "already_installed")
+			ui.SetDone("distro", d.ID)
 			fmt.Print(ui.Box(ui.BoxOK, d.Label()+" is already installed",
 				ui.KV("Installed", name(have)), ui.KV("Start", "./"+d.MainStart()), "",
 				"To replace it with "+name(edition)+", run the same command with --reinstall. That deletes everything inside it; back it up first: andronix backup "+d.ID))
@@ -223,6 +252,8 @@ func install(ctx context.Context, o InstallOpts) error {
 	}
 	if in.Installed() && !o.Reinstall && (in.Get("DE") == de.ID || de.None()) {
 		rep.outcome = "already_installed"
+		ui.SetDone("outcome", "already_installed")
+		ui.SetDone("distro", d.ID)
 		WriteLaunchers(d)             // refresh in case andronix moved
 		rootfs.InstallSelf(in.Rootfs) // and keep the in-distro helper current
 		if cur, err := conf.ResolveDesktop(in.Get("DE")); err == nil && !cur.None() {
@@ -251,8 +282,17 @@ func install(ctx context.Context, o InstallOpts) error {
 				return err
 			}
 			if err := rootfs.Remove(in.Dir); err != nil {
-				return ui.Errorf("Couldn't delete the old files", err.Error(), "Exit every session of "+d.Name+", then try again.")
+				return ui.Errorf("couldn_t_delete_the_old_files", "Couldn't delete the old files", err.Error(), "Exit every session of "+d.Name+", then try again.")
 			}
+		}
+	}
+	// 'Command line only' over an unfinished desktop install (owner, #177):
+	// resuming would keep its desktop, so start over from the base system.
+	restarted := ""
+	if de.None() && edition == "" && !o.Reinstall && desktopLeft(in) {
+		restarted = fmt.Sprintf("PREBUILT=%q DE=%q STAGE=%q", in.Get("PREBUILT"), in.Get("DE"), in.Get("STAGE"))
+		if err := rootfs.Remove(in.Dir); err != nil {
+			return ui.Errorf("couldn_t_delete_the_old_files", "Couldn't delete the old files", err.Error(), "Exit every session of "+d.Name+", then try again.")
 		}
 	}
 	haveRootfs := false
@@ -266,14 +306,22 @@ func install(ctx context.Context, o InstallOpts) error {
 	fmt.Print(ui.Box(ui.BoxBrand, d.Label()+" "+ui.GSep+" "+deLabel,
 		ui.KV("CPU", arch.Label()), ui.KV("Desktop", deLabel), ui.KV("Location", ui.Tilde(in.Dir))))
 	fmt.Println()
-	ui.Note("Keep Termux open while this runs; it takes 5 to 30 minutes on a phone. Android may ask whether Termux can run in the background: tap Allow, so the install isn't stopped.")
+	if sys.Standalone() {
+		ui.NoteKey("install_time", "This takes 5 to 30 minutes on a phone. Andronix keeps working while it runs in the background.")
+	} else {
+		ui.Note("Keep Termux open while this runs; it takes 5 to 30 minutes on a phone. Android may ask whether Termux can run in the background: tap Allow, so the install isn't stopped.")
+	}
 	// This phone's compatibility rules (compat.json): what's known before
 	// the probe (kernel, Android, Termux, a cached probe).
 	cr := newCompat(d, de.ID)
+	rep.cr = cr
 	shown := map[string]bool{}
-	if sys.IsTermux() {
+	if sys.OnAndroid() {
 		cr.warnings(shown)
 		if err := cr.refuse(d); err != nil {
+			return err
+		}
+		if err := appLibCheck(); err != nil {
 			return err
 		}
 	}
@@ -282,6 +330,9 @@ func install(ctx context.Context, o InstallOpts) error {
 	lg := NewLog("install-" + d.ID)
 	defer lg.Close()
 	lg.Printf("andronix %s install %s de=%s arch=%s termux=%v", Version, d.ID, de.ID, arch, sys.IsTermux())
+	if restarted != "" {
+		lg.Printf("command line only over an unfinished desktop install (%s): started over", restarted)
+	}
 	if sys.IsTermux() {
 		sys.Command("termux-wake-lock").Run()
 		defer sys.Command("termux-wake-unlock").Run()
@@ -291,6 +342,9 @@ func install(ctx context.Context, o InstallOpts) error {
 	os.MkdirAll(paths.Cache, 0o755)
 	var src source
 	var lowRAM int64
+	// The image's fallback reason (image.go), "" when one was used or none tried.
+	imgFallback := ""
+	imageUnpacked := false
 	t := in.Target(true)
 	run := func(r ui.Reporter, cmd string) error {
 		return t.Run(ctx, cmd, nil, func(l string) { r.Line(l) })
@@ -301,7 +355,7 @@ func install(ctx context.Context, o InstallOpts) error {
 	// proot comes from Termux's packages: install it here (with pkg's lock
 	// and its recovery for a half-upgraded Termux) rather than asking.
 	if _, err := sys.LookPath("proot"); err != nil && sys.IsTermux() {
-		steps = append(steps, ui.Step{Label: "Installing proot", Run: func(ctx context.Context, r ui.Reporter) error {
+		steps = append(steps, ui.Step{Key: "proot", Label: "Installing proot", Run: func(ctx context.Context, r ui.Reporter) error {
 			if err := termux.Install(ctx, r.Line, "proot"); err != nil {
 				return termuxPkgErr("Couldn't install proot", "pkg upgrade -y && pkg install proot -y", err)
 			}
@@ -309,8 +363,12 @@ func install(ctx context.Context, o InstallOpts) error {
 		}})
 	}
 	steps = append(steps, []ui.Step{
-		{Label: "Checking your phone", Run: func(ctx context.Context, r ui.Reporter) error {
-			if _, err := sys.LookPath("proot"); err != nil {
+		{Key: "phone-check", Label: "Checking your phone", Run: func(ctx context.Context, r ui.Reporter) error {
+			if !proot.Available() {
+				if sys.Standalone() {
+					return &ui.UserError{Title: "proot is missing", Class: "proot_is_missing",
+						What: "The Andronix app didn't pass a usable proot (PROOT_BIN).", Fix: "Update or reinstall the Andronix app."}
+				}
 				if !sys.IsTermux() {
 					return &ui.UserError{Title: "proot is missing", Class: "proot_is_missing",
 						What: "This doesn't look like a normal Termux session ($PREFIX isn't set), so Andronix can't install proot itself.",
@@ -320,12 +378,12 @@ func install(ctx context.Context, o InstallOpts) error {
 					Fix: "Install it, then run the same command again: pkg install proot -y"}
 			}
 			if d.MaxKernel != "" && kernelNewer(sys.KernelRelease(), d.MaxKernel) {
-				return ui.Errorf(d.Label()+" can't run on this phone yet",
+				return ui.Errorf("kernel_too_new", d.Label()+" can't run on this phone yet",
 					d.Name+" needs an Android kernel up to "+d.MaxKernel+"; this phone has "+sys.KernelRelease()+". A fix in proot is in progress.",
 					"Pick another distro for now, e.g. Debian or Alpine.")
 			}
 			if !d.HasArch(string(arch)) {
-				return ui.Errorf(d.Label()+" isn't available here", d.Label()+" has no build for "+arch.Label()+" phones.",
+				return ui.Errorf("no_build_for_your_cpu", d.Label()+" isn't available here", d.Label()+" has no build for "+arch.Label()+" phones.",
 					"Pick another distro in the Andronix app, e.g. Debian.")
 			}
 			need := spaceNeed(d, de, haveRootfs)
@@ -336,8 +394,8 @@ func install(ctx context.Context, o InstallOpts) error {
 				// read, and its free space isn't a phone's (Oct 6: 21
 				// 'not enough space' failures from one x86_64 box).
 				return &ui.UserError{Title: "This doesn't look like an Android phone", Class: "not_android",
-					What: fmt.Sprintf("Andronix runs in Termux on Android phones. Here Android's version can't be read, and the free space reads %d MB (%s with %s needs about %d MB).", free, d.Label(), deLabel, need),
-					Fix:  "Use Termux on an Android phone. On a PC, run the distro there directly."}
+					What: fmt.Sprintf("Andronix runs on Android phones. Here Android's version can't be read, and the free space reads %d MB (%s with %s needs about %d MB).", free, d.Label(), deLabel, need),
+					Fix:  "Use the Andronix app on an Android phone (or, on the command line, Termux on the phone). On a PC, run the distro there directly."}
 			}
 			if free >= 0 && free < need {
 				return &ui.UserError{Title: "Not enough space", Class: "not_enough_space",
@@ -347,12 +405,12 @@ func install(ctx context.Context, o InstallOpts) error {
 			if de.MinRAMMB > 0 {
 				if ram := sys.TotalRAMMB(); ram > 0 && ram < int64(de.MinRAMMB) {
 					lg.Printf("ram=%dMB below %s's %dMB", ram, de.Name, de.MinRAMMB)
-					r.Detail(fmt.Sprintf("%s · only %d MB RAM", arch.Label(), ram))
+					ui.DetailOf(r, "arch.low_ram", fmt.Sprintf("%s · only %d MB RAM", arch.Label(), ram), map[string]any{"arch": string(arch), "ram_mb": ram})
 					lowRAM = ram
 				}
 			}
 			if lowRAM == 0 {
-				r.Detail(arch.Label())
+				ui.DetailOf(r, "arch", arch.Label(), map[string]any{"arch": string(arch)})
 			}
 			os.MkdirAll(in.Dir, 0o755)
 			in.Set("DISTRO", d.ID)
@@ -361,7 +419,7 @@ func install(ctx context.Context, o InstallOpts) error {
 			in.Set("EDITION", edition)
 			return nil
 		}},
-		{Label: "Finding the best download", Run: func(ctx context.Context, r ui.Reporter) error {
+		{Key: "find-download", Label: "Finding the best download", Run: func(ctx context.Context, r ui.Reporter) error {
 			if haveRootfs {
 				return ui.Skip("already downloaded")
 			}
@@ -376,6 +434,17 @@ func install(ctx context.Context, o InstallOpts) error {
 					}
 				}
 			} else {
+				// A ready-made image first (image.go), else the base rootfs.
+				if imageEligible(o, edition, de) {
+					img, reason := findImage(ctx, d, de, arch, lg)
+					if reason == "" {
+						src = img
+						ui.DetailOf(r, "source.image", "ready-made image, "+ui.Bytes(img.size), map[string]any{"bytes": img.size})
+						return nil
+					}
+					imgFallback = reason
+					lg.Printf("image: %s, using the package install", reason)
+				}
 				s, err = pickSource(ctx, d, arch, paths, lg)
 			}
 			if err != nil {
@@ -384,36 +453,77 @@ func install(ctx context.Context, o InstallOpts) error {
 			src = s
 			switch s.kind {
 			case "local":
-				r.Detail("local file")
+				ui.DetailOf(r, "source.local", "local file", nil)
 			case "tarball":
-				r.Detail("Andronix mirror, " + ui.Bytes(s.size))
+				ui.DetailOf(r, "source.mirror", "Andronix mirror, "+ui.Bytes(s.size), map[string]any{"bytes": s.size})
 			case "upstream":
-				r.Detail(d.Name + "'s own download, " + ui.Bytes(s.size))
+				ui.DetailOf(r, "source.upstream", d.Name+"'s own download, "+ui.Bytes(s.size), map[string]any{"distro": d.Name, "distro_id": d.ID, "bytes": s.size})
 			case "modded":
-				r.Detail(editionName(edition))
+				ui.DetailOf(r, "source.edition", editionName(edition), map[string]any{"edition": edition})
 			default:
-				r.Detail("official image, " + ui.Bytes(s.image.Total))
+				ui.DetailOf(r, "source.official", "official image, "+ui.Bytes(s.image.Total), map[string]any{"bytes": s.image.Total})
 			}
 			return nil
 		}},
-		{Label: "Downloading " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
+		{Key: "download", Label: downloadLabel(d, de, edition), Run: func(ctx context.Context, r ui.Reporter) error {
 			if haveRootfs || src.kind == "local" {
 				return ui.Skip("nothing to download")
+			}
+			if src.kind == "image" {
+				// Downloaded straight into the rootfs (no copy on disk), hashed
+				// on the way; on any failure, wipe it and fall back silently.
+				rootfs.Remove(in.Rootfs)
+				os.MkdirAll(in.Rootfs, 0o755)
+				x := &rootfs.Extractor{Root: in.Rootfs}
+				n, reason, err := unpackImage(ctx, src, x, func(c, t int64) { r.Progress(c, t, "bytes") })
+				rep.downloadBytes += n // all bytes fetched, a failed image's included
+				if reason == "" {
+					x.Finish()
+					for _, w := range x.Warnings {
+						lg.Printf("extract: %s", w)
+					}
+					// Checksum fine but no usable system: a bad build. Same silent
+					// fallback as any other image failure (review).
+					if _, serr := os.Lstat(filepath.Join(in.Rootfs, "etc/passwd")); serr != nil {
+						reason, err = fbUnpack, errors.New("the image has no etc/passwd")
+					}
+				}
+				if reason == "" {
+					imageUnpacked = true
+					ui.DetailOf(r, "verify.image", "ready-made image, sha256 checked", nil)
+					return nil
+				}
+				lg.Printf("image: %s: %v; using the package install", reason, err)
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				imgFallback = reason
+				rootfs.Remove(in.Rootfs)
+				base, err := pickSource(ctx, d, arch, paths, lg)
+				if err != nil {
+					return err
+				}
+				src = base
+				r.Label(downloadLabel(d, de, edition))
+				if src.kind == "local" {
+					return nil
+				}
 			}
 			if src.kind == "tarball" || src.kind == "upstream" || src.kind == "modded" {
 				part := src.file + ".part"
 				sum, err := netx.Download(ctx, src.url, part, nil, src.size, func(c, t int64) { r.Progress(c, t, "bytes") })
+				rep.downloadBytes += src.size
 				if err != nil {
 					if e := earlyErr(err, ed); e != nil {
 						return e
 					}
-					return downloadErr(err)
+					return downloadErr(err, src.kind == "modded")
 				}
 				if src.sha != "" && sum != src.sha {
 					os.Remove(part)
-					return ui.Errorf("Download is damaged", "The file's checksum doesn't match, so it was deleted.", "Run the same command again to download it fresh.")
+					return ui.Errorf("download_is_damaged", "Download is damaged", "The file's checksum doesn't match, so it was deleted.", "Run the same command again to download it fresh.")
 				}
-				r.Detail("sha256 checked")
+				ui.DetailOf(r, "verify.sha256", "sha256 checked", nil)
 				return os.Rename(part, src.file)
 			}
 			// Registry layers, each verified against its digest.
@@ -427,24 +537,53 @@ func install(ctx context.Context, o InstallOpts) error {
 					continue
 				}
 				base := done
-				sum, err := netx.Download(ctx, src.image.BlobURL(l), dst+".part", src.image.Headers(), l.Size,
-					func(c, _ int64) { r.Progress(base+c, src.image.Total, "bytes") })
+				blob := func() (string, error) {
+					return netx.Download(ctx, src.image.BlobURL(l), dst+".part", src.image.Headers(), l.Size,
+						func(c, _ int64) { r.Progress(base+c, src.image.Total, "bytes") })
+				}
+				sum, err := blob()
+				var se *netx.StatusError
+				if errors.As(err, &se) && se.Code == 401 {
+					// The registry (docker.io) bearer expired mid-pull, not
+					// the user's token (#243/#658): refresh it and resume the
+					// blob from the .part (netx.Download Ranges).
+					lg.Printf("registry blob %s: 401, refreshing bearer", l.Digest)
+					if rerr := src.image.RefreshToken(ctx); rerr == nil {
+						sum, err = blob()
+					}
+				}
 				if err != nil {
-					return downloadErr(err)
+					// A 401 that survives the refresh is a plain download
+					// failure here, never the user's "token refused".
+					return downloadErr(err, false)
 				}
 				if "sha256:"+sum != l.Digest {
 					os.Remove(dst + ".part")
-					return ui.Errorf("Download is damaged", "A layer's checksum doesn't match, so it was deleted.", "Run the same command again to download it fresh.")
+					return ui.Errorf("download_is_damaged", "Download is damaged", "A layer's checksum doesn't match, so it was deleted.", "Run the same command again to download it fresh.")
 				}
 				os.Rename(dst+".part", dst)
 				done += l.Size
 			}
-			r.Detail("digests checked")
+			ui.DetailOf(r, "verify.digests", "digests checked", nil)
 			return nil
 		}},
-		{Label: "Unpacking files", Run: func(ctx context.Context, r ui.Reporter) error {
+		{Key: "unpack", Label: "Unpacking files", Run: func(ctx context.Context, r ui.Reporter) error {
 			if haveRootfs {
 				return ui.Skip("already unpacked")
+			}
+			if imageUnpacked {
+				// Unpacked while downloading. Without the desktop's session it
+				// isn't the image it claims to be: the package steps fill it in.
+				pb := "image"
+				if !sessionPresent(in, de) {
+					pb, imgFallback = "no", fbNoDesk
+				}
+				in.Set("PREBUILT", pb)
+				if _, err := os.Lstat(filepath.Join(in.Rootfs, "etc/passwd")); err != nil {
+					return ui.Errorf("unpacking_failed", "Unpacking failed", "The download doesn't contain a usable system.", "Run the same command again with --reinstall.")
+				}
+				in.Set("STAGE", "extracted")
+				return ui.Skip("unpacked while downloading")
 			}
 			rootfs.Remove(in.Rootfs)
 			os.MkdirAll(in.Rootfs, 0o755)
@@ -465,7 +604,7 @@ func install(ctx context.Context, o InstallOpts) error {
 			}
 			for _, f := range files {
 				if err := x.ExtractFile(f); err != nil {
-					return ui.Errorf("Unpacking failed", "The files couldn't be unpacked: "+err.Error(), "Free up some space, then run the same command again.")
+					return ui.Errorf("unpacking_failed", "Unpacking failed", "The files couldn't be unpacked: "+err.Error(), "Free up some space, then run the same command again.")
 				}
 			}
 			x.Finish()
@@ -473,7 +612,7 @@ func install(ctx context.Context, o InstallOpts) error {
 				lg.Printf("extract: %s", w)
 			}
 			if _, err := os.Lstat(filepath.Join(in.Rootfs, "etc/passwd")); err != nil {
-				return ui.Errorf("Unpacking failed", "The download doesn't contain a usable system.", "Run the same command again with --reinstall.")
+				return ui.Errorf("unpacking_failed", "Unpacking failed", "The download doesn't contain a usable system.", "Run the same command again with --reinstall.")
 			}
 			if src.kind == "upstream" {
 				// Not cleaned by our CI: strip kernel/firmware packages, default
@@ -495,11 +634,11 @@ func install(ctx context.Context, o InstallOpts) error {
 			in.Set("PREBUILT", pb)
 			return in.Set("STAGE", "extracted")
 		}},
-		{Label: "Setting up " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
+		{Key: "setup", Label: "Setting up " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
 			// Measure this phone inside the rootfs, then apply the fixes
 			// (idempotent: every install and resume runs it).
 			compatFix := func(ctx context.Context) error {
-				if !sys.IsTermux() {
+				if !sys.OnAndroid() {
 					return nil
 				}
 				if err := cr.probe(ctx, t, lg); err != nil {
@@ -526,7 +665,7 @@ func install(ctx context.Context, o InstallOpts) error {
 			}
 			if err := rootfs.Configure(in.Dir, in.Rootfs, rootfs.Info{ID: d.ID, Label: d.Label(), Start: d.MainStart(),
 				Version: Version, Family: d.Family, Edition: edition}); err != nil {
-				return ui.Errorf("Setup failed", "Couldn't write settings into "+d.Label()+": "+err.Error(), "Run the same command again.")
+				return ui.Errorf("setup_failed", "Setup failed", "Couldn't write settings into "+d.Label()+": "+err.Error(), "Run the same command again.")
 			}
 			if fam.Configure != nil {
 				if err := fam.Configure(in.Rootfs); err != nil {
@@ -550,16 +689,22 @@ func install(ctx context.Context, o InstallOpts) error {
 			}
 			return in.Set("STAGE", "configured")
 		}},
-		{Label: "Refreshing package lists", Run: func(ctx context.Context, r ui.Reporter) error {
+		{Key: "refresh", Label: "Refreshing package lists", Run: func(ctx context.Context, r ui.Reporter) error {
 			if err := ops.update(ctx, r); err != nil {
 				return pkgErr(refreshTitle, err)
 			}
-			if err := cr.preScripts(ctx, t, r); err != nil {
-				return err
-			}
-			return preUpgrade(ctx, ops, d, r)
+			return cr.preScripts(ctx, t, r)
 		}},
-		{Label: "Updating " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
+	}...)
+	// Its own step, so a failure there names it (support #147: Ubuntu
+	// 26.04's coreutils switch failed as 'Refreshing package lists').
+	if d.PreUpgrade != "" {
+		steps = append(steps, ui.Step{Key: "prepare", Label: "Preparing " + d.Label() + " for updates", Run: func(ctx context.Context, r ui.Reporter) error {
+			return preUpgrade(ctx, ops, d, r)
+		}})
+	}
+	steps = append(steps, []ui.Step{
+		{Key: "update", Label: "Updating " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
 			if prebuilt(in, de) {
 				return ui.Skip("the image is up to date")
 			}
@@ -572,13 +717,13 @@ func install(ctx context.Context, o InstallOpts) error {
 				return pkgErr("Couldn't update "+d.Name, err)
 			}
 			run(r, fam.Clean) // the upgrade's downloads go before the desktop's come (support #158)
-			r.Detail(fmt.Sprintf("%d packages", n))
+			ui.DetailOf(r, "packages", packages(n), map[string]any{"count": n})
 			return nil
 		}},
-		{Label: installLabel(de), Run: func(ctx context.Context, r ui.Reporter) error {
+		{Key: installKey(de), Label: installLabel(de), Run: func(ctx context.Context, r ui.Reporter) error {
 			// A prebuilt image (a Modded edition, or a rootfs exported with
 			// its desktop) already has everything: skip the package run.
-			if prebuilt(in, de) {
+			if prebuilt(in, de) || imageInstalled(in, de) {
 				return ui.Skip("already in the image")
 			}
 			pkgs := append([]string{}, d.BasePkgs...)
@@ -600,17 +745,28 @@ func install(ctx context.Context, o InstallOpts) error {
 					})
 				}
 			}
-			n := count(ctx, t, fam.SimInstall(pkgs), fam)
-			if err := ops.run(ctx, fam.Install(pkgs), n, r); err != nil {
+			// The app's display and sound (Xvfb, PulseAudio) in the same run, so the
+			// first desktop start doesn't install them (about a minute there).
+			extras := standaloneExtras(d, de, sys.Standalone())
+			n := count(ctx, t, fam.SimInstall(append(pkgs, extras...)), fam)
+			err := ops.run(ctx, fam.Install(append(pkgs, extras...)), n, r)
+			if err != nil && len(extras) > 0 {
+				// The desktop never fails because of them: without them, the first
+				// display start installs them (ensureXvfb, ensurePulse) as before.
+				lg.Printf("install with %s failed (%v); again without them", strings.Join(extras, " "), err)
+				n = count(ctx, t, fam.SimInstall(pkgs), fam)
+				err = ops.run(ctx, fam.Install(pkgs), n, r)
+			}
+			if err != nil {
 				return pkgErr("Couldn't install "+strings.ToLower(installLabel(de)[len("Installing "):]), err)
 			}
 			if n > 0 {
-				r.Detail(fmt.Sprintf("%d packages", n))
+				ui.DetailOf(r, "packages", packages(n), map[string]any{"count": n})
 			}
 			run(r, fam.Clean)
 			return nil
 		}},
-		{Label: "Installing a web browser", Run: func(ctx context.Context, r ui.Reporter) error {
+		{Key: "browser", Label: "Installing a web browser", Run: func(ctx context.Context, r ui.Reporter) error {
 			b := d.BrowserFor(string(arch))
 			switch {
 			case de.None() || o.NoBrowser:
@@ -634,7 +790,7 @@ func install(ctx context.Context, o InstallOpts) error {
 			run(r, fam.Clean)
 			return nil
 		}},
-		{Label: "Setting up the desktop", Run: func(ctx context.Context, r ui.Reporter) error {
+		{Key: "desktop-setup", Label: "Setting up the desktop", Run: func(ctx context.Context, r ui.Reporter) error {
 			if de.None() {
 				return ui.Skip("command line only")
 			}
@@ -642,7 +798,7 @@ func install(ctx context.Context, o InstallOpts) error {
 			// an SSH server is present.
 			run(r, "[ -d /etc/ssh ] && command -v ssh-keygen >/dev/null && ssh-keygen -A >/dev/null 2>&1; true")
 			if err := setupDesktop(ctx, in, de, t, r); err != nil {
-				return ui.Errorf("Desktop setup failed", err.Error(), "Run the same command again.")
+				return ui.Errorf("desktop_setup_failed", "Desktop setup failed", err.Error(), "Run the same command again.")
 			}
 			// A user from an earlier command-line install gets the session files too (#284).
 			if n := userSessionFiles(in); n > 0 {
@@ -653,18 +809,23 @@ func install(ctx context.Context, o InstallOpts) error {
 			rootfs.SetRelease(in.Rootfs, map[string]string{"ANDRONIX_DE": de.ID})
 			return in.Set("STAGE", "desktop")
 		}},
-		{Label: "Writing " + d.MainStart(), Run: func(ctx context.Context, r ui.Reporter) error {
+		{Key: "finish", Label: finishLabel(d), Run: func(ctx context.Context, r ui.Reporter) error {
 			if de.None() {
 				in.Set("DE", "none")
 				in.Set("DE_NAME", "Command line")
 				rootfs.SetRelease(in.Rootfs, map[string]string{"ANDRONIX_DE": "none"})
 			}
-			renamed, err := WriteLaunchers(d)
-			if err != nil {
-				return ui.Errorf("Couldn't write the start script", err.Error(), "Check that Termux can write to its home folder.")
+			// Termux's start scripts (./start-debian.sh and the old names);
+			// the standalone app starts distros itself, so none there.
+			if !sys.Standalone() {
+				renamed, err := WriteLaunchers(d)
+				if err != nil {
+					return ui.Errorf("couldn_t_write_the_start_script", "Couldn't write the start script", err.Error(), "Check that Termux can write to its home folder.")
+				}
+				in.Set("RENAMED", strings.Join(renamed, " "))
 			}
-			in.Set("RENAMED", strings.Join(renamed, " "))
 			in.Set("SOURCE", src.kind)
+			in.Set("FALLBACK", imgFallback)
 			in.Set("STAGE", "done")
 			os.RemoveAll(filepath.Join(paths.Cache, "layers-"+d.ID))
 			// The image isn't needed any more (a Modded or Classic one
@@ -675,30 +836,110 @@ func install(ctx context.Context, o InstallOpts) error {
 			return nil
 		}},
 	}...)
+	if o.ImageBuild {
+		// Up to the package steps, plus what the app installs lazily; the
+		// rest (desktop setup, launchers, the user) runs on the phone.
+		for i, st := range steps {
+			if st.Key == "browser" {
+				steps = steps[:i]
+				break
+			}
+		}
+		steps = append(steps, ui.Step{Key: "image-extras", Label: "Adding Xvfb and PulseAudio", Run: func(ctx context.Context, r ui.Reporter) error {
+			var pkgs []string
+			for _, p := range []string{d.Xvfb(), d.Pulse()} {
+				if p != "" {
+					pkgs = append(pkgs, p)
+				}
+			}
+			if len(pkgs) == 0 {
+				return ui.Skip("none for " + d.Label())
+			}
+			n := count(ctx, t, fam.SimInstall(pkgs), fam)
+			if err := ops.run(ctx, fam.Install(pkgs), n, r); err != nil {
+				return pkgErr("Couldn't install Xvfb and PulseAudio", err)
+			}
+			run(r, fam.Clean)
+			// The package list, next to the rootfs (not in it), for the image's .manifest.
+			if q := imageManifestCmd(d.Family); q != "" {
+				var lines []string
+				t.Run(ctx, q, nil, func(l string) {
+					if l = strings.TrimSpace(l); l != "" {
+						lines = append(lines, l)
+					}
+				})
+				sort.Strings(lines)
+				os.WriteFile(filepath.Join(in.Dir, "image-manifest.txt"), []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+			}
+			return nil
+		}})
+	}
 	for i := range steps {
-		label, run := steps[i].Label, steps[i].Run
+		label, key, run := steps[i].Label, steps[i].Key, steps[i].Run
 		steps[i].Run = func(ctx context.Context, r ui.Reporter) error {
-			rep.step = label // the failed step, for the app
-			return run(ctx, r)
+			rep.step, rep.stepKey = label, ui.StepKey(key, label) // the failed step, for the app
+			t0 := time.Now()
+			err := run(ctx, r)
+			ms := time.Since(t0).Milliseconds()
+			if len(rep.steps) < 20 {
+				rep.steps = append(rep.steps, fmt.Sprintf("%s:%d", ui.StepKey(key, label), ms))
+			}
+			switch key {
+			case "download":
+				rep.downloadMS += ms
+			case "unpack":
+				rep.unpackMS += ms
+			}
+			return err
 		}
 	}
-	telemetry.Send("install_started", map[string]any{"distro": d.ID, "de": de.ID, "modded": o.Modded, "edition": edition})
+	telemetry.Send("install_started", rep.ids(map[string]any{"distro": d.ID, "de": de.ID, "modded": o.Modded, "edition": edition}))
 	if err := ui.RunSteps(ctx, steps, lg); err != nil {
 		if ue, ok := err.(*ui.UserError); ok && ue.Log == "" {
 			ue.Log = lg.Path
 		}
 		return err
 	}
-	rep.step = ""
+	rep.step, rep.stepKey = "", ""
+	if o.ImageBuild {
+		ui.SetDone("distro", d.ID)
+		return nil
+	}
+	if !de.None() {
+		in.Set("FIRST_DESKTOP", rep.attemptID) // desktop_start says first, once
+	}
+	// products-api takes source image|packages only.
+	rep.source, rep.fallback = "packages", imgFallback
+	if src.kind == "image" {
+		rep.source = "image"
+	}
 
+	ui.SetDone("distro", d.ID)
+	if edition != "" {
+		ui.SetDone("edition", edition)
+	}
 	// A normal user instead of root (asks here; otherwise at first login).
 	user := in.Get("USER")
 	noStart, userStopped := o.NoStart, false
-	if user == "" && !o.NoUser {
+	if o.User != "" {
+		ui.Emit("step", map[string]any{"key": "user", "label": "Setting up " + o.User})
+		t0 := time.Now()
+		err := setupUserScripted(ctx, in, o.User, nil)
+		rep.steps = append(rep.steps, fmt.Sprintf("user:%d", time.Since(t0).Milliseconds()))
+		if err != nil {
+			rep.step, rep.stepKey = "Setting up "+o.User, "user"
+			ui.Emit("fail", map[string]any{"key": "user", "label": "Setting up " + o.User})
+			return err
+		}
+		ui.Emit("ok", map[string]any{"key": "user", "label": "Setting up " + o.User})
+		user = in.Get("USER")
+	} else if user == "" && !o.NoUser {
 		firstboot := filepath.Join(in.Rootfs, "etc/andronix/firstboot")
 		if ui.Interactive {
 			fmt.Println()
+			t0 := time.Now()
 			err := t.Interactive("/usr/local/bin/andronix setup-user", false)
+			rep.userSetupMS = time.Since(t0).Milliseconds()
 			if b, rerr := os.ReadFile(filepath.Join(in.Rootfs, "etc/andronix/user")); err == nil && rerr == nil {
 				user = strings.TrimSpace(string(b))
 				in.Set("USER", user)
@@ -718,7 +959,7 @@ func install(ctx context.Context, o InstallOpts) error {
 		}
 	}
 	if lowRAM > 0 {
-		ui.Warn(fmt.Sprintf("%s needs about %d MB of RAM; this phone has %d MB. It may be slow or close apps; XFCE is lighter.", de.Name, de.MinRAMMB, lowRAM))
+		ui.WarnKey("low_ram", fmt.Sprintf("%s needs about %d MB of RAM; this phone has %d MB. It may be slow or close apps; XFCE is lighter.", de.Name, de.MinRAMMB, lowRAM))
 	}
 	finish(in, de, user, noStart, userStopped, rep)
 	return nil
@@ -828,6 +1069,27 @@ func sessionPresent(in *Inst, de *conf.Desktop) bool {
 	return hasAny(in.Rootfs, "usr/bin/"+cmd, "bin/"+cmd, "usr/local/bin/"+cmd)
 }
 
+// desktopLeft reports an unfinished install with a desktop in it: unpacked
+// from a ready-made or Modded image, a desktop recorded, or any desktop's
+// session installed (an interrupted package run).
+func desktopLeft(in *Inst) bool {
+	if _, err := os.Stat(in.Rootfs); err != nil || in.Installed() {
+		return false
+	}
+	if p := in.Get("PREBUILT"); p != "" && p != "no" {
+		return true
+	}
+	if de := in.Get("DE"); de != "" && de != "none" {
+		return true
+	}
+	for _, id := range conf.DesktopIDs() {
+		if de, err := conf.ResolveDesktop(id); err == nil && sessionPresent(in, de) {
+			return true
+		}
+	}
+	return false
+}
+
 // moddedImage reports a Modded edition (its layer's files are present).
 func moddedImage(in *Inst) bool { return hasAny(in.Rootfs, "usr/share/andronix/modded") }
 
@@ -850,12 +1112,12 @@ func API() string { return netx.APIs()[0] }
 // the default file is <id>-<version>-<desktop>-modded-<arch>.tar.xz.
 func moddedSource(d *conf.Distro, de *conf.Desktop, arch sys.Arch, p Paths, token, edition string) (source, error) {
 	if token == "" {
-		return source{}, ui.Errorf("Missing download token", "Modded editions need the token the Andronix app gives you after purchase.",
+		return source{}, ui.Errorf("missing_download_token", "Missing download token", "Modded editions need the token the Andronix app gives you after purchase.",
 			"Copy the install command from the Andronix app again; it includes --token.")
 	}
 	q, err := url.ParseQuery(strings.TrimPrefix(strings.TrimSpace(token), "?"))
 	if err != nil || q.Get("k") == "" || q.Get("e") == "" || q.Get("h") == "" {
-		return source{}, ui.Errorf("That token doesn't look right", "The --token value is incomplete.",
+		return source{}, ui.Errorf("that_token_doesn_t_look_right", "That token doesn't look right", "The --token value is incomplete.",
 			"Copy the whole install command from the Andronix app again.")
 	}
 	file := q.Get("f")
@@ -866,7 +1128,7 @@ func moddedSource(d *conf.Distro, de *conf.Desktop, arch sys.Arch, p Paths, toke
 		}
 	}
 	if strings.ContainsAny(file, "/\\") || strings.HasPrefix(file, ".") {
-		return source{}, ui.Errorf("That token doesn't look right", "The file name in the token isn't valid.", "Copy the install command from the Andronix app again.")
+		return source{}, ui.Errorf("that_token_doesn_t_look_right", "That token doesn't look right", "The file name in the token isn't valid.", "Copy the install command from the Andronix app again.")
 	}
 	// The token proves the purchase of a product, not a file: it goes to
 	// products-api as given (every field), with this CPU's file name.
@@ -874,6 +1136,81 @@ func moddedSource(d *conf.Distro, de *conf.Desktop, arch sys.Arch, p Paths, toke
 	base := API() + "/v1/modded/download/"
 	return source{kind: "modded", api: API(), url: base + url.PathEscape(file) + "?" + q.Encode(),
 		sumURL: base + url.PathEscape(file+".sha256") + "?" + q.Encode(), file: filepath.Join(p.Cache, file)}, nil
+}
+
+// setupUserScripted runs setup-user inside the distro for name, with the
+// passwords, time zone and keyboard written to its stdin: proot passes a
+// session's environment on its command line, which /proc shows.
+func setupUserScripted(ctx context.Context, in *Inst, name string, onLine func(string)) error {
+	if !regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`).MatchString(name) || name == "root" {
+		return &ui.UserError{Title: "Can't use that user name", Class: "bad_user",
+			What: "'" + name + "' isn't a valid user name.", Fix: "Use lower-case letters, digits, _ and -, starting with a letter."}
+	}
+	if len(os.Getenv("ANDRONIX_USER_PASSWORD")) < 4 {
+		return &ui.UserError{Title: "No password for " + name, Class: "bad_user",
+			What: "ANDRONIX_USER_PASSWORD must hold the new user's password (4 characters or more).", Fix: "Set it in the environment, never on the command line."}
+	}
+	rootfs.InstallSelf(in.Rootfs) // setup-user --user needs this build's in-distro andronix
+	t := in.Target(true)
+	var secrets strings.Builder
+	for _, k := range secretKeys {
+		if v := os.Getenv(k); v != "" && !strings.ContainsAny(v, "\n\r") {
+			secrets.WriteString(k + "=" + v + "\n")
+		}
+	}
+	var tail []string
+	err := t.Run(ctx, "/usr/local/bin/andronix setup-user --user "+name+" --secrets-stdin", strings.NewReader(secrets.String()), func(l string) {
+		if tail = append(tail, l); len(tail) > 6 {
+			tail = tail[1:]
+		}
+		if onLine != nil {
+			onLine(l)
+		}
+	})
+	if err != nil {
+		return &ui.UserError{Title: "Couldn't set up " + name, Class: "setup_user", What: lastNonEmpty(strings.Join(tail, "\n"), 3), Err: err,
+			Fix: "Run it again: andronix setup-user " + in.D.ID + " --user " + name}
+	}
+	b, rerr := os.ReadFile(filepath.Join(in.Rootfs, "etc/andronix/user"))
+	if rerr != nil || strings.TrimSpace(string(b)) != name {
+		return &ui.UserError{Title: "Couldn't set up " + name, Class: "setup_user", What: "setup-user finished but didn't record the user.",
+			Fix: "Run it again: andronix setup-user " + in.D.ID + " --user " + name}
+	}
+	in.Set("USER", name)
+	return nil
+}
+
+// secretKeys are what setup-user --secrets-stdin accepts.
+var secretKeys = []string{"ANDRONIX_USER_PASSWORD", "ANDRONIX_VNC_PASSWORD", "ANDRONIX_TZ", "ANDRONIX_KEYBOARD"}
+
+// ReadSecrets sets secretKeys from KEY=value lines on stdin (setup-user
+// --secrets-stdin inside the distro).
+func ReadSecrets(r io.Reader) {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		k, v, ok := strings.Cut(sc.Text(), "=")
+		if ok && slices.Contains(secretKeys, k) {
+			os.Setenv(k, v)
+		}
+	}
+}
+
+// SetupUserHost is `andronix setup-user <distro> --user NAME` outside the
+// distro (the standalone app), secrets from the environment.
+func SetupUserHost(ctx context.Context, distro, name string) error {
+	d, err := resolveDistro(distro, "start")
+	if err != nil {
+		return err
+	}
+	in := Open(d)
+	if !in.Installed() {
+		return ui.Errorf("not_installed", d.Label()+" isn't installed", "There's no distro to set a user up in.", "Install it first: andronix install "+d.ID)
+	}
+	if err := setupUserScripted(ctx, in, name, func(l string) { fmt.Println("  " + l) }); err != nil {
+		return err
+	}
+	ui.OK(name + " is set up in " + d.Label() + ".")
+	return nil
 }
 
 // tokenExpired reads a Modded token's expiry (e, unix seconds); a token
@@ -914,11 +1251,11 @@ func moddedChecksum(ctx context.Context, s *source, lg *Logger, warn func(string
 		}
 		return nil
 	case err != nil:
-		return downloadErr(err)
+		return downloadErr(err, true) // products-api (Modded edition checksum)
 	}
 	f := strings.Fields(string(b))
 	if len(f) == 0 || !sha256Re.MatchString(strings.ToLower(f[0])) {
-		return ui.Errorf("Download check failed", "The server's checksum for this edition isn't valid.", "Run the same command again; if it keeps happening, tell us on Discord.")
+		return ui.Errorf("download_check_failed", "Download check failed", "The server's checksum for this edition isn't valid.", "Run the same command again; if it keeps happening, tell us on Discord.")
 	}
 	s.sha = strings.ToLower(f[0])
 	return nil
@@ -947,7 +1284,7 @@ func installLabel(de *conf.Desktop) string {
 func pickSource(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg *Logger) (source, error) {
 	if f := os.Getenv("ANDRONIX_ROOTFS"); f != "" {
 		if _, err := os.Stat(f); err != nil {
-			return source{}, ui.Errorf("Rootfs file not found", "ANDRONIX_ROOTFS points at '"+f+"', which doesn't exist.", "Fix the path or unset ANDRONIX_ROOTFS.")
+			return source{}, ui.Errorf("rootfs_file_not_found", "Rootfs file not found", "ANDRONIX_ROOTFS points at '"+f+"', which doesn't exist.", "Fix the path or unset ANDRONIX_ROOTFS.")
 		}
 		s := source{kind: "local", file: f}
 		if b, err := os.ReadFile(f + ".sha256"); err == nil {
@@ -991,7 +1328,7 @@ func pickSource(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg 
 			lg.Printf("tarball %s: no checksum, using the registry", u)
 		}
 		if mode == "tarball" {
-			return source{}, ui.Errorf("Download not available", "The "+d.Label()+" download isn't reachable right now.", "Check your connection and try again in a few minutes.")
+			return source{}, ui.Errorf("download_not_available", "Download not available", "The "+d.Label()+" download isn't reachable right now.", "Check your connection and try again in a few minutes.")
 		}
 	}
 	a, v := arch.OCI()
@@ -1013,28 +1350,36 @@ func pickSource(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg 
 			}
 			return s, nil
 		case errors.As(err, &np):
-			return source{}, ui.Errorf("No build for your CPU", d.Label()+" has no image for "+arch.Label()+".", "Pick another distro in the Andronix app.")
+			return source{}, ui.Errorf("no_build_for_your_cpu", "No build for your CPU", d.Label()+" has no image for "+arch.Label()+".", "Pick another distro in the Andronix app.")
 		case errors.As(err, &se) && se.Code == 429:
-			return source{}, ui.Errorf("The image server is busy", "Docker Hub limits downloads per network, and your network hit the limit.",
+			return source{}, ui.Errorf("the_image_server_is_busy", "The image server is busy", "Docker Hub limits downloads per network, and your network hit the limit.",
 				"Wait an hour, or switch between Wi-Fi and mobile data, then run the same command again.")
 		}
-		return source{}, ui.Errorf("Couldn't reach the download servers", err.Error(), "Check your internet connection, then run the same command again.")
+		return source{}, ui.Errorf("couldn_t_reach_the_download_servers", "Couldn't reach the download servers", err.Error(), "Check your internet connection, then run the same command again.")
 	}
 	return source{kind: "registry", image: im}, nil
 }
 
-func downloadErr(err error) error {
+// downloadErr turns a failed download into a user error. tokenAuth is true
+// only for products-api downloads (Modded editions, the beta channel),
+// where a 401/403 is the user's download token being refused or made for
+// another edition. On every other source — the free distro tarball, the
+// OCI registry, self-update — an HTTP status is just a failed download: a
+// registry (docker.io) 401 is its own bearer token expiring mid-download,
+// not the user's, so it must not be shown as "Download link expired ...
+// daily limit" (#243, support #658).
+func downloadErr(err error, tokenAuth bool) error {
 	if errors.Is(err, context.Canceled) {
 		return ui.ErrCancelled
 	}
 	var se *netx.StatusError
-	if errors.As(err, &se) && se.Code == 403 {
+	if tokenAuth && errors.As(err, &se) && se.Code == 403 {
 		// products-api: a genuine token for another edition.
 		return &ui.UserError{Title: "That token is for another edition", Class: "token_other_edition",
 			What: "The download token was made for a different Modded edition than this command installs.",
 			Fix:  "Copy the install command for this edition from the Andronix app.", Err: err}
 	}
-	if errors.As(err, &se) && se.Code == 401 {
+	if tokenAuth && errors.As(err, &se) && se.Code == 401 {
 		return &ui.UserError{Title: "Download link expired", Class: "token_refused", What: "The download token was refused (it lasts a limited time, and each purchase has a daily limit).",
 			Fix: "Copy a fresh install command from the Andronix app and run it again.", Err: err}
 	}
@@ -1104,17 +1449,23 @@ func termuxPkgErr(title, manual string, err error) error {
 	return e
 }
 
-// spaceNeed is the free space (MB) an install needs: the download and the
-// unpacked image, plus the desktop's packages, plus 20%. The desktop part
-// comes from DISTRO_XFCE_MB (measured with XFCE) scaled by the desktop's
-// size against XFCE's; distros not measured use the older estimate.
+// spaceNeed is the free space (MB) an install needs: the unpacked image,
+// plus the desktop's packages, plus 20%. The image is streamed into the
+// extractor and never stored (unpackImage: "no copy on disk"), so the
+// download size isn't part of the peak; the base is the unpacked rootfs
+// (DISTRO_DISK_MB). The desktop part comes from DISTRO_XFCE_MB (measured
+// with XFCE) scaled by the desktop's size against XFCE's; distros not
+// measured use the older estimate.
 func spaceNeed(d *conf.Distro, de *conf.Desktop, haveRootfs bool) int64 {
-	base := d.DownloadMB*2 + d.DiskMB
+	base := d.DiskMB
 	if haveRootfs {
 		base = 0
 	}
+	if len(standaloneExtras(d, de, sys.Standalone())) > 0 {
+		base += standaloneExtrasMB
+	}
 	if x := d.XFCEMB(); x > 0 && !de.None() {
-		desk := x - (d.DownloadMB*2 + d.DiskMB)
+		desk := x - d.DiskMB
 		if xfce, err := conf.ResolveDesktop("xfce"); err == nil && xfce.DiskMB > 0 && de.DiskMB > 0 {
 			desk = desk * de.DiskMB / xfce.DiskMB
 		}
@@ -1124,6 +1475,52 @@ func spaceNeed(d *conf.Distro, de *conf.Desktop, haveRootfs bool) int64 {
 		return int64(float64(base+100) * 1.2)
 	}
 	return int64(base + de.DiskMB + 300)
+}
+
+// standaloneExtrasMB is what Xvfb and PulseAudio add to a desktop install
+// (DISTRO_XFCE_MB is measured without them): about 60-80 MB, measured on an
+// API 36 emulator with Debian 13 XFCE (sv2-startup).
+const standaloneExtrasMB = 80
+
+// standaloneExtras are the packages a desktop install adds for the app's own
+// display and sound (standalone only): DISTRO_XVFB and DISTRO_PULSE, the ones
+// the first display start would install otherwise. None for Termux or for
+// command line installs.
+func standaloneExtras(d *conf.Distro, de *conf.Desktop, standalone bool) []string {
+	if !standalone || de.None() {
+		return nil
+	}
+	var out []string
+	for _, p := range []string{d.Xvfb(), d.Pulse()} {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// installKey is the package step's --progress json key.
+func installKey(de *conf.Desktop) string {
+	if de.None() {
+		return "basics"
+	}
+	return "desktop"
+}
+
+// finishLabel: Termux writes its start script; the standalone app doesn't.
+func finishLabel(d *conf.Distro) string {
+	if sys.Standalone() {
+		return "Finishing up"
+	}
+	return "Writing " + d.MainStart()
+}
+
+// packages is "1 package" or "n packages".
+func packages(n int) string {
+	if n == 1 {
+		return "1 package"
+	}
+	return fmt.Sprintf("%d packages", n)
 }
 
 // refreshTitle is a failed package-list refresh; network failures get
@@ -1136,6 +1533,9 @@ func pkgErr(title string, err error) error {
 	}
 	e := &ui.UserError{Title: title, What: "The package manager stopped with an error.", Class: "package_manager",
 		Fix: "Run the same command again; downloads resume. If Android closed Termux (signal 9), see docs.andronix.app on the phantom process killer.", Err: err}
+	if sys.Standalone() {
+		e.Fix = "Try again; downloads resume. If Android stopped the install, keep the Andronix app open while it runs."
+	}
 	var f *pkgmgr.Failure
 	if !errors.As(err, &f) {
 		return e
@@ -1154,6 +1554,10 @@ func pkgErr(title string, err error) error {
 		e.Title = "Another andronix is using this distro's package manager"
 		e.What = "It is running in another Termux session (" + f.Detail + ")."
 		e.Fix = "Wait for it to finish, or close it, then run the same command again."
+		if sys.Standalone() {
+			e.What = "Another install of this distro is running in the Andronix app (" + f.Detail + ")."
+			e.Fix = "Wait for it to finish, then try again."
+		}
 	case f.Kind == pkgmgr.KindDiskFull:
 		e.Class = "not_enough_space"
 		e.Title, e.What = "Your phone ran out of space", "The package manager couldn't write any more files ("+f.Detail+")."
@@ -1162,6 +1566,9 @@ func pkgErr(title string, err error) error {
 		e.Title = "Linux programs fail under proot on this phone"
 		e.What = "Programs in the distro crash or get 'Function not implemented' from the system (" + f.Detail + "), even after a second try with proot's fast mode off. It isn't your network."
 		e.Fix = "Update Termux (from the Play Store or F-Droid, wherever you got it), then run the same command again. If it still fails, send a report: andronix report."
+		if sys.Standalone() {
+			e.Fix = "Update the Andronix app, then try again. If it still fails, send a report from the app."
+		}
 	case f.Kind == pkgmgr.KindFakeRoot || f.Kind == "fake_root_not_fixed":
 		e.Title = "The distro's tools don't see root access on this phone"
 		e.What = "A program in the distro refused to run because it isn't root (" + f.Detail + "). proot pretends to be root, and on this phone that didn't work, even after a second try."
@@ -1180,6 +1587,9 @@ func pkgErr(title string, err error) error {
 		e.Fix = "Make sure the phone's date and time are set automatically (Settings, Date and time), then run the same command again."
 	case f.Kind == pkgmgr.KindKilled:
 		e.Fix = "Android stopped the install (signal 9). Keep Termux open in front while it runs, and see docs.andronix.app on the phantom process killer; then run the same command again."
+		if sys.Standalone() {
+			e.Fix = "Android stopped the install (signal 9). Keep the Andronix app open while it installs, then try again."
+		}
 	case f.Kind == pkgmgr.KindMirror:
 		if title == refreshTitle {
 			e.Title = "The package mirrors sent a broken answer"
@@ -1192,6 +1602,10 @@ func pkgErr(title string, err error) error {
 	case f.Kind == pkgmgr.KindProotArgs:
 		e.What = "proot refused how Andronix runs it, even with only its basic options. Termux's proot may be broken or very old."
 		e.Fix = "Reinstall it, then run the same command again: pkg reinstall proot"
+		if sys.Standalone() {
+			e.What = "proot refused how Andronix runs it, even with only its basic options."
+			e.Fix = "Update the Andronix app, then try again. If it still fails, send a report from the app."
+		}
 	case f.Kind == pkgmgr.KindProotExec:
 		e.What = "proot can't start programs inside the distro on this phone (" + f.Detail + ")."
 		e.Fix = "Send a report so we can look: andronix report"
@@ -1220,11 +1634,36 @@ func pkgRun(ctx context.Context, t *proot.Target, f *pkgmgr.Family, cmd string, 
 		defer t.Run(ctx, f.PostInstall, nil, nil)
 	}
 	steps := 0
+	// apt: bytes while it downloads ("Need to get" .. the last "Get:"),
+	// then the package steps as before (lead, 2.1: a big desktop's
+	// download showed no movement for minutes).
+	var need, got int64
+	downloading := false
 	return t.Run(ctx, cmd, nil, func(l string) {
 		r.Line(l)
 		if cur, tot, ok := f.Parse(l); ok {
 			r.Progress(int64(cur), int64(tot), "packages")
 			return
+		}
+		if f.ID == "apt" {
+			if b, ok := pkgmgr.AptNeedBytes(l); ok && b > 0 {
+				need, got, downloading = b, 0, true
+				r.Progress(0, need, "bytes")
+				return
+			}
+			if downloading {
+				if b, ok := pkgmgr.AptGotBytes(l); ok {
+					got = min(got+b, need)
+					if f.Step != nil && f.Step.MatchString(l) {
+						steps++ // still a step for the phases after the download
+					}
+					r.Progress(got, need, "bytes")
+					return
+				}
+				if strings.HasPrefix(l, "Fetched ") || strings.HasPrefix(l, "Unpacking ") || strings.HasPrefix(l, "Setting up ") {
+					downloading = false
+				}
+			}
 		}
 		if f.Step != nil && n > 0 && f.Step.MatchString(l) {
 			steps++
@@ -1236,6 +1675,14 @@ func pkgRun(ctx context.Context, t *proot.Target, f *pkgmgr.Family, cmd string, 
 
 func finish(in *Inst, de *conf.Desktop, user string, noStart, userStopped bool, rep *installReport) {
 	d := in.D
+	if sys.Standalone() {
+		// In the Andronix app: the app opens the terminal and the desktop.
+		fmt.Println()
+		fmt.Print(ui.Box(ui.BoxOK, d.Label()+" is ready", appFinishLines(d, de, user)...))
+		fmt.Println()
+		rep.send("ok")
+		return
+	}
 	start := ui.Interactive && !noStart
 	lines := []string{}
 	// The desktop is Termux:X11 (owner decision); VNC is the other way.
@@ -1286,6 +1733,20 @@ func finish(in *Inst, de *conf.Desktop, user string, noStart, userStopped bool, 
 	}
 }
 
+// appFinishLines is the install's closing box in the Andronix app.
+func appFinishLines(d *conf.Distro, de *conf.Desktop, user string) []string {
+	lines := []string{"Open " + d.Name + " from the Andronix app: its terminal"}
+	if !de.None() {
+		lines[0] += " and its " + de.Name + " desktop."
+	} else {
+		lines[0] += "."
+	}
+	if user != "" {
+		lines = append(lines, ui.KV("User", user+" (sudo works)"))
+	}
+	return lines
+}
+
 // startLine is the install's last line: how to start the distro (or its
 // desktop) again from Termux.
 func startLine(d *conf.Distro, de *conf.Desktop) string {
@@ -1325,6 +1786,25 @@ func preUpgrade(ctx context.Context, ops *pkgOps, d *conf.Distro, r ui.Reporter)
 
 // editionName is what users see for a Modded edition id (owner naming):
 // "Modded 2.0" for the lineup, "Classic" for the archived legacy-* ones.
+// downloadLabel names the download step. A free install shows the distro
+// ("Downloading Ubuntu 26.04"); a paid edition shows the edition instead
+// ("Downloading Ubuntu KDE Plasma (Classic)"), so a Classic or Modded
+// download no longer reads as a plain distro (#286).
+func downloadLabel(d *conf.Distro, de *conf.Desktop, edition string) string {
+	if edition == "" {
+		return "Downloading " + d.Label()
+	}
+	kind := "Modded"
+	if strings.HasPrefix(edition, "legacy-") {
+		kind = "Classic"
+	}
+	name := d.Name
+	if !de.None() {
+		name += " " + de.Name
+	}
+	return "Downloading " + name + " (" + kind + ")"
+}
+
 func editionName(id string) string {
 	if strings.HasPrefix(id, "legacy-") {
 		return "Andronix Classic"

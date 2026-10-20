@@ -42,7 +42,7 @@ func TestXFCEWallpaperDefaults(t *testing.T) {
 			}
 		}
 	}
-	if styles["monitorbuiltin"] != "4" || styles["monitorVNC-0"] != "5" {
+	if styles["monitorbuiltin"] != "4" || styles["monitorscreen"] != "4" || styles["monitorVNC-0"] != "5" {
 		t.Fatalf("image-style per monitor: %v", styles)
 	}
 	if !strings.Contains(string(b), `name="rgba1"`) {
@@ -126,6 +126,23 @@ func TestRefreshWallpaperRepairsBlackLXQt(t *testing.T) {
 	}
 }
 
+// The safe layer (standalone safe mode) has the light profile's settings
+// and the same need to keep LXQt's wallpaper defaults.
+func TestSafeLayerKeepsLXQtWallpaper(t *testing.T) {
+	root := t.TempDir()
+	de, _ := conf.ResolveDesktop("lxqt")
+	if err := setWallpaper(context.Background(), root, "lxqt", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSafeLayer(root, de); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(root, "etc/xdg/andronix-safe/pcmanfm-qt/lxqt/settings.conf"))
+	if !strings.Contains(string(b), "Wallpaper="+WallpaperPath) || !strings.Contains(string(b), "ShowThumbnails=false") {
+		t.Errorf("safe settings.conf:\n%s", b)
+	}
+}
+
 // Under the light profile xstartup sets XDG_CONFIG_DIRS, and startlxqt
 // then no longer adds /usr/share (LXQt's default lxqt.conf and panel.conf
 // on Debian; the panel drew solid black), so LXQt's own default dirs follow
@@ -164,6 +181,38 @@ func TestProfileEmptyFile(t *testing.T) {
 	}
 	if err := ApplyProfile(root, nil, "light"); err != nil || !profileSet(root) || Profile(root) != "light" {
 		t.Errorf("after ApplyProfile: %v", err)
+	}
+}
+
+// Firefox's phone prefs take effect only in browser/defaults/preferences,
+// read after Firefox's own firefox.js (#172); defaults/pref keeps a copy.
+func TestPhoneDefaultsFirefoxDirs(t *testing.T) {
+	root := t.TempDir()
+	esr := filepath.Join(root, "usr/lib/firefox-esr")
+	moz := filepath.Join(root, "usr/lib/firefox")
+	os.MkdirAll(filepath.Join(esr, "defaults/pref"), 0o755)
+	os.MkdirAll(filepath.Join(esr, "browser"), 0o755)
+	os.MkdirAll(filepath.Join(moz, "browser/defaults/preferences"), 0o755) // Mozilla's build: no defaults/pref
+	phoneDefaults(root)
+	for _, f := range []string{
+		"usr/lib/firefox-esr/defaults/pref/andronix-phone.js",
+		"usr/lib/firefox-esr/browser/defaults/preferences/andronix-phone.js",
+		"usr/lib/firefox/browser/defaults/preferences/andronix-phone.js",
+	} {
+		b, err := os.ReadFile(filepath.Join(root, f))
+		if err != nil || !strings.Contains(string(b), `pref("dom.ipc.processPrelaunch.enabled", false);`) {
+			t.Errorf("%s: %v", f, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(moz, "defaults/pref")); err == nil {
+		t.Error("created defaults/pref where Firefox has none")
+	}
+}
+
+// The desktop session has no GIO volume monitors or gvfsd-fuse (#172).
+func TestXstartupGvfs(t *testing.T) {
+	if !strings.Contains(xstartup, "export GIO_USE_VOLUME_MONITOR=unix GVFS_DISABLE_FUSE=1\n") {
+		t.Error("xstartup: gvfs settings missing")
 	}
 }
 

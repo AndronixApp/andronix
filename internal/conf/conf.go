@@ -113,6 +113,12 @@ func (d *Distro) MirrorFallbacks() [][]string {
 	return out
 }
 
+// Xvfb is DISTRO_XVFB: the package with Xvfb (andronix display).
+func (d *Distro) Xvfb() string { return d.raw.Get("DISTRO_XVFB") }
+
+// Pulse is DISTRO_PULSE: the PulseAudio package (standalone sound).
+func (d *Distro) Pulse() string { return d.raw.Get("DISTRO_PULSE") }
+
 // MirrorFor is DISTRO_MIRROR_<arch>: the package mirror to use, if any.
 func (d *Distro) MirrorFor(arch string) string { return d.raw.Get("DISTRO_MIRROR_" + arch) }
 
@@ -218,6 +224,13 @@ func (de *Desktop) SupportedOn() []string {
 
 // None is the command-line-only desktop.
 func (d *Desktop) None() bool { return d.ID == "none" }
+
+// XDGName is DE_XDG_NAME: the desktop's name in .desktop files'
+// OnlyShowIn/NotShowIn ("XFCE").
+func (d *Desktop) XDGName() string { return d.raw.Get("DE_XDG_NAME") }
+
+// IconThemes is DE_ICON_THEMES: the icon themes to search, best first.
+func (d *Desktop) IconThemes() []string { return d.raw.List("DE_ICON_THEMES") }
 
 // The data is built into the binary. ANDRONIX_DATA=<dir> (with distros/
 // and desktops/ inside) adds to it and overrides same-named files, for

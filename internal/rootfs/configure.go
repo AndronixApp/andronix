@@ -3,6 +3,7 @@ package rootfs
 import (
 	"compress/gzip"
 	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
 	"errors"
@@ -150,6 +151,10 @@ export MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_RDD_SANDBOX=1 MOZ_DISABLE_UTILI
 # Shared memory without memfd seals: some phones' content processes all
 # died otherwise ("Shared memory PlatformHandle is not safe to map").
 export MOZ_SHM_NO_SEALS=1
+# GIO's volume monitors (udisks2, MTP, gphoto2, AFC, GOA) and gvfsd-fuse
+# find nothing under proot and count toward Android's 32-process cap
+# (#172); gvfsd and gvfsd-metadata stay (Thunar's trash and recent files).
+export GIO_USE_VOLUME_MONITOR=unix GVFS_DISABLE_FUSE=1
 case $- in
     *i*)
         if [ -z "${ANDRONIX_WELCOMED:-}" ] && [ -x /usr/local/bin/andronix ]; then
@@ -171,17 +176,31 @@ esac
 // InstallSelf copies this binary into the distro, where it runs the VNC
 // helpers, first-boot setup and the greeting. Same CPU, so it just runs.
 func InstallSelf(root string) error {
-	bin, err := linuxSelf()
-	if err != nil {
-		return err
-	}
 	dst := filepath.Join(root, "usr/local/bin/andronix")
-	os.Remove(dst + ".new")
-	if err := os.WriteFile(dst+".new", bin, 0o755); err != nil {
-		return err
-	}
-	if err := os.Rename(dst+".new", dst); err != nil {
-		return err
+	stampPath := filepath.Join(root, selfStampFile)
+	build := selfStamp()
+	// The same build is already there (every desktop start calls this):
+	// skip unpacking and writing 10 MB (0.1-0.2 s on a phone, sv2-startup).
+	// The stamp also holds the file's size and time, so a copy written by
+	// anything else (an older installer without stamps) is replaced.
+	if old, err := os.ReadFile(stampPath); err != nil || build == "" || string(old) != installedStamp(build, dst) {
+		bin, err := linuxSelf()
+		if err != nil {
+			return err
+		}
+		os.Remove(dst + ".new")
+		if err := os.WriteFile(dst+".new", bin, 0o755); err != nil {
+			return err
+		}
+		if err := os.Rename(dst+".new", dst); err != nil {
+			return err
+		}
+		os.MkdirAll(filepath.Dir(stampPath), 0o755)
+		if build != "" {
+			os.WriteFile(stampPath, []byte(installedStamp(build, dst)), 0o644)
+		} else {
+			os.Remove(stampPath)
+		}
 	}
 	// bwrap stand-in: sandboxes can't work under proot, and glycin's image
 	// loaders go through bwrap (app.BwrapShim). /usr/local/bin is first in
@@ -266,6 +285,31 @@ var (
 	linuxBin  []byte
 	linuxErr  error
 )
+
+// selfStampFile records which build InstallSelf last put in a distro.
+const selfStampFile = "usr/local/lib/andronix/self.stamp"
+
+// selfStamp identifies the build linuxSelf would install without unpacking
+// it: the embedded copy's SHA-256, or the linux executable's size and
+// time. "" when it can't tell (a downloaded copy): then it always installs.
+func selfStamp() string {
+	if runtime.GOOS == "linux" {
+		self, err := os.Executable()
+		if err != nil {
+			return ""
+		}
+		st, err := os.Stat(self)
+		if err != nil {
+			return ""
+		}
+		return fmt.Sprintf("exe %d %d", st.Size(), st.ModTime().UnixNano())
+	}
+	b, err := andronix.SelfBin.ReadFile("selfbin/andronix-linux.gz")
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("gz %x", sha256.Sum256(b))
+}
 
 // linuxSelf is the andronix that goes inside distros: the static GOOS=linux
 // build. A linux build is its own; the android build (what Termux runs)
@@ -392,10 +436,47 @@ func sysdata(d string) {
 		"max_user_watches": "8192\n",
 		"overflowuid":      "65534\n",
 		"overflowgid":      "65534\n",
+		"filesystems":      procFilesystems,
 	}
 	for k, v := range files {
 		os.WriteFile(filepath.Join(d, k), []byte(v), 0o644)
 	}
+	writeCpuinfoStandIn(d)
+}
+
+// writeCpuinfoStandIn stages sysdata/cpuinfo when this phone needs the SVE
+// mask (#192): a copy of /proc/cpuinfo with the SVE-implying ARM core parts
+// set to generic, so Mesa's llvmpipe JIT stops emitting SVE. proot binds it
+// over /proc/cpuinfo (see proot.Args). On a phone that doesn't need it the
+// stand-in is removed, so an SVE-on or non-Qualcomm phone never binds one.
+// Read fresh from the host, so install, resume and update all react to the
+// actual device.
+func writeCpuinfoStandIn(d string) {
+	p := filepath.Join(d, "cpuinfo")
+	if content, ok := sys.MaskedCpuinfo(); ok {
+		os.WriteFile(p, []byte(content), 0o644)
+	} else {
+		os.Remove(p)
+	}
+}
+
+// procFilesystems stands in for /proc/filesystems, which Android 11+
+// denies to apps (an SELinux AVC each time proot or a program like
+// xfce4-panel's wrapper looks at it).
+const procFilesystems = "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevpts\nnodev\tcgroup2\nnodev\tfuse\nnodev\tfusectl\n\text4\n\tvfat\n\tfuseblk\n"
+
+// EnsureSysdata adds stand-ins an older install doesn't have yet (they're
+// written at install time), without touching existing ones.
+func EnsureSysdata(d string) {
+	if _, err := os.Stat(d); err != nil {
+		return // no sysdata at all: an install from before stand-ins
+	}
+	if _, err := os.Stat(filepath.Join(d, "filesystems")); err != nil {
+		os.WriteFile(filepath.Join(d, "filesystems"), []byte(procFilesystems), 0o644)
+	}
+	// Recompute each run: the SVE cpuinfo mask (#192) depends on the device,
+	// and this also removes a stale stand-in if the phone no longer matches.
+	writeCpuinfoStandIn(d)
 }
 
 func numCPU() int {
@@ -429,4 +510,13 @@ func InstallShm(root string) error {
 		return err
 	}
 	return os.Rename(p+".new", p)
+}
+
+// installedStamp is build plus dst's size and time; "" when dst is missing or empty.
+func installedStamp(build, dst string) string {
+	st, err := os.Stat(dst)
+	if err != nil || st.Size() == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s %d %d", build, st.Size(), st.ModTime().UnixNano())
 }

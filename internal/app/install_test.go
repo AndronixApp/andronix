@@ -246,3 +246,42 @@ func TestTermuxPkgErrPlayRepo(t *testing.T) {
 		t.Fatalf("GitHub/F-Droid: %+v", e)
 	}
 }
+
+// 'Command line only' over an unfinished desktop install starts over (#177);
+// an unfinished command-line install, or a finished one, is resumed or kept.
+func TestDesktopLeft(t *testing.T) {
+	mk := func(conf map[string]string, session bool) *Inst {
+		d := t.TempDir()
+		in := &Inst{Dir: d, Rootfs: filepath.Join(d, "rootfs"), State: filepath.Join(d, "install.conf")}
+		os.MkdirAll(filepath.Join(in.Rootfs, "usr/bin"), 0o755)
+		if session {
+			os.WriteFile(filepath.Join(in.Rootfs, "usr/bin/startxfce4"), nil, 0o755)
+		}
+		for k, v := range conf {
+			in.Set(k, v)
+		}
+		return in
+	}
+	for _, c := range []struct {
+		name    string
+		conf    map[string]string
+		session bool
+		want    bool
+	}{
+		{"image unpacked, interrupted", map[string]string{"STAGE": "configured", "PREBUILT": "image"}, true, true},
+		{"image, no session yet", map[string]string{"STAGE": "extracted", "PREBUILT": "image"}, false, true},
+		{"desktop recorded", map[string]string{"STAGE": "desktop", "PREBUILT": "no", "DE": "lxqt"}, false, true},
+		{"package run cut short, session in", map[string]string{"STAGE": "configured", "PREBUILT": "no"}, true, true},
+		{"command line, interrupted", map[string]string{"STAGE": "configured", "PREBUILT": "no"}, false, false},
+		{"command line from 2.0.x", map[string]string{"STAGE": "configured"}, false, false},
+		{"desktop install finished", map[string]string{"STAGE": "done", "PREBUILT": "image", "DE": "xfce"}, true, false},
+	} {
+		if got := desktopLeft(mk(c.conf, c.session)); got != c.want {
+			t.Errorf("%s: desktopLeft = %v, want %v", c.name, got, c.want)
+		}
+	}
+	d := t.TempDir()
+	if desktopLeft(&Inst{Dir: d, Rootfs: filepath.Join(d, "rootfs"), State: filepath.Join(d, "install.conf")}) {
+		t.Error("nothing there: want false")
+	}
+}

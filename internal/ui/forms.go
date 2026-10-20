@@ -40,7 +40,16 @@ func Theme() *huh.Theme {
 func noTerminal() *UserError {
 	return &UserError{Class: "needs_a_terminal", Title: "This needs a terminal",
 		What: "Andronix has a question for you, but its input isn't a terminal, so there's nowhere to type the answer.",
-		Fix:  "Run the same command in Termux's own window (type or paste it there), not from a script or another app."}
+		Fix:  noTerminalFix()}
+}
+
+// noTerminalFix: in the Andronix app (ANDRONIX_HOST=standalone, on the
+// phone or in its distros) there's no Termux to send people to.
+func noTerminalFix() string {
+	if os.Getenv("ANDRONIX_HOST") == "standalone" {
+		return "Open the distro's terminal in the Andronix app and run it there."
+	}
+	return "Run the same command in Termux's own window (type or paste it there), not from a script or another app."
 }
 
 func run(fields ...huh.Field) error {

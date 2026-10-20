@@ -2,15 +2,21 @@
 
 Changes to the `andronix` installer and the free distro images it installs. The app, the website and the docs have their own release notes. See https://docs.andronix.app for how to use the installer.
 
-## 2.0.10 (2026-10-15)
+## 2.1.1 (unreleased)
 
-2.0.9 was only a release candidate (beta); everything in it ships here too.
+### In the Andronix app
 
-- **A phone where a tool inside the distro crashes is no longer told its network is at fault** (support #470, #471): on some phones Termux's Linux layer makes programs in the distro crash (the signature checker gpgv) or fail with "Function not implemented", so every package list looked unsigned and the install said "your network is likely showing a sign-in page". The installer now recognises it, tries once more with proot's fast mode off, and if that doesn't help says to update Termux.
-- **One PulseAudio for sound, not one more at every start**: where Termux runs programs through Android's linker, PulseAudio's own check said it wasn't running when it was, so every `andronix start` launched another sound server (a dozen after a dozen starts), each one a process toward Android's limit of 32. The installer now asks the running server's socket first.
-- **A desktop that lost one of its own packages gets it back** (support #458): a Kali XFCE install without dbus-x11 (removed since the install) quit at once with "dbus-launch: not found". `andronix update` now puts back any missing packages of the installed desktop, and when the session can't start for that reason its log says which package and to run `andronix update`.
+- **Welcome doesn't offer a desktop the app won't open** (card #138): on kernels the app blocks a desktop on, Welcome says "Desktop: not available on this device (needs Linux kernel 4.8 or newer)", and points to LXQt when that one works, instead of "open it from the Andronix app".
+- **Messages point to the app, not to Termux**: inside the app, errors and notes (another install running, package failures, "This needs a terminal", the install's closing lines) say what to do in the app. `andronix update` inside a distro says the Linux runtime updates with the app from Google Play and the distro's packages update with its package manager, with the command to use.
+- **`andronix desktop` and `andronix x11` inside a distro say where desktops start** (support #351, card #173): in the app, "start desktops from Home > Your Linux"; in Termux, type exit and run the same command.
+- **Step details for the app's own wording** (card #174): the progress JSON's `ok` events carry `detail_key` and `detail_args` next to the English `detail`, which stays as it was.
+
+### Install
+
 - **Distros with systemd install on kernel 3.10 phones** (support #436, #438): systemd stopped with "Failed to take /etc/passwd lock: Invalid argument", because it locks the user database with a kind of lock Linux added in 3.15, and then every package that needs dbus or polkit stayed unconfigured (Kali; Ubuntu with KDE). On kernels before 3.15 a small shim now gives systemd the older lock instead.
 - **The time zone your phone reports is always accepted** (support #443, #435): Android still reports some zones by old names (Asia/Calcutta for India) that newer Ubuntu and Debian keep only in an extra package, so setting up the user, the last step of an install, failed with "Use a name like Europe/Berlin". The installer now maps old names to the current ones (Asia/Kolkata), accepts a name typed in another case, and never fails setup over a time zone: one it can't find keeps the current zone.
+- **"Command line only" installs only the command-line system** (card #177): resuming an interrupted desktop install as command line only kept the desktop. It now starts over from the base system; an unfinished command-line install is still resumed.
+- **Play Store Termux with a broken program link is told the fix before downloading** (support #358, card #178): when Termux's `applib` link (which Play's proot starts every program through) is a folder, a bad link or missing, every program failed with "execve: Permission denied" at "Setting up". The install now stops first with how to fix it: remove `~/../applib`, force stop Termux and open it again.
 - **One install of a distro at a time** (support #313): a second `andronix install` of the same distro in another Termux session (or while the app is installing it) failed on the first one's package lock, while the first finished fine. Install, update, remove and restore now hold a lock per distro, and a second run stops at once with "<Distro> is being installed in another Termux session", saying to wait or close it and run the same command again. The lock goes with its process, so a crashed or killed run never blocks the next.
 - **A resumed install waits for a leftover package run** (support #296): when an earlier attempt's apt or pacman is still running under this distro's proot with nothing left to start it, the installer waits up to 5 minutes, then stops that leftover, finishes dpkg's configuration and tries again. A package run that belongs to a live install, or to anything outside this distro, is never touched.
 - **Play Store Termux on a network that blocks termux.net says so** (support #305): it read as a missing package. Play Store Termux has only one package server, so the message says your network blocks it and to switch network or use a VPN; other Termux keeps the mirror advice.
@@ -18,18 +24,21 @@ Changes to the `andronix` installer and the free distro images it installs. The 
 - **Fedora installs on x86 Chromebooks and x86 Android** (support #326): Android's x86 app sandbox refuses the old file-creation system call that Fedora's package manager uses to import its keys ("Function not implemented"). A small shim, on x86 only and only where the check finds the call blocked, swaps it for the modern one. The fix that gives systemd its mount ids now also goes in wherever the check finds them missing, whatever the kernel (ChromeOS on 5.10).
 - **Kali gets Mozilla's Firefox** (64-bit; 32-bit phones keep Firefox ESR): Kali moved to FFmpeg 9, which Firefox ESR 140 can't load, so videos with H.264 or AAC didn't play. `andronix update` switches existing Kali installs: it installs Mozilla's Firefox from Mozilla's package repository (as on Ubuntu), keeps your Firefox profile (bookmarks, logins, history), points the dock, the Whisker menu favourites and your launchers at it, and removes Firefox ESR only when nothing else depends on it.
 
-## 2.0.9 (release candidate only; shipped in 2.0.10)
+### Desktops
+
+- **One PulseAudio for sound, not one more at every start**: where Termux runs programs through Android's linker, PulseAudio's own check said it wasn't running when it was, so every `andronix start` launched another sound server (a dozen after a dozen starts), each one a process toward Android's limit of 32. The installer now asks the running server's socket first.
+- **A desktop that lost one of its own packages gets it back** (support #458): a Kali XFCE install without dbus-x11 (removed since the install) quit at once with "dbus-launch: not found". `andronix update` now puts back any missing packages of the installed desktop, and when the session can't start for that reason its log says which package and to run `andronix update`.
+- **Firefox starts fewer processes** (card #172): its phone settings now go where Firefox reads them after its own defaults, so it no longer starts three spare content processes (Kali 8 to 5 processes with two tabs). The desktop no longer starts GIO's volume monitors or gvfsd-fuse, which find nothing under proot (about 6 processes); Thunar's trash and recent files still work. Both apply on install and on `andronix update`.
+
+## 2.1.0 (2026-10-11)
 
 - **A desktop added to a command-line install starts for your user** (support #284): the user made at the first login of a command-line install never got the desktop's session files, so `andronix desktop` stopped with "The desktop session is missing". Installing a desktop, and `andronix desktop`, now copy what the user's home lacks from /etc/skel, never overwriting your files (VNC already did).
 - **Andronix works on networks that block public DNS** (card #141): where a network drops DNS to public servers, every install stopped at "Finding the best download" with "Couldn't reach the download servers", while curl and the Andronix app worked. The installer looked names up itself through public servers (Termux's 8.8.8.8, then 1.1.1.1), and so does the distro (its resolv.conf). Now both go through Android's own resolver (the network's DNS, or Private DNS): the installer asks it first, with the public servers as the fallback, and each session runs a small forwarder that glibc distros ask through an NSS module (`hosts: files andronix [NOTFOUND=return] dns` in nsswitch.conf, set again on every start). A name that doesn't exist answers at once; with no forwarder, lookups go to resolv.conf as before. Alpine (musl) keeps resolv.conf only. The install log says which resolver answered ("dns dl.andronix.app: android"). The 64-bit Termux build now links with Android's C library, like the other CPUs. `ANDRONIX_DNS=go` keeps the old behaviour.
-
-## 2.0.8 (2026-10-10)
-
 - **`andronix report` sends the failed run's own log**, also for errors without one of their own; a newer run since (a "Try again") follows it, shorter. Before, such a report carried only the newest log, the retry's (support #255).
 - **A question with no keyboard to answer it says so**: when its input isn't a terminal, a prompt fails with "This needs a terminal" and how to run the command instead, and the installer's screens never try to open /dev/tty themselves (support #255 saw "could not open a new TTY: open /dev/tty: no such device or address").
 - **sudo no longer prints "unable to send audit message"** (Ubuntu 26.04 and other distros with the classic sudo): under proot, every sudo printed "sudo: unable to send audit message: Operation not permitted" even when it worked, which read as sudo failing (support #253). The installer turns off sudo's audit logging (`Defaults !log_allowed, !log_denied` in `/etc/sudoers.d/andronix-quiet`) when the user is set up, and on `andronix update` and `andronix start` for distros installed before. Not with sudo-rs, which doesn't know those settings.
 
-## 2.0.7 (2026-10-09)
+## 2.0.7 (unreleased)
 
 ### Desktops
 
@@ -56,14 +65,13 @@ Changes to the `andronix` installer and the free distro images it installs. The 
 
 ### Telemetry
 
-- **A failed download says why** (HTTP status, DNS, connection, timeout, interrupted, checksum, disk full), without the address or any path.
 - **Only released versions send telemetry**: test, release-candidate and development builds send nothing, so test runs never mix into the numbers. `andronix telemetry off` works as before.
 
 ### Reports
 
 - **`andronix report --attach AX-…` joins a report to the one you sent from the Andronix app**, so support sees both together. `--message` works as before.
 
-## 2.0.6 (2026-10-07)
+## 2.0.6 (unreleased)
 
 ### Installs that get through
 

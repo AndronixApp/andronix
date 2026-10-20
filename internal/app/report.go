@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AndronixApp/andronix-distros/internal/proot"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
 	"github.com/AndronixApp/andronix-distros/internal/telemetry"
 	"github.com/AndronixApp/andronix-distros/internal/termux"
@@ -36,6 +39,127 @@ type installReport struct {
 	started    time.Time
 	err        error  // the failure, for its telemetry class
 	outcome    string // ok, but not a new install: already_installed
+	// How the rootfs came: source (image, tarball, registry, ...), the
+	// image's fallback reason (image.go), and the bytes downloaded.
+	source, fallback     string
+	downloadBytes        int64
+	downloadMS, unpackMS int64 // the download and unpack steps (an image does both in download)
+	// Telemetry v2: this run's random id, the app's command id (gen_id),
+	// each step that ran as key:ms, the failed step's key, the time spent
+	// on the interactive user setup (kept out of duration_ms, which is
+	// then machine time), and the phone's compat facts.
+	attemptID, genID string
+	steps            []string
+	stepKey          string
+	userSetupMS      int64
+	cr               *compatRun
+}
+
+// newInstallReport starts a run's report with a new attempt id.
+func newInstallReport(distro, de string, modded bool) *installReport {
+	r := &installReport{distro: distro, de: de, modded: modded, started: time.Now(), attemptID: randomHex(16)}
+	if id := os.Getenv("ANDRONIX_INSTALL_ID"); installIDRe.MatchString(id) {
+		r.genID = strings.ToLower(id)
+	}
+	return r
+}
+
+// ids are the attempt and command ids, for install_started and install_result.
+func (r *installReport) ids(props map[string]any) map[string]any {
+	props["attempt_id"] = r.attemptID
+	if r.genID != "" {
+		props["gen_id"] = r.genID
+	}
+	return props
+}
+
+// facts adds the phone's facts to install_result, ok or not: proot, the
+// linker, kernel (major.minor), ROM family, RAM bucket, the probe summary
+// (not-probed before the setup step) and the matching compat rules.
+func (r *installReport) facts(props map[string]any) {
+	if v := proot.Version(); v != "" {
+		props["proot_version"] = v
+	}
+	if sys.ViaLinker() {
+		props["linker"] = true
+	}
+	if r.cr == nil {
+		return
+	}
+	p := r.cr.facts.Probe
+	props["kernel"], props["rom"], props["ram"], props["probe"] = p.KernelMajorMinor(), p.ROM, p.RAMBucket(), p.Summary()
+	props["rules"] = strings.Join(r.cr.plan.IDs, " ")
+}
+
+// props is install_result's properties for status ok or fail.
+func (r *installReport) props(status string) map[string]any {
+	props := r.ids(map[string]any{"ok": status == "ok", "distro": r.distro, "de": r.de, "modded": r.modded,
+		"duration_ms": time.Since(r.started).Milliseconds() - r.userSetupMS})
+	if r.userSetupMS > 0 {
+		props["user_setup_ms"] = r.userSetupMS
+	}
+	if len(r.steps) > 0 {
+		props["steps_ms"] = strings.Join(r.steps, ",")
+	}
+	r.facts(props)
+	if r.outcome != "" {
+		props["outcome"] = r.outcome
+	}
+	if r.source != "" {
+		props["source"] = r.source
+	}
+	if r.fallback != "" {
+		props["fallback_reason"] = r.fallback
+	}
+	if r.downloadBytes > 0 {
+		props["download_bytes"] = r.downloadBytes
+	}
+	if r.downloadMS > 0 {
+		props["download_ms"] = r.downloadMS
+	}
+	if r.unpackMS > 0 {
+		props["unpack_ms"] = r.unpackMS
+	}
+	if status != "ok" {
+		props["step"], props["error_class"] = r.step, telemetry.ErrorClass(r.err)
+		if r.stepKey != "" {
+			props["step_key"] = r.stepKey
+		}
+		var ue *ui.UserError
+		if errors.As(r.err, &ue) {
+			if ue.Kind != "" {
+				props["error_kind"] = ue.Kind
+			}
+			if ue.Detail != "" {
+				props["error_detail"] = ue.Detail
+			}
+		}
+	}
+	addPMFailure(props)
+	return props
+}
+
+// desktopStart sends desktop_start (kind x11, display or vnc) next to the
+// old start event, which stays for one release so charts carry over. The
+// first desktop start after an install says first, with that install's
+// attempt_id.
+func desktopStart(in *Inst, kind string, start map[string]any) {
+	p := map[string]any{"kind": kind}
+	for k, v := range start {
+		p[k] = v
+	}
+	if id := in.Get("FIRST_DESKTOP"); id != "" {
+		p["first"], p["attempt_id"] = true, id
+		in.Set("FIRST_DESKTOP", "")
+	}
+	telemetry.Send("desktop_start", p)
+}
+
+// randomHex is n random bytes as hex.
+func randomHex(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // amArgs is the am command line for status "ok" or "fail", or nil when
@@ -70,25 +194,7 @@ func (r *installReport) send(status string) {
 		return
 	}
 	r.sent = true
-	props := map[string]any{"ok": status == "ok", "distro": r.distro, "de": r.de, "modded": r.modded,
-		"duration_ms": time.Since(r.started).Milliseconds()}
-	if r.outcome != "" {
-		props["outcome"] = r.outcome
-	}
-	if status != "ok" {
-		props["step"], props["error_class"] = r.step, telemetry.ErrorClass(r.err)
-		var ue *ui.UserError
-		if errors.As(r.err, &ue) {
-			if ue.Kind != "" {
-				props["error_kind"] = ue.Kind
-			}
-			if ue.Detail != "" {
-				props["error_detail"] = ue.Detail
-			}
-		}
-	}
-	addPMFailure(props)
-	telemetry.Send("install_result", props)
+	telemetry.Send("install_result", r.props(status))
 	if id := os.Getenv("ANDRONIX_INSTALL_ID"); id != "" && !installIDRe.MatchString(id) {
 		termux.Logf("install result: ANDRONIX_INSTALL_ID %q isn't 16 hex digits; not sent", id)
 	}

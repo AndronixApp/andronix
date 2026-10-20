@@ -167,8 +167,3 @@ func swapItem(list, sep, from, to string) string {
 	}
 	return strings.Join(out, sep)
 }
-
-func isDir(p string) bool {
-	st, err := os.Stat(p)
-	return err == nil && st.IsDir()
-}

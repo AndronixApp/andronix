@@ -82,6 +82,12 @@ func RunOne(name string) string {
 		if e, ok = creatSyscall(); !ok {
 			return "setup-failed"
 		}
+	case "getcwd":
+		// proot on some ROMs (Blackview/rockchip kernel 5.10, support #229
+		// AX-N73QZG) answers getcwd with ENOSYS, so sh/apt/dpkg die with
+		// "getcwd() failed: Function not implemented". A plain buffer here.
+		var buf [256]byte
+		_, _, e = unix.Syscall(unix.SYS_GETCWD, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0)
 	case "seccomp":
 		action := uint32(unix.SECCOMP_RET_KILL_PROCESS)
 		_, _, e = unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_GET_ACTION_AVAIL, 0, uintptr(unsafe.Pointer(&action)))

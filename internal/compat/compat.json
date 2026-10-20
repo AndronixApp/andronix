@@ -116,6 +116,29 @@
       }
     },
     {
+      "id": "getcwd-shim",
+      "why": "proot on some ROMs answers getcwd(2) with ENOSYS, so glibc's getcwd() returns 'Function not implemented' and sh/apt/dpkg stop ('sh: 0: getcwd() failed: Function not implemented', dpkg-preconfigure 'cannot fetch initial working directory'); PROOT_NO_SECCOMP=1 doesn't help because it is proot's getcwd path, not seccomp (support #229, report AX-N73QZG, Blackview SHARK 8, rockchip kernel 5.10). The shim reads the directory from /proc/self/cwd when getcwd fails with ENOSYS, and is a no-op where getcwd works.",
+      "when": {
+        "family": [
+          "apt",
+          "dnf",
+          "pacman",
+          "xbps",
+          "apk"
+        ],
+        "probe": {
+          "getcwd": [
+            "ENOSYS",
+            "EPERM",
+            "SIGSYS"
+          ]
+        }
+      },
+      "do": {
+        "preload": "getcwd"
+      }
+    },
+    {
       "id": "fchmodat2-bad-errno",
       "why": "On some old kernels proot answers fchmodat2 with a wrong errno (ENETDOWN on andronix-a9, 4.4) instead of ENOSYS, so glibc 2.39+ doesn't fall back and every chmod of a symlink fails ('Cannot change mode: Network is down'). The fchmodat shim never calls fchmodat2.",
       "when": {

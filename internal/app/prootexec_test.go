@@ -1,9 +1,13 @@
 package app
 
 import (
-	"github.com/AndronixApp/andronix-distros/internal/sys"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/AndronixApp/andronix-distros/internal/sys"
+	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
 
 // Play Store Termux on a 32-bit phone gets the F-Droid advice (owner, #109);
@@ -36,5 +40,51 @@ func TestProotExecError(t *testing.T) {
 		} else if !strings.Contains(e.Fix, "andronix report") || !strings.Contains(e.What, detail) {
 			t.Errorf("%s/%s: %q / %q", c.termux, c.arch, e.What, e.Fix)
 		}
+	}
+}
+
+// Play Store Termux with a broken applib link (support #358): the exact fix,
+// both before the install starts and when proot fails; a good link changes
+// nothing.
+func TestAppLibError(t *testing.T) {
+	for _, k := range []string{"TERMUX_APP__APK_RELEASE", "TERMUX_APK_RELEASE", "TERMUX_APP__APP_VERSION_NAME", "ANDRONIX_HOST", "ANDRONIX_DISTRO"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("TERMUX_VERSION", "googleplay.2026.10.09")
+	root := t.TempDir()
+	files := filepath.Join(root, "data", "com.termux", "files")
+	os.MkdirAll(filepath.Join(files, "usr"), 0o755)
+	t.Setenv("PREFIX", filepath.Join(files, "usr"))
+	apk := filepath.Join(root, "app", "lib", "arm64")
+	os.MkdirAll(apk, 0o755)
+	os.WriteFile(filepath.Join(apk, "libproot-loader.so"), []byte("x"), 0o755)
+	applib := filepath.Join(files, "applib")
+	const detail = `execve("/usr/bin/env"): Permission denied`
+
+	os.MkdirAll(applib, 0o755) // restored as a folder
+	err := appLibCheck()
+	e, ok := err.(*ui.UserError)
+	if !ok || e.Class != "termux_applib" || !strings.Contains(e.What, "a folder instead of a link") ||
+		!strings.Contains(e.Fix, "rm -rf ~/../applib") || !strings.Contains(e.Fix, "Force stop") || !strings.Contains(e.Fix, "erases everything inside Termux") {
+		t.Fatalf("folder: %#v", err)
+	}
+	e = prootExecError(detail, "Arch Linux", "google_play_store", "aarch64")
+	if e.Class != "termux_applib" || e.Kind != "proot_exec" || e.Detail != detail {
+		t.Errorf("proot failure with a folder: %+v", e)
+	}
+
+	os.RemoveAll(applib)
+	os.Symlink(apk, applib)
+	if err := appLibCheck(); err != nil {
+		t.Errorf("good link: %v", err)
+	}
+	if e := prootExecError(detail, "Arch Linux", "google_play_store", "aarch64"); e.Class != "proot_exec" || !strings.Contains(e.Fix, "andronix report") {
+		t.Errorf("good link, proot failure: %+v", e)
+	}
+
+	t.Setenv("TERMUX_VERSION", "0.118.3") // F-Droid/GitHub: no applib, never checked
+	os.Remove(applib)
+	if err := appLibCheck(); err != nil {
+		t.Errorf("F-Droid Termux: %v", err)
 	}
 }

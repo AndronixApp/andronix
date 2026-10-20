@@ -16,7 +16,7 @@ import (
 
 // Syscalls are what the probe tries, in order.
 var Syscalls = []string{"statx", "statx_mnt_id", "openat2", "faccessat2", "fchmodat2", "close_range", "open_tree",
-	"name_to_handle_at", "memfd_create", "clone3", "seccomp", "creat"}
+	"name_to_handle_at", "memfd_create", "clone3", "seccomp", "creat", "getcwd"}
 
 // RunAll runs every probe syscall in its own child (`self __probe one
 // <name>`), so a seccomp kill costs only that child: it's recorded as the

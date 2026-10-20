@@ -48,13 +48,16 @@ func VNCStart(args []string, lan bool) error {
 	if len(args) > 1 {
 		n, err := strconv.Atoi(strings.TrimPrefix(args[1], ":"))
 		if err != nil {
-			return ui.Errorf("Bad display", "'"+args[1]+"' is not a number.", "Try: vncserver-start 1920x1080 1")
+			return ui.Errorf("bad_display", "Bad display", "'"+args[1]+"' is not a number.", "Try: vncserver-start 1920x1080 1")
 		}
 		num = n
 	}
 	if _, err := sys.LookPath("Xvnc"); err != nil {
-		return ui.Errorf("VNC isn't installed", "This distro has no desktop yet.",
-			"In Termux, run: andronix install "+guestRelease().Get("ANDRONIX_DISTRO")+" --de xfce")
+		fix := "In Termux, run: andronix install " + guestRelease().Get("ANDRONIX_DISTRO") + " --de xfce"
+		if standaloneHost() {
+			fix = "Add one from the Andronix app: Your Linux > ⋮ > Add a desktop. Your files stay."
+		}
+		return ui.Errorf("vnc_isn_t_installed", "VNC isn't installed", "This distro has no desktop yet.", fix)
 	}
 	desktopNote()
 	if pidAlive(fmt.Sprintf("/tmp/.X%d-lock", num)) {
@@ -94,7 +97,7 @@ func VNCStart(args []string, lan bool) error {
 		}
 	}
 	if size != "" && !reSize.MatchString(size) {
-		return ui.Errorf("Bad screen size", "'"+size+"' doesn't look like WIDTHxHEIGHT.", "Try: vncserver-start 1920x1080")
+		return ui.Errorf("bad_screen_size", "Bad screen size", "'"+size+"' doesn't look like WIDTHxHEIGHT.", "Try: vncserver-start 1920x1080")
 	}
 
 	h := home()
@@ -116,12 +119,12 @@ func VNCStart(args []string, lan bool) error {
 			fmt.Println()
 			p, err := ui.Password("Choose a desktop password", "Your VNC viewer asks for it. 6 to 8 characters.", 6, 8)
 			if err != nil {
-				return ui.Errorf("No password set", "VNC needs a password before it starts.", "Run vncserver-start again in a terminal.")
+				return ui.Errorf("no_password_set", "No password set", "VNC needs a password before it starts.", "Run vncserver-start again in a terminal.")
 			}
 			pass = p
 		}
 		if err := writeVNCPassword(pw, pass); err != nil {
-			return ui.Errorf("Couldn't save the password", err.Error(), "Run vncserver-start again.")
+			return ui.Errorf("couldn_t_save_the_password", "Couldn't save the password", err.Error(), "Run vncserver-start again.")
 		}
 	}
 	os.Chmod(pw, 0o600) // TigerVNC refuses a password file others can read
@@ -133,7 +136,7 @@ func VNCStart(args []string, lan bool) error {
 	// Extra X server options for troubleshooting, e.g.
 	// ANDRONIX_VNC_ARGS="-extension MIT-SHM".
 	extra := strings.Fields(os.Getenv("ANDRONIX_VNC_ARGS"))
-	if light {
+	if light && os.Getenv("ANDRONIX_VNC_UNIX") == "" {
 		extra = append([]string{"-depth", "16"}, extra...) // half the bandwidth and memory
 	}
 	logf := fmt.Sprintf("/tmp/andronix-vnc-%d.log", num)
@@ -147,14 +150,14 @@ func VNCStart(args []string, lan bool) error {
 		if len(lines) > 4 {
 			lines = lines[len(lines)-4:]
 		}
-		return ui.Errorf("The desktop didn't start", strings.Join(lines, " "),
-			"Run vncserver-stop, then vncserver-start again. Log: "+logf)
+		return ui.Errorf("the_desktop_didn_t_start", "The desktop didn't start", strings.Join(lines, " "),
+			vncRetry("Run vncserver-stop, then vncserver-start again.")+" Log: "+logf)
 	}
 	// The session can die while Xvnc keeps serving an empty screen; check
 	// before saying it's running.
 	if dead, tail := sessionDied(filepath.Join(dir, "xstartup")); dead {
-		return ui.Errorf("The desktop session stopped", "The VNC server is up, but the desktop inside it quit right away: "+tail,
-			"Run vncserver-stop, then vncserver-start. If it happens again, send us "+sessionLog()+" (Discord or email).")
+		return ui.Errorf("the_desktop_session_stopped", "The desktop session stopped", "The VNC server is up, but the desktop inside it quit right away: "+tail,
+			vncRetry("Run vncserver-stop, then vncserver-start.")+" If it happens again, send us "+sessionLog()+" (Discord or email).")
 	}
 	s := size
 	if s == "" {
@@ -165,14 +168,73 @@ func VNCStart(args []string, lan bool) error {
 		reach = "your whole network (--lan)"
 	}
 	fmt.Println()
+	if p := os.Getenv("ANDRONIX_VNC_UNIX"); p != "" {
+		fmt.Print(ui.Box(ui.BoxOK, "Desktop is running", ui.KV("Socket", p), ui.KV("Size", s),
+			ui.KV("Reachable", "only the Andronix app"), "", "Andronix shows the desktop by itself.", vncKeep(), vncDone()))
+		fmt.Println()
+		return nil
+	}
 	fmt.Print(ui.Box(ui.BoxOK, "Desktop is running",
 		ui.KV("Address", fmt.Sprintf("localhost:%d", num)), ui.KV("Port", strconv.Itoa(5900+num)), ui.KV("Size", s),
 		ui.KV("Reachable", reach), "",
 		"Open a VNC viewer and connect to the address above.",
-		"Keep this Termux session open while you use the desktop: closing it (or typing exit) stops the desktop too.",
-		"When you're done: vncserver-stop"))
+		vncKeep(), vncDone()))
 	fmt.Println()
 	return nil
+}
+
+// The VNC messages for where the distro runs: Termux, or the standalone
+// app (ANDRONIX_HOST=standalone, passed in by proot), whose own viewer
+// connects and whose notification stops the desktop.
+func standaloneHost() bool {
+	if h := os.Getenv("ANDRONIX_HOST"); h != "" {
+		return h == "standalone"
+	}
+	// sudo and su - drop the environment: the host start wrote its kind.
+	return strings.TrimSpace(string(readFile("/"+hostFile))) == "standalone"
+}
+
+// hostFile records, in the rootfs, what started the distro last (termux,
+// standalone or linux), for andronix inside it when sudo dropped
+// ANDRONIX_HOST (writeHostKind).
+const hostFile = "etc/andronix/host"
+
+// writeHostKind records the host kind in the rootfs, when it changed.
+func writeHostKind(root string) {
+	kind := "linux"
+	switch {
+	case sys.Standalone():
+		kind = "standalone"
+	case sys.IsTermux():
+		kind = "termux"
+	}
+	p := filepath.Join(root, hostFile)
+	if strings.TrimSpace(string(readFile(p))) == kind {
+		return
+	}
+	os.MkdirAll(filepath.Dir(p), 0o755)
+	sys.WriteFileAtomic(p, []byte(kind+"\n"), 0o644)
+}
+
+func vncKeep() string {
+	if standaloneHost() {
+		return "Keep Andronix open while you use the desktop."
+	}
+	return "Keep this Termux session open while you use the desktop: closing it (or typing exit) stops the desktop too."
+}
+
+func vncDone() string {
+	if standaloneHost() {
+		return "When you're done, stop it from the Andronix notification."
+	}
+	return "When you're done: vncserver-stop"
+}
+
+func vncRetry(termux string) string {
+	if standaloneHost() {
+		return "Stop the desktop from the Andronix notification, then open it again."
+	}
+	return termux
 }
 
 func sessionLog() string { return fmt.Sprintf("/tmp/andronix-session-%d.log", os.Getuid()) }
@@ -210,12 +272,6 @@ func sessionDied(xstartup string) (bool, string) {
 	return true, strings.Join(lines, " / ")
 }
 
-// xServerFileCap is the most Xvnc may write to any one file (its log). A
-// runaway X server is stopped by the kernel there (SIGXFSZ): orphaned when
-// Android killed its proot, Xvfb looped on poll() and wrote 10 GB of log
-// in 20 minutes (a16, Oct 7), which on a phone fills the disk.
-const xServerFileCap = 16 << 20
-
 // startXvnc runs Xvnc and the session directly, detached, and waits for
 // the display socket.
 func startXvnc(num int, size, listen, passwd, xstartup, logf string, extra []string) ([]byte, error) {
@@ -234,38 +290,70 @@ func startXvnc(num int, size, listen, passwd, xstartup, logf string, extra []str
 	}
 	args := []string{fmt.Sprintf(":%d", num), "-desktop", "remote-desktop", "-localhost=" + local,
 		"-rfbport", strconv.Itoa(5900 + num), "-rfbauth", passwd, "-SecurityTypes", "VncAuth", "-depth", "24"}
+	// The standalone app's viewer: a Unix socket in the app's private
+	// storage, no TCP port (any app on the phone can reach 127.0.0.1).
+	if p := os.Getenv("ANDRONIX_VNC_UNIX"); p != "" {
+		args = []string{fmt.Sprintf(":%d", num), "-desktop", "remote-desktop", "-rfbport", "-1",
+			"-rfbunixpath", p, "-rfbunixmode", "0600", "-rfbauth", passwd, "-SecurityTypes", "VncAuth", "-depth", "24"}
+	}
 	if size != "" {
 		args = append(args, "-geometry", size)
 	}
 	args = append(args, extra...)
-	x := sys.Command("Xvnc", args...)
+	return startXServer("Xvnc", args, num, xstartup, lg, logf, nil, xServerFileCap)
+}
+
+// xServerFileCap is the most an X server may write to any one file (its
+// log; Xvfb adds its framebuffer file's size). A runaway X server is
+// stopped by the kernel there (SIGXFSZ): orphaned when Android killed its
+// proot, Xvfb looped on poll() and wrote 10 GB of log in 20 minutes
+// (a16, Oct 7), which on a phone fills the disk.
+const xServerFileCap = 16 << 20
+
+// startXServer starts an X server (Xvnc, Xvfb) detached, waits for its
+// display socket, then starts the desktop session (xstartup) on it.
+// up, if not nil, runs once the server is up, before the session starts.
+// fileCap (bytes, 0 for none) caps every file the X server writes.
+func startXServer(bin string, args []string, num int, xstartup string, lg *os.File, logf string, up func(), fileCap int64) ([]byte, error) {
+	x := sys.Command(bin, args...)
 	x.Stdout, x.Stderr = lg, lg
 	x.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	sendTrace("guest-xserver-exec", "bin="+bin)
 	if err := x.Start(); err != nil {
 		return nil, err
 	}
-	if err := capFileSize(x.Process.Pid, xServerFileCap); err != nil {
-		fmt.Fprintf(lg, "andronix: no file size cap on Xvnc: %v\n", err)
+	if fileCap > 0 {
+		if err := capFileSize(x.Process.Pid, fileCap); err != nil {
+			fmt.Fprintf(lg, "andronix: no file size cap on %s: %v\n", bin, err)
+		}
 	}
 	sock := fmt.Sprintf("/tmp/.X11-unix/X%d", num)
-	for i := 0; i < 20; i++ {
+	// Every 25 ms for up to 10 s: at 500 ms steps the socket "appeared"
+	// 0.506 s after the exec on every phone (sv2-startup), hiding the real time.
+	for i := 0; i < 400; i++ {
 		if _, err := os.Stat(sock); err == nil {
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
 	if _, err := os.Stat(sock); err != nil {
 		x.Process.Kill()
 		b, _ := os.ReadFile(logf)
-		return b, fmt.Errorf("Xvnc didn't open display :%d", num)
+		return b, fmt.Errorf("%s didn't open display :%d", bin, num)
+	}
+	sendTrace("guest-xserver-socket")
+	if up != nil {
+		up()
 	}
 	s := sys.Command(xstartup)
 	s.Env = append(os.Environ(), fmt.Sprintf("DISPLAY=:%d", num))
-	// The session has its own log: in Xvnc's, a chatty session would
-	// bring the server to its file cap.
-	sl, err := os.OpenFile(strings.TrimSuffix(logf, ".log")+"-session.log", os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_APPEND, 0o644)
+	// The session has its own log: in the X server's, a chatty session
+	// would bring the server to its file cap. Appended to, so capLog can
+	// cut it while the session writes.
+	slog := strings.TrimSuffix(logf, ".log") + "-session.log"
+	sl, err := os.OpenFile(slog, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_APPEND, 0o644)
 	if err != nil {
-		sl = lg
+		sl, slog = lg, ""
 	} else {
 		defer sl.Close()
 	}
@@ -276,7 +364,36 @@ func startXvnc(num int, size, listen, passwd, xstartup, logf string, extra []str
 	}
 	x.Process.Release()
 	s.Process.Release()
+	if slog != "" {
+		go capLog(slog, sessionLogCap) // for as long as this process runs (the standalone display's helper)
+	}
 	return nil, nil
+}
+
+// sessionLogCap: the desktop session's log is cut to nothing past this.
+const sessionLogCap = 8 << 20
+
+// capLogEvery is how often capLog looks (tests make it short).
+var capLogEvery = 30 * time.Second
+
+// capLog checks path every capLogEvery and empties it when it's over max, with a
+// line saying so. Its writers append, so they go on from the start.
+func capLog(path string, max int64) {
+	for {
+		time.Sleep(capLogEvery)
+		st, err := os.Stat(path)
+		if err != nil {
+			return
+		}
+		if st.Size() > max {
+			if os.Truncate(path, 0) == nil {
+				if f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0); err == nil {
+					fmt.Fprintf(f, "andronix: this log went over %d MB and was emptied (%s)\n", max>>20, time.Now().Format(time.RFC3339))
+					f.Close()
+				}
+			}
+		}
+	}
 }
 
 func writeVNCPassword(path, pass string) error {
@@ -324,7 +441,7 @@ func VNCStop(args []string) error {
 		num = "1"
 	}
 	if _, err := strconv.Atoi(num); err != nil {
-		return ui.Errorf("Bad display", "'"+num+"' is not a display number.", "Try: vncserver-stop 1")
+		return ui.Errorf("bad_display", "Bad display", "'"+num+"' is not a display number.", "Try: vncserver-stop 1")
 	}
 	err := sys.Command("vncserver", "-kill", ":"+num).Run()
 	// No wrapper (or upstream's, which can't -kill): stop Xvnc by its lock.
@@ -380,7 +497,7 @@ func userNameProblem(s string) string {
 // set the desktop password. Replaces the old blue `dialog` screens.
 func SetupUser(preset string) error {
 	if os.Getuid() != 0 {
-		return ui.Errorf("Run this as root", "setup-user creates users, so it needs root.", "Start the distro with: andronix start <distro> --root")
+		return ui.Errorf("run_this_as_root", "Run this as root", "setup-user creates users, so it needs root.", "Start the distro with: andronix start <distro> --root")
 	}
 	rel := guestRelease()
 	d, err := conf.LoadDistro(rel.Get("ANDRONIX_DISTRO"))
@@ -395,8 +512,8 @@ func SetupUser(preset string) error {
 	// ANDRONIX_USER_PASSWORD and (optionally) ANDRONIX_VNC_PASSWORD.
 	if preset != "" {
 		pass := os.Getenv("ANDRONIX_USER_PASSWORD")
-		if !reUser.MatchString(preset) || preset == "root" || pass == "" {
-			return ui.Errorf("Can't set up that user", "setup-user --user needs a valid name and ANDRONIX_USER_PASSWORD.", "Example: ANDRONIX_USER_PASSWORD=secret andronix setup-user --user alex")
+		if !reUser.MatchString(preset) || preset == "root" || len(pass) < 4 {
+			return ui.Errorf("can_t_set_up_that_user", "Can't set up that user", "setup-user --user needs a valid name and ANDRONIX_USER_PASSWORD.", "Example: ANDRONIX_USER_PASSWORD=secret andronix setup-user --user alex")
 		}
 		if err := setLocale(os.Getenv("ANDRONIX_TZ"), os.Getenv("ANDRONIX_KEYBOARD")); err != nil {
 			return err
@@ -490,7 +607,7 @@ func setLocale(tz, kb string) error {
 	}
 	if kb != "" {
 		if !regexp.MustCompile(`^[a-z]{2,3}$`).MatchString(kb) {
-			return ui.Errorf("Unknown keyboard layout", "'"+kb+"' isn't a layout code.", "Use a code like us, gb or de.")
+			return ui.Errorf("unknown_keyboard_layout", "Unknown keyboard layout", "'"+kb+"' isn't a layout code.", "Use a code like us, gb or de.")
 		}
 		os.MkdirAll("/etc/andronix", 0o755)
 		os.WriteFile("/etc/andronix/keyboard", []byte(kb+"\n"), 0o644)
@@ -519,12 +636,12 @@ func createUser(fam *pkgmgr.Family, d *conf.Distro, name, pass, vncPass string) 
 		shell = "/bin/sh"
 	}
 	if err := run(fam.AddUser(name, shell), ""); err != nil {
-		return ui.Errorf("Couldn't create the user", err.Error(), "Run: andronix setup-user")
+		return ui.Errorf("couldn_t_create_the_user", "Couldn't create the user", err.Error(), "Run: andronix setup-user")
 	}
 	// Void's image has no /etc/shadow until pwconv runs.
 	run("[ -f /etc/shadow ] || ! command -v pwconv >/dev/null || pwconv", "")
 	if err := run("chpasswd", name+":"+pass+"\n"); err != nil {
-		return ui.Errorf("Couldn't set the password", err.Error(), "Run: passwd "+name)
+		return ui.Errorf("couldn_t_set_the_password", "Couldn't set the password", err.Error(), "Run: passwd "+name)
 	}
 	os.MkdirAll("/etc/sudoers.d", 0o755)
 	// By user name: under proot the process's supplementary groups are
@@ -597,13 +714,53 @@ func Welcome() error {
 	}
 	fmt.Println()
 	fmt.Println("  " + ui.Bold(ui.BrandS("andronix")+"."+" Welcome to Andronix | "+rel.Get("ANDRONIX_NAME")))
-	if _, err := sys.LookPath("Xvnc"); err == nil {
-		ui.Note("Desktop: type exit, then in Termux: andronix desktop " + rel.Get("ANDRONIX_DISTRO") + " (Termux:X11). Or VNC here: vncserver-start.")
-	} else {
-		ui.Note("Leave with: exit")
-	}
+	_, vncErr := sys.LookPath("Xvnc")
+	_, xvfbErr := sys.LookPath("Xvfb")
+	ui.Note(welcomeDesktopLine(standaloneHost(), vncErr == nil, xvfbErr == nil, guestDesktop(), os.Getenv("ANDRONIX_BLOCKED_DESKTOPS"), rel.Get("ANDRONIX_DISTRO")))
 	fmt.Println()
 	return nil
+}
+
+// welcomeDesktopLine is the Welcome banner's desktop hint. In the app,
+// ANDRONIX_BLOCKED_DESKTOPS lists the desktops it won't open on this device
+// (installer ids, comma-separated, or "all"; set on kernels before 4.8,
+// card #138): then the desktop isn't offered, LXQt is if it isn't blocked.
+func welcomeDesktopLine(standalone, vnc, xvfb bool, de, blocked, distro string) string {
+	switch {
+	case standalone && (vnc || xvfb) && desktopBlocked(de, blocked):
+		line := "Desktop: not available on this device (needs Linux kernel 4.8 or newer)."
+		if de != "lxqt" && !desktopBlocked("lxqt", blocked) {
+			line += " LXQt works here: add it from the Andronix app."
+		}
+		return line
+	case standalone && (vnc || xvfb):
+		// The Andronix app opens the desktop itself.
+		return "Desktop: open it from the Andronix app."
+	case vnc:
+		return "Desktop: type exit, then in Termux: andronix desktop " + distro + " (Termux:X11). Or VNC here: vncserver-start."
+	}
+	return "Leave with: exit"
+}
+
+// desktopBlocked: de is in the comma-separated list, or the list is "all".
+func desktopBlocked(de, list string) bool {
+	for _, x := range strings.Split(list, ",") {
+		if x = strings.TrimSpace(strings.ToLower(x)); x != "" && (x == "all" || x == de) {
+			return true
+		}
+	}
+	return false
+}
+
+// guestDesktop is the installed desktop's id, from its session program
+// ("" when none is found).
+func guestDesktop() string {
+	for _, c := range []struct{ id, bin string }{{"xfce", "startxfce4"}, {"kde", "startplasma-x11"}, {"mate", "mate-session"}, {"lxqt", "startlxqt"}} {
+		if _, err := sys.LookPath(c.bin); err == nil {
+			return c.id
+		}
+	}
+	return ""
 }
 
 // syncSkel copies what's in skel but missing from home into home (owned

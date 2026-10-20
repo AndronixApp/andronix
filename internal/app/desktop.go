@@ -33,6 +33,8 @@ echo $$ >"/tmp/andronix-session-$(id -u).pid"
 unset SESSION_MANAGER
 unset DBUS_SESSION_BUS_ADDRESS
 export PULSE_SERVER=127.0.0.1
+# The Andronix app's own sound: the distro's PulseAudio (andronix sound).
+[ "$ANDRONIX_HOST" = standalone ] && export PULSE_SERVER=unix:/tmp/.andronix-pulse/native
 # Firefox's sandboxes can't start under proot: without these, pages render
 # no text (content) and no audio plays at all, AAC, Opus or MP3 (the RDD
 # and utility decoder processes), so YouTube is silent or won't start.
@@ -43,11 +45,25 @@ export MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_RDD_SANDBOX=1 MOZ_DISABLE_UTILI
 export MOZ_SHM_NO_SEALS=1
 # No crash-reporter helper process (Android's phantom process killer).
 export MOZ_CRASHREPORTER_DISABLE=1
+# GIO's volume monitors (udisks2, MTP, gphoto2, AFC, GOA) and gvfsd-fuse
+# find nothing under proot and count toward Android's 32-process cap
+# (#172); gvfsd and gvfsd-metadata stay (Thunar's trash and recent files).
+export GIO_USE_VOLUME_MONITOR=unix GVFS_DISABLE_FUSE=1
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-$(id -u)}"
 mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 # Performance profile (andronix tune): the light layer goes first.
 if [ "$(cat /etc/andronix/profile 2>/dev/null)" = light ] && [ -d /etc/xdg/andronix-light ]; then
     export XDG_CONFIG_DIRS="/etc/xdg/andronix-light:${XDG_CONFIG_DIRS:-@XDGDIRS@}"
+fi
+# The Andronix app's own display (ANDRONIX_HOST=standalone): its layer
+# (compositing off) goes first; a user's own setting in ~/.config wins.
+if [ "$ANDRONIX_HOST" = standalone ] && [ -d /etc/xdg/andronix-standalone ]; then
+    export XDG_CONFIG_DIRS="/etc/xdg/andronix-standalone:${XDG_CONFIG_DIRS:-@XDGDIRS@}"
+fi
+# Safe mode (andronix display --safe, after a black desktop): its layer
+# (the light profile's settings) goes before everything.
+if [ "$ANDRONIX_SAFE" = 1 ] && [ -d /etc/xdg/andronix-safe ]; then
+    export XDG_CONFIG_DIRS="/etc/xdg/andronix-safe:${XDG_CONFIG_DIRS:-@XDGDIRS@}"
 fi
 [ -r "$HOME/.Xresources" ] && xrdb "$HOME/.Xresources"
 # Keyboard layout chosen at first boot (andronix setup-user).
@@ -175,7 +191,7 @@ func setupDesktop(ctx context.Context, in *Inst, de *conf.Desktop, t *proot.Targ
 	if !profileSet(root) {
 		if ram := sys.TotalRAMMB(); ram > 0 && ram < AutoLightBelow {
 			profile = "light"
-			r.Detail(fmt.Sprintf("light profile (%d MB RAM)", ram))
+			ui.DetailOf(r, "desktop.light", fmt.Sprintf("light profile (%d MB RAM)", ram), map[string]any{"ram_mb": ram})
 		}
 	}
 	if err := ApplyProfile(root, de, profile); err != nil {
@@ -298,12 +314,14 @@ func setWallpaper(ctx context.Context, root, de string, t *proot.Target) error {
 		// Termux:X11's "builtin".
 		var mons strings.Builder
 		for _, m := range []string{"monitorVNC-0", "monitorbuiltin", "monitor0", "monitorscreen", "monitorDisplayPort-0", "monitordefault"} {
-			// Zoomed (5) fills a landscape screen. Termux:X11 is usually a
-			// portrait phone, where zoom crops the wordmark: scaled (4) on
-			// the wallpaper's own base colour (#15110e) instead.
+			// Zoomed (5) fills a landscape screen. Termux:X11 ("builtin")
+			// is usually a portrait phone, and the standalone app's
+			// display (Xvfb's "screen") rotates, where zoom crops the
+			// wordmark: scaled (4) on the wallpaper's own base colour
+			// (#15110e) instead.
 			style := `          <property name="image-style" type="int" value="5"/>
 `
-			if m == "monitorbuiltin" {
+			if m == "monitorbuiltin" || m == "monitorscreen" {
 				style = `          <property name="image-style" type="int" value="4"/>
           <property name="rgba1" type="array">
             <value type="double" value="0.082353"/>
@@ -451,9 +469,8 @@ pref("fission.webContentIsolationStrategy", 2);
 pref("dom.ipc.processCount", 1);
 pref("dom.ipc.processCount.webIsolated", 1);
 // No fork server (a desktop with Firefox was 37 processes in the app,
-// Oct 7). Firefox ESR 153 ignores extensions.webextensions.remote and
-// browser.tabs.remote.separatePrivilegedContentProcess (measured): its
-// extension and about: processes stay.
+// Oct 7). The extension process stays (extensions.webextensions.remote
+// would move extensions into the main process: weaker isolation).
 pref("dom.ipc.forkserver.enable", false);
 // A blank home and new-tab page: Firefox's own pages run in a "Privileged
 // Content" process of their own, which then never starts (measured, a16).
@@ -473,17 +490,35 @@ pref("media.utility-process.enabled", true);
 `
 
 // phoneDefaults writes the settings that keep a desktop's process count
-// down: Firefox's (in every Firefox's defaults/pref, which package
-// upgrades leave alone) and no PulseAudio of the distro's own (sound goes
-// to Termux's, through PULSE_SERVER).
+// down: Firefox's and no PulseAudio of the distro's own (sound goes to
+// Termux's, through PULSE_SERVER).
+//
+// Firefox's prefs go into browser/defaults/preferences, which Firefox
+// reads after its own firefox.js: in defaults/pref (read before it) the
+// prefs firefox.js also sets were overridden, so three preallocated
+// content processes still started (#172: Firefox 8 processes, 5 with
+// this, Kali a16). defaults/pref keeps a copy for the prefs firefox.js
+// doesn't set, as before. Package upgrades leave both files alone.
 func phoneDefaults(root string) {
-	dirs, _ := filepath.Glob(filepath.Join(root, "usr/lib*/firefox*/defaults/pref"))
-	for _, d := range dirs {
-		os.WriteFile(filepath.Join(d, "andronix-phone.js"), []byte(firefoxPrefs), 0o644)
+	ffs, _ := filepath.Glob(filepath.Join(root, "usr/lib*/firefox*"))
+	for _, ff := range ffs {
+		if d := filepath.Join(ff, "defaults/pref"); isDir(d) {
+			os.WriteFile(filepath.Join(d, "andronix-phone.js"), []byte(firefoxPrefs), 0o644)
+		}
+		if isDir(filepath.Join(ff, "browser")) {
+			d := filepath.Join(ff, "browser/defaults/preferences")
+			os.MkdirAll(d, 0o755)
+			os.WriteFile(filepath.Join(d, "andronix-phone.js"), []byte(firefoxPrefs), 0o644)
+		}
 	}
 	d := filepath.Join(root, "etc/pulse/client.conf.d")
 	if _, err := os.Stat(filepath.Join(root, "etc/pulse")); err == nil {
 		os.MkdirAll(d, 0o755)
 		os.WriteFile(filepath.Join(d, "00-andronix.conf"), []byte("# Andronix: sound goes to Termux's PulseAudio (PULSE_SERVER); never start one in the distro.\nautospawn = no\n"), 0o644)
 	}
+}
+
+func isDir(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.IsDir()
 }

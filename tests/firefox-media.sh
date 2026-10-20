@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Firefox with the installer's phone prefs (firefoxPrefs in
-# internal/app/desktop.go, written to defaults/pref/andronix-phone.js) must
+# internal/app/desktop.go, written to defaults/pref and browser/defaults/preferences, where they take effect) must
 # still play media: H.264 and VP9 video, AAC, Opus and MP3 audio, and draw
 # a canvas. Prefs that move media into the parent process broke this
 # (2.0.1-rc1: every video NotSupportedError, AAC never played).
@@ -25,6 +25,7 @@ ffmpeg -loglevel error -y -f lavfi -i sine=duration=5 -c:a aac a.m4a
 ffmpeg -loglevel error -y -f lavfi -i sine=duration=5 -c:a libopus a.opus.webm
 ffmpeg -loglevel error -y -f lavfi -i sine=duration=5 a.mp3
 cp /w/andronix-phone.js /usr/lib/firefox-esr/defaults/pref/andronix-phone.js
+mkdir -p /usr/lib/firefox-esr/browser/defaults/preferences && cp /w/andronix-phone.js /usr/lib/firefox-esr/browser/defaults/preferences/andronix-phone.js
 python3 -m http.server 8000 >/tmp/http.log 2>&1 &
 sleep 1
 HOME=/tmp timeout 60 firefox-esr --headless --no-remote --profile "$(mktemp -d)" http://127.0.0.1:8000/media.html >/dev/null 2>&1 || true

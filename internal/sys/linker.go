@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -27,9 +28,39 @@ var (
 // FixLinkerArgs must run first in main. Started through the linker, Go
 // sees the program's path as os.Args[1] (bionic moves argv only for C
 // programs); it is dropped so commands parse as usual.
+//
+// The Andronix app starts us the same way when Android unpacked its native
+// libraries without the exec bit (some Samsung phones, #229), and sets
+// ANDRONIX_EXEC_VIA_LINKER=1, which also forces linker execs when we were
+// started directly (for tests with chmod 644).
 func FixLinkerArgs() {
 	exe, _ := os.Readlink("/proc/self/exe")
 	os.Args = fixLinkerArgs(exe, os.Getenv("TERMUX_EXEC__PROC_SELF_EXE"), os.Args)
+	if linkerPath == "" && os.Getenv("ANDRONIX_EXEC_VIA_LINKER") == "1" {
+		linkerPath = systemLinker()
+	}
+}
+
+// systemLinker is Android's linker for our CPU.
+func systemLinker() string {
+	if strconv.IntSize == 32 {
+		return "/system/bin/linker"
+	}
+	return "/system/bin/linker64"
+}
+
+// linkerRuns reports whether the linker can run p although it has no exec
+// bit: we run through the linker, and p is an ELF in app data (the app's
+// nativeLibraryDir unpacked 0644: PROOT_BIN was "missing", #229). The
+// linker only maps the file, which needs no exec bit.
+func linkerRuns(p string) bool {
+	if linkerPath == "" {
+		return false
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	return strings.HasPrefix(p, appData) && isELF(p)
 }
 
 func fixLinkerArgs(exe, self string, args []string) []string {

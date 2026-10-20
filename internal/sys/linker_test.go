@@ -71,3 +71,31 @@ func TestLinkerExec(t *testing.T) {
 		t.Errorf("system binary rewritten: %s", p)
 	}
 }
+
+// The app's nativeLibraryDir unpacked 0644 (#229): through the linker, a
+// readable ELF there is runnable, so PROOT_BIN isn't "missing".
+func TestLinkerNoExecBit(t *testing.T) {
+	d := t.TempDir()
+	elf := filepath.Join(d, "libproot.so")
+	os.WriteFile(elf, []byte("\x7fELF rest"), 0o644)
+	text := filepath.Join(d, "notes")
+	os.WriteFile(text, []byte("hi"), 0o644)
+	defer func(a string) { appData, linkerPath, selfPath = a, "", "" }(appData)
+	appData = d + "/"
+
+	linkerPath = ""
+	if _, err := LookPath(elf); err == nil {
+		t.Errorf("started directly: 0644 ELF found")
+	}
+	linkerPath = "/system/bin/linker64"
+	if p, err := LookPath(elf); err != nil || p != elf {
+		t.Errorf("through the linker: %q %v", p, err)
+	}
+	if _, err := LookPath(text); err == nil {
+		t.Errorf("0644 non-ELF found")
+	}
+	appData = "/elsewhere/"
+	if _, err := LookPath(elf); err == nil {
+		t.Errorf("0644 ELF outside app data found")
+	}
+}

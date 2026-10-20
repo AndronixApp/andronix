@@ -214,12 +214,26 @@ func classifyX11(out string, err error) error {
 
 // HideExtraKeysOnce hides Termux:X11's extra-keys bar the first time a
 // desktop starts: it covers the bottom ~130 px, where docks and panels
-// sit. Only once (a marker in ~/.andronix), so a user who brings it back
-// with a three-finger swipe down keeps it. Call it after OpenX11App: on a
-// fresh install the app sets up its preferences when it first starts, and
-// a value written before that is lost (the call still succeeds). So the
-// setting is read back, tried a second time if it didn't stick, and the
-// marker is written only once it reads false. Reports whether it hid it.
+// sit. Only once (a marker in ~/.andronix), so a user who turns it back on
+// keeps it. Reports whether it hid it.
+//
+// It sets showAdditionalKbd:false — the extra-keys feature's master switch —
+// not additionalKbdVisible (the shown/hidden state). additionalKbdVisible
+// does not re-render the bar live: MainActivity.onPreferencesChanged ignores
+// that exact key. The old write-and-trust-additionalKbdVisible approach left
+// the bar up on the 1.03.01-fa3a8b4 nightly although the setting read back as
+// false (#260); the fa3a8b4 emulator A/B also showed that build opens more
+// than one Termux:X11 window, so driving the per-window toggle hid only one
+// of them. A showAdditionalKbd change, in contrast, is applied to every
+// window (the app broadcasts it to all instances and that key is not
+// ignored), so it removes the bar reliably on both builds — confirmed on the
+// emulator. The cost is that the three-finger swipe no longer brings it back;
+// a user re-enables it in Termux:X11's settings ("Show additional keys").
+//
+// The app can lose a preference written before it has started, so each pass
+// waits, writes, and reads it back; the marker is written only once the read
+// confirms the bar is off. Setting showAdditionalKbd only ever hides, so this
+// can never turn the bar on for a user who had it off.
 func HideExtraKeysOnce() bool {
 	if !isTermux() {
 		return false
@@ -228,32 +242,36 @@ func HideExtraKeysOnce() bool {
 	if _, err := os.Stat(marker); err == nil {
 		return false
 	}
-	for try := 1; try <= 2; try++ {
+	deadline := time.Now().Add(extraKeysDeadline)
+	for time.Now().Before(deadline) {
 		time.Sleep(extraKeysWait)
-		// additionalKbdVisible is the bar's current state; a three-finger
-		// swipe down (the default swipeDownAction) toggles it.
-		// showAdditionalKbd would remove the feature, so it's left alone.
-		out, err := sys.Command("termux-x11-preference", "additionalKbdVisible:false").CombinedOutput()
-		if err != nil {
-			Logf("x11: hiding the extra-keys bar failed (try %d): %v: %s", try, err, lastLines(string(out), 2))
-			continue
+		if x11Preference("showAdditionalKbd") == "false" {
+			markExtraKeysHidden(marker)
+			return true
 		}
-		if v := x11Preference("additionalKbdVisible"); v != "false" {
-			Logf("x11: the extra-keys bar setting didn't stick (try %d): additionalKbdVisible=%q", try, v)
-			continue
+		sys.Command("termux-x11-preference", "showAdditionalKbd:false").Run()
+		if x11Preference("showAdditionalKbd") == "false" {
+			markExtraKeysHidden(marker)
+			Logf("x11: hid Termux:X11's extra-keys bar (re-enable it in Termux:X11 settings)")
+			return true
 		}
-		os.MkdirAll(filepath.Dir(marker), 0o755)
-		os.WriteFile(marker, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o644)
-		Logf("x11: hid Termux:X11's extra-keys bar (first desktop; a three-finger swipe down brings it back)")
-		return true
 	}
 	Logf("x11: left the extra-keys bar as it is; the next andronix desktop tries again")
 	return false
 }
 
-// extraKeysWait is how long HideExtraKeysOnce gives the app to start
-// before each try.
-var extraKeysWait = 3 * time.Second
+func markExtraKeysHidden(marker string) {
+	os.MkdirAll(filepath.Dir(marker), 0o755)
+	os.WriteFile(marker, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o644)
+}
+
+// extraKeysWait is how long HideExtraKeysOnce waits between passes (the app
+// needs a moment to start and the X session to connect); extraKeysDeadline
+// bounds the whole attempt so a never-connecting session can't hang it.
+var (
+	extraKeysWait     = 3 * time.Second
+	extraKeysDeadline = 30 * time.Second
+)
 
 // x11Preference reads one Termux:X11 preference ("" if it can't).
 func x11Preference(key string) string {

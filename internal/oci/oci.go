@@ -73,6 +73,20 @@ func (im *Image) BlobURL(l Layer) string {
 	return "https://" + im.Ref.Host + "/v2/" + im.Ref.Repo + "/blobs/" + l.Digest
 }
 
+// RefreshToken fetches a fresh bearer for the image's registry. A blob
+// download can outlive the token the registry handed out (a large layer
+// over slow mobile data: support #243/#658 saw a 3703 s pull hit HTTP 401
+// when the bearer expired); the caller refreshes and resumes the blob
+// instead of restarting the whole image.
+func (im *Image) RefreshToken(ctx context.Context) error {
+	tok, err := token(ctx, im.Ref)
+	if err != nil {
+		return err
+	}
+	im.Token = tok
+	return nil
+}
+
 var reParam = regexp.MustCompile(`(\w+)="([^"]*)"`)
 
 func token(ctx context.Context, r Ref) (string, error) {

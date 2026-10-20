@@ -88,6 +88,9 @@ func normalise(a string) Arch {
 
 // Prefix is Termux's $PREFIX (or "" off Termux).
 func Prefix() string {
+	if Standalone() {
+		return ""
+	}
 	if p := os.Getenv("PREFIX"); strings.Contains(p, "com.termux") {
 		return p
 	}
@@ -98,7 +101,25 @@ func Prefix() string {
 }
 
 // IsTermux reports whether we run inside Termux (not inside a distro).
-func IsTermux() bool { return Prefix() != "" && os.Getenv("ANDRONIX_DISTRO") == "" }
+func IsTermux() bool { return Prefix() != "" && os.Getenv("ANDRONIX_DISTRO") == "" && !InGuest() }
+
+// InGuest reports whether this runs inside an installed distro, also when
+// sudo or su - dropped ANDRONIX_DISTRO from the environment.
+func InGuest() bool {
+	_, err := os.Stat("/etc/andronix-release")
+	return err == nil
+}
+
+// Standalone is Andronix's own app running andronix (ANDRONIX_HOST=
+// standalone, the UserLAnd model): no Termux. Its proot, loader and this
+// binary are in the app's nativeLibraryDir (PROOT_BIN, PROOT_LOADER), its
+// files under ANDRONIX_HOME; nothing is installed on the host side.
+func Standalone() bool {
+	return os.Getenv("ANDRONIX_HOST") == "standalone" && os.Getenv("ANDRONIX_DISTRO") == "" && !InGuest()
+}
+
+// OnAndroid is andronix on the phone itself, in Termux or the app.
+func OnAndroid() bool { return IsTermux() || Standalone() }
 
 // Home is $HOME, falling back to Termux's home.
 func Home() string {

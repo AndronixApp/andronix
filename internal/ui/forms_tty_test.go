@@ -17,7 +17,7 @@ func TestPromptNeedsATerminal(t *testing.T) {
 	defer func() { os.Stdin, Interactive = old, oldI }()
 	check := func(what string, err error) {
 		var ue *UserError
-		if !errors.As(err, &ue) || ue.Class != "needs_a_terminal" {
+		if !errors.As(err, &ue) || ClassOf(ue) != "needs_a_terminal" {
 			t.Errorf("%s: %v", what, err)
 		}
 	}

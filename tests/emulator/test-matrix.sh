@@ -10,6 +10,8 @@
 #   --keep                 don't remove the distro after a passing test
 #   --src DIR              installer checkout to test (default: this repo, HEAD)
 #   --modded DIR           test Modded images: installs DIR/<distro>-*-<desktop>-modded-aarch64.tar.xz
+#   --env 'K=V ...'        extra environment for each install, e.g. a local image mirror
+#                          'ANDRONIX_MIRROR=http://127.0.0.1:8899' (adb reverse), or ANDRONIX_NO_IMAGE=1
 #   --app-context          run andronix inside the Termux app process (its seccomp filter and
 #                          SELinux domain, like a user), not via run-as; see app-context.sh
 #   (one of --port or --serial is required; real devices also need ALLOW_REAL_DEVICE=1)
@@ -63,6 +65,7 @@ while [ $# -gt 0 ]; do
         --keep) keep=1 ;;
         --modded) modded_dir=$(cd "$2" && pwd); shift ;;
         --app-context) app=1 ;;
+        --env) extra_env=$2; shift ;;
         --port) port=$2; shift ;;
         --reinstall-termux) reinstall=1 ;;
         --x11) x11=1 ;;
@@ -318,7 +321,7 @@ run_combo() {
     printf 'andronix remove %s --yes >/dev/null 2>&1; true\n' "$d" | with_timeout 300 $TSH >/dev/null 2>&1
 
     # 1. install
-    if ! printf '%s andronix install %s --de %s --yes --no-start; echo "EXIT=$?"\n' "$rootfs" "$d" "$de" |
+    if ! printf '%s %s andronix install %s --de %s --yes --no-start; echo "EXIT=$?"; grep -E "^(SOURCE|FALLBACK|PREBUILT)=" ~/.andronix/distros/%s/install.conf\n' "${extra_env:-}" "$rootfs" "$d" "$de" "$d" |
          with_timeout "$INSTALL_TIMEOUT" $TSH >"$dir/install.log" 2>&1 ||
        ! grep -q '^EXIT=0' "$dir/install.log"; then
         res=FAIL; note="install failed (see install.log)"
@@ -370,10 +373,13 @@ run_combo() {
         sleep 5; "$ADB" exec-out screencap -p >"$dir/x11.png"
         # The first desktop hides Termux:X11's extra-keys bar (it covers the
         # bottom panel); it must stick even when this run installed the app.
-        printf 'termux-x11-preference list | grep additionalKbdVisible; ls ~/.andronix/x11-extra-keys-hidden\n' |
+        # #260 sets showAdditionalKbd (the feature's master switch, applied to
+        # every window), not the per-window additionalKbdVisible, which isn't
+        # reliably persisted — so assert showAdditionalKbd.
+        printf 'termux-x11-preference list | grep -iE "showAdditionalKbd|additionalKbdVisible"; ls ~/.andronix/x11-extra-keys-hidden\n' |
             with_timeout 60 $TSH >"$dir/x11-extra-keys.txt" 2>&1
-        grep -q '"additionalKbdVisible"="false"' "$dir/x11-extra-keys.txt" ||
-            { res=FAIL; note="${note:+$note; }extra-keys bar not hidden ($(head -1 "$dir/x11-extra-keys.txt"))"; }
+        grep -q '"showAdditionalKbd"="false"' "$dir/x11-extra-keys.txt" ||
+            { res=FAIL; note="${note:+$note; }extra-keys bar not hidden ($(grep -i showAdditionalKbd "$dir/x11-extra-keys.txt" | head -1))"; }
         printf 'andronix desktop stop\n' | with_timeout 120 $TSH >"$dir/x11-stop.log" 2>&1
         for _ in $(seq 1 30); do kill -0 "$x11_session" 2>/dev/null || break; sleep 2; done
         kill "$x11_session" 2>/dev/null; wait "$x11_session" 2>/dev/null

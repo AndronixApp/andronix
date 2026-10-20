@@ -33,7 +33,8 @@ import (
 // A name Android says doesn't exist returns at once; with no forwarder
 // answering (none running, a stale file) the module is UNAVAIL and dns runs
 // as before. The forwarder exits when the session's process (pid) is gone.
-// musl distros (Alpine) have no NSS and keep resolv.conf only.
+// musl distros (Alpine) have no NSS and keep resolv.conf only. Termux and
+// the standalone app alike (sys.OnAndroid).
 
 const nssLine = "hosts: files andronix [NOTFOUND=return] dns"
 
@@ -45,11 +46,11 @@ var forwarders sync.Map // rootfs -> started, for this process
 // nsswitch line (again on every start: package upgrades can rewrite
 // nsswitch.conf), and a forwarder watching pid. Best effort, silent.
 func startSession(rootfs string, pid int) {
-	if os.Getenv("ANDRONIX_DNS") == "go" || !sys.IsTermux() {
+	if os.Getenv("ANDRONIX_DNS") == "go" || !sys.OnAndroid() {
 		return
 	}
 	if err := ensureNSS(rootfs, sys.DetectArch()); err != nil {
-		termux.Logf("dns: nss setup in %s: %v", rootfs, err)
+		termux.Logf("dnsfwd: nss setup in %s: %v", rootfs, err)
 	}
 	// One forwarder per distro for this process (an install runs proot
 	// dozens of times); one per desktop session, which outlives it.
@@ -58,8 +59,11 @@ func startSession(rootfs string, pid int) {
 			return
 		}
 	}
-	if err := spawnForwarder(rootfs, pid); err != nil {
-		termux.Logf("dns: forwarder for %s: %v", rootfs, err)
+	s := time.Now()
+	err := spawnForwarder(rootfs, pid)
+	sendTrace("dnsfwd", "ms="+strconv.FormatInt(time.Since(s).Milliseconds(), 10), "ok="+strconv.FormatBool(err == nil))
+	if err != nil {
+		termux.Logf("dnsfwd: no forwarder for %s: %v", rootfs, err)
 	}
 }
 

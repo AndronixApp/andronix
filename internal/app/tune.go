@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
@@ -65,6 +66,125 @@ func ApplyProfile(root string, de *conf.Desktop, profile string) error {
 		return err
 	}
 	return writeXfconf(root, base, de.LightXfconf)
+}
+
+// standaloneXfconf is the standalone app's layer: no compositing in
+// xfwm4 (S24 Ultra 170 -> 200 in glmark2, and smoother dragging).
+var standaloneXfconf = []string{"xfwm4:/general/use_compositing:bool:false"}
+
+// ApplyStandaloneLayer writes /etc/xdg/andronix-standalone (used by the
+// session when ANDRONIX_HOST=standalone; see xstartup).
+func ApplyStandaloneLayer(root string) error {
+	base := filepath.Join(root, "etc/xdg/andronix-standalone")
+	os.RemoveAll(base)
+	if err := writeXfconf(root, base, standaloneXfconf); err != nil {
+		return err
+	}
+	// XFCE's clients start together, without Thunar's daemon (sessionstart.go).
+	if err := writeSessionLayer(root, base, true); err != nil {
+		return err
+	}
+	applyStandaloneHomes(root)
+	return nil
+}
+
+// safeKeys are what display --safe does, as the SAFE line names them:
+// software GL, a fresh saved session, and the light profile's settings.
+var safeKeys = []string{"swrender", "fresh_session", "light"}
+
+// writeSafeLayer writes /etc/xdg/andronix-safe: the light profile's
+// settings (whatever the install's profile) plus the standalone ones, for
+// a desktop started in safe mode (xstartup puts it first).
+func writeSafeLayer(root string, de *conf.Desktop) error {
+	base := filepath.Join(root, "etc/xdg/andronix-safe")
+	os.RemoveAll(base)
+	if de == nil || de.None() {
+		return nil
+	}
+	for _, n := range de.LightAutostartHide {
+		if err := writeFile(filepath.Join(base, "autostart", n+".desktop"),
+			"[Desktop Entry]\nType=Application\nName="+n+"\nExec=true\nHidden=true\n"); err != nil {
+			return err
+		}
+	}
+	if err := writeINI(root, base, de.LightXDGConfig); err != nil {
+		return err
+	}
+	return writeXfconf(root, base, append(append([]string{}, de.LightXfconf...), standaloneXfconf...))
+}
+
+// standaloneMarker records that a home got the standalone defaults.
+const standaloneMarker = ".config/andronix/standalone-defaults"
+
+// applyStandaloneHomes puts the standalone layer's settings into each
+// user's own xfconf files, once per home: a channel file in ~/.config wins
+// over every system layer, and xfconfd writes the whole channel there
+// (compositing on included) after a session without the layer, or one in
+// Termux before a backup moved here. After this one time, the user's own
+// choices stay.
+func applyStandaloneHomes(root string) {
+	homes := []string{filepath.Join(root, "root")}
+	if ents, err := os.ReadDir(filepath.Join(root, "home")); err == nil {
+		for _, e := range ents {
+			if e.IsDir() {
+				homes = append(homes, filepath.Join(root, "home", e.Name()))
+			}
+		}
+	}
+	for _, h := range homes {
+		if _, err := os.Stat(filepath.Join(h, standaloneMarker)); err == nil {
+			continue
+		}
+		for _, e := range standaloneXfconf {
+			f := strings.SplitN(e, ":", 4)
+			if len(f) != 4 {
+				continue
+			}
+			setXfconfFile(filepath.Join(h, ".config/xfce4/xfconf/xfce-perchannel-xml", f[0]+".xml"), f[1], f[2], f[3])
+		}
+		if st, err := os.Stat(h); err == nil {
+			p := filepath.Join(h, standaloneMarker)
+			os.MkdirAll(filepath.Dir(p), 0o755)
+			os.WriteFile(p, []byte("compositing off (standalone app)\n"), 0o644)
+			if s, ok := st.Sys().(*syscall.Stat_t); ok {
+				os.Lchown(filepath.Dir(p), int(s.Uid), int(s.Gid))
+				os.Lchown(p, int(s.Uid), int(s.Gid))
+			}
+		}
+	}
+}
+
+// setXfconfFile sets one property in a user's channel file, if the file
+// exists (without one, the system layers apply anyway).
+func setXfconfFile(p, prop, typ, val string) {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	var doc xnode
+	if xml.Unmarshal(b, &doc) != nil || doc.XMLName.Local != "channel" {
+		return
+	}
+	doc.setProp(strings.Split(strings.Trim(prop, "/"), "/"), typ, val)
+	var buf bytes.Buffer
+	buf.WriteString(xml.Header)
+	enc := xml.NewEncoder(&buf)
+	enc.Indent("", "  ")
+	if enc.Encode(doc) != nil {
+		return
+	}
+	buf.WriteString("\n")
+	st, _ := os.Stat(p)
+	tmp := p + ".andronix"
+	if os.WriteFile(tmp, buf.Bytes(), 0o644) == nil {
+		if st != nil {
+			if s, ok := st.Sys().(*syscall.Stat_t); ok {
+				os.Lchown(tmp, int(s.Uid), int(s.Gid))
+			}
+			os.Chmod(tmp, st.Mode().Perm())
+		}
+		os.Rename(tmp, p)
+	}
 }
 
 func writeFile(p, s string) error {
@@ -209,7 +329,7 @@ func Tune(name, profile string) error {
 	}
 	in := Open(d)
 	if !in.Installed() {
-		return ui.Errorf(d.Label()+" isn't installed", "There's nothing to tune.", "Install it first: andronix install "+d.ID)
+		return ui.Errorf("not_installed", d.Label()+" isn't installed", "There's nothing to tune.", "Install it first: andronix install "+d.ID)
 	}
 	de, _ := conf.ResolveDesktop(in.Get("DE"))
 	ram := sys.TotalRAMMB()
@@ -226,13 +346,13 @@ func Tune(name, profile string) error {
 		return nil
 	}
 	if profile != "light" && profile != "balanced" {
-		return ui.Errorf("Unknown profile '"+profile+"'", "Profiles are light and balanced.", "Try: andronix tune "+d.ID+" --profile light")
+		return ui.Errorf("unknown_profile", "Unknown profile '"+profile+"'", "Profiles are light and balanced.", "Try: andronix tune "+d.ID+" --profile light")
 	}
 	if de == nil || de.None() {
-		return ui.Errorf("No desktop to tune", d.Label()+" is installed without a desktop.", "Profiles only change the desktop.")
+		return ui.Errorf("no_desktop_to_tune", "No desktop to tune", d.Label()+" is installed without a desktop.", "Profiles only change the desktop.")
 	}
 	if err := ApplyProfile(in.Rootfs, de, profile); err != nil {
-		return ui.Errorf("Couldn't change the profile", err.Error(), "Run the same command again.")
+		return ui.Errorf("couldn_t_change_the_profile", "Couldn't change the profile", err.Error(), "Run the same command again.")
 	}
 	writeXstartup(in.Rootfs, de)
 	fmt.Println()
@@ -245,6 +365,8 @@ func Tune(name, profile string) error {
 // D-Bus): applies or resets the desktop's DE_LIGHT_GSETTINGS for the
 // current profile. Quiet; never fails the session.
 func SessionPrep() error {
+	sendTrace("guest-session-prep")
+	startAgent() // the Andronix app's launch agent (standalone only)
 	b, _ := os.ReadFile("/etc/andronix-release")
 	de, err := conf.ResolveDesktop(conf.Parse(b).Get("ANDRONIX_DE"))
 	if err != nil || len(de.LightGSettings) == 0 {

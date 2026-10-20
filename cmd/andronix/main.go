@@ -1,4 +1,5 @@
-// Command andronix installs and runs Linux distros in Termux.
+// Command andronix installs and runs Linux distros on Android: the Andronix
+// app's in-app runtime, or the command line in Termux.
 //
 //	andronix install <distro> [--de xfce|lxqt|mate|kde|lxde|none] [--yes] [--no-browser] [--no-start] [--reinstall]
 //	andronix start   <distro> [--root] [-- command...]
@@ -37,7 +38,7 @@ type args struct {
 }
 
 // valueFlags are the flags that take the next argument as their value.
-var valueFlags = map[string]bool{"de": true, "desktop": true, "wm": true, "user": true, "token": true, "to": true, "profile": true, "manifest": true, "edition": true, "channel": true, "message": true, "open": true, "attach": true}
+var valueFlags = map[string]bool{"de": true, "desktop": true, "wm": true, "user": true, "token": true, "to": true, "profile": true, "manifest": true, "edition": true, "channel": true, "message": true, "open": true, "port": true, "size": true, "max-size": true, "gpu": true, "gpu-socket": true, "bytes": true, "dpi": true, "progress": true, "attach": true}
 
 func parse(in []string, withValue map[string]bool) args {
 	a := args{flags: map[string]string{}}
@@ -125,6 +126,10 @@ func reportHelp() {
 }
 
 func help() {
+	if app.InApp() {
+		helpInApp()
+		return
+	}
 	fmt.Print(ui.Banner("Linux on Android " + ui.GSep + " " + app.VersionLabel()))
 	fmt.Println("  " + ui.Bold("Usage"))
 	for _, c := range []string{"andronix install debian --de xfce", "andronix start debian", "andronix desktop debian", "andronix update",
@@ -146,6 +151,19 @@ func help() {
 	ui.Row("vncserver-start", "or a VNC desktop (andronix vnc start)", 16)
 	ui.Row("vncserver-stop", "stop it (andronix vnc stop)", 16)
 	ui.Row("sudo andronix pack", "add dev packs: python, node, java, go, db", 16)
+	ui.Footer()
+}
+
+// helpInApp is 'andronix help' in the Andronix app: installing, opening
+// and removing distros and desktops are the app's; here, what works inside
+// a distro.
+func helpInApp() {
+	fmt.Print(ui.Banner("Linux on Android " + ui.GSep + " " + app.VersionLabel()))
+	fmt.Println("  Install, open, update and remove distros and desktops in the Andronix app.")
+	ui.Section("Inside a distro")
+	ui.Row("sudo andronix pack", "add dev packs: python, node, java, go, db", 18)
+	ui.Row("andronix report", "send us what went wrong (opens the app)", 18)
+	ui.Row("andronix version", "this runtime's version", 18)
 	ui.Footer()
 }
 
@@ -208,7 +226,16 @@ func main() {
 	if a.has("no-color") {
 		os.Setenv("NO_COLOR", "1")
 	}
-	ui.Init(a.has("plain"))
+	progressJSON := a.flags["progress"] == "json"
+	ui.Init(a.has("plain") || progressJSON)
+	if progressJSON {
+		// The app's install screen: events on stdout, everything else on stderr.
+		if jerr := ui.EnableJSON(); jerr != nil {
+			fmt.Fprintln(os.Stderr, "--progress json:", jerr)
+			os.Exit(2)
+		}
+		ui.Emit("hello", map[string]any{"v": 1, "installer": app.Version, "host": telemetry.Host(), "command": cmd})
+	}
 	if pastedTwice {
 		ui.Note("It looks like the command was pasted twice; running it once.")
 	}
@@ -243,7 +270,8 @@ func main() {
 		}
 		err = app.Install(ctx, app.InstallOpts{Distro: a.arg(0), Desktop: de, NoBrowser: a.has("no-browser"),
 			NoStart: a.has("no-start"), Reinstall: a.has("reinstall") || a.has("force"), NoUser: a.has("no-user"),
-			Modded: a.has("modded"), Token: a.flags["token"], Edition: a.flags["edition"]})
+			Modded: a.has("modded"), Token: a.flags["token"], Edition: a.flags["edition"], User: a.flags["user"],
+			ImageBuild: a.has("image-build")})
 	case "start", "login", "run":
 		// Everything after the distro name is the command, verbatim
 		// (flags included), so argv reaches the distro unchanged.
@@ -266,6 +294,8 @@ func main() {
 			Manifest: a.flags["manifest"], Token: a.flags["token"], Channel: a.flags["channel"]})
 	case "list", "ls":
 		err = app.List()
+	case "space-need":
+		err = app.SpaceNeedCmd(a.arg(0), a.flags["de"], a.has("json"))
 	case "report":
 		err = app.Report(ctx, a.has("dry-run"), a.flags["message"], a.flags["open"], a.flags["attach"])
 	case "clean":
@@ -273,8 +303,29 @@ func main() {
 	case "backup":
 		err = app.Backup(ctx, a.arg(0), a.arg(1), a.flags["to"] == "storage")
 	case "restore":
-		err = app.Restore(ctx, a.arg(0))
+		n, _ := strconv.ParseInt(a.flags["bytes"], 10, 64)
+		err = app.Restore(ctx, a.arg(0), a.has("replace"), n)
 	case "vnc":
+		// On the host (the standalone app): andronix vnc <distro> | stop.
+		if os.Getenv("ANDRONIX_DISTRO") == "" {
+			switch a.arg(0) {
+			case "stop":
+				err = app.VNCHostStop()
+			case "", "start", "help":
+				ui.Cmd("andronix vnc <distro> [--size 1280x720] [--dpi 160] [--unix | --tcp --port 5901]   (password: ANDRONIX_VNC_PASSWORD)")
+				ui.Cmd("andronix vnc stop")
+			default:
+				port := a.flags["port"]
+				if port == "" {
+					port = "5901"
+				}
+				// The standalone app gets a private Unix socket unless it asks
+				// for TCP (--tcp); elsewhere TCP stays the default.
+				unix := (sys.Standalone() || a.has("unix")) && !a.has("tcp")
+				err = app.VNCHost(ctx, a.arg(0), port, a.flags["size"], a.flags["dpi"], unix)
+			}
+			break
+		}
 		switch a.arg(0) {
 		case "start":
 			err = app.VNCStart(a.pos[1:], a.has("lan"))
@@ -283,6 +334,43 @@ func main() {
 		default:
 			ui.Cmd("vncserver-start [WIDTHxHEIGHT] [display] [--lan]")
 			ui.Cmd("vncserver-stop [display]")
+		}
+	case "sound":
+		// Inside the distro (the standalone app): the distro's PulseAudio.
+		if a.arg(0) == "start" {
+			err = app.SoundStart()
+		}
+	case "launch":
+		// A distro's app in its running desktop (the app's shortcuts).
+		err = app.Launch(a.arg(0), a.arg(1))
+	case "session-agent":
+		err = app.SessionAgent()
+	case "apps":
+		// The distro's desktop apps, for the Andronix app's shortcuts.
+		err = app.Apps(a.arg(0), a.has("json"))
+	case "selfcheck":
+		// The standalone app's gate: can this phone run Linux from the app?
+		if err = app.SelfCheck(a.has("json")); err != nil {
+			os.Exit(1)
+		}
+	case "display":
+		// The standalone app's built-in display: on the host, andronix
+		// display <distro> | stop; inside the distro, display start (Xvfb +
+		// the session + the damage/input helper).
+		if os.Getenv("ANDRONIX_DISTRO") != "" {
+			if a.arg(0) == "start" {
+				err = app.DisplayStart(a.pos[1:], a.flags["max-size"], a.has("safe"))
+			}
+			break
+		}
+		switch a.arg(0) {
+		case "stop":
+			err = app.DisplayHostStop()
+		case "":
+			ui.Cmd("andronix display <distro> [--size 800x600] [--max-size 800x800] [--dpi 160] [--safe] [--gpu virgl --gpu-socket <path>]")
+			ui.Cmd("andronix display stop")
+		default:
+			err = app.DisplayHost(ctx, a.arg(0), a.flags["size"], a.flags["max-size"], a.flags["dpi"], a.flags["gpu"], a.flags["gpu-socket"], a.has("safe"))
 		}
 	case "pack", "packs":
 		switch rest := a.pos[min(1, len(a.pos)):]; a.arg(0) {
@@ -315,7 +403,14 @@ func main() {
 	case "session-prep":
 		err = app.SessionPrep()
 	case "setup-user":
-		err = app.SetupUser(a.flags["user"])
+		if os.Getenv("ANDRONIX_DISTRO") == "" && a.arg(0) != "" {
+			err = app.SetupUserHost(ctx, a.arg(0), a.flags["user"]) // outside: setup-user <distro> --user NAME
+		} else {
+			if a.has("secrets-stdin") {
+				app.ReadSecrets(os.Stdin) // passwords, never on a command line
+			}
+			err = app.SetupUser(a.flags["user"])
+		}
 	case "welcome":
 		err = app.Welcome()
 	case "version":
@@ -325,7 +420,13 @@ func main() {
 	case "report-help":
 		reportHelp()
 	default:
-		err = ui.Errorf("Unknown command '"+cmd+"'", "andronix doesn't have a '"+cmd+"' command.", "Run 'andronix help' to see what it can do.")
+		err = ui.Errorf("unknown_command", "Unknown command '"+cmd+"'", "andronix doesn't have a '"+cmd+"' command.", "Run 'andronix help' to see what it can do.")
+	}
+	if ui.JSON {
+		if err != nil && !errors.Is(err, ui.ErrCancelled) && !errors.Is(err, context.Canceled) {
+			ui.EmitError(err)
+		}
+		ui.EmitDone(err)
 	}
 	if errors.Is(err, app.ErrExplained) {
 		os.Exit(1)
@@ -339,6 +440,10 @@ func main() {
 				ui.Note("Stopped. Run the same command again to pick up where you left off.")
 			}
 			os.Exit(130)
+		}
+		var quiet *app.ExitError
+		if errors.As(err, &quiet) {
+			os.Exit(quiet.Code)
 		}
 		app.SaveFailure(cmd, a.arg(0), err)
 		ui.ShowError(err)

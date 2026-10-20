@@ -268,12 +268,7 @@ func guestFacts(r *problemReport) {
 	r.Doctor = b.String()
 	// proot fakes uname's release (--kernel-release): the phone's is in /proc.
 	if strings.HasSuffix(r.Device.Kernel, "-andronix") {
-		r.Device.Kernel = ""
-		if k := strings.TrimSpace(string(readFile("/proc/sys/kernel/osrelease"))); k != "" && !strings.HasSuffix(k, "-andronix") {
-			r.Device.Kernel = k
-		} else if f := strings.Fields(string(readFile("/proc/version"))); len(f) > 2 && f[1] == "version" {
-			r.Device.Kernel = f[2]
-		}
+		r.Device.Kernel = guestKernel(string(readFile("/proc/sys/kernel/osrelease")), string(readFile("/proc/version")))
 	}
 }
 
@@ -431,7 +426,7 @@ func Report(ctx context.Context, dryRun bool, message, openID, attach string) er
 	}
 	attach = strings.ToUpper(strings.TrimSpace(attach))
 	if attach != "" && !reportIDRe.MatchString(attach) {
-		return ui.Errorf("Not a report id", "'"+attach+"' doesn't look like AX-XXXXXX.", "Copy the id the Andronix app showed for your report.")
+		return ui.Errorf("not_a_report_id", "Not a report id", "'"+attach+"' doesn't look like AX-XXXXXX.", "Copy the id the Andronix app showed for your report.")
 	}
 	desc := clip(strings.TrimSpace(message), reportDescMax)
 	rep := buildReport(desc)
@@ -472,7 +467,7 @@ func Report(ctx context.Context, dryRun bool, message, openID, attach string) er
 	}
 	ui.Info("Report " + d.ID + " is ready. To add details or photos, open it in the Andronix app:")
 	fmt.Println("  " + d.Link)
-	if inDistro() {
+	if inDistro() && !standaloneHost() {
 		ui.Note("Or open it from Termux: andronix report --open " + d.ID)
 	}
 	ok, err = ui.Confirm("Send it now without the app?", "", true)
@@ -488,7 +483,7 @@ func Report(ctx context.Context, dryRun bool, message, openID, attach string) er
 			return nil
 		})
 		if err != nil {
-			return ui.Errorf("No description", "Sending without the app needs a line about what happened.", `Add it: andronix report --message "what happened"`)
+			return ui.Errorf("no_description", "No description", "Sending without the app needs a line about what happened.", `Add it: andronix report --message "what happened"`)
 		}
 		desc = clip(newRedactor().do(strings.TrimSpace(desc)), reportDescMax)
 	}
@@ -514,7 +509,7 @@ type reportDraft struct {
 }
 
 // inDistro: running inside a distro (the in-distro copy of andronix).
-func inDistro() bool { return os.Getenv("ANDRONIX_DISTRO") != "" }
+func inDistro() bool { return os.Getenv("ANDRONIX_DISTRO") != "" || inGuest() }
 
 // draftDir is where a draft waits: inside a distro its /tmp (Termux reads
 // it through the rootfs for --open), else ~/.andronix/report-drafts.
@@ -549,17 +544,17 @@ func findDraft(id string) *reportDraft {
 // openDraft is `andronix report --open AX-ID` (in Termux).
 func openDraft(ctx context.Context, id string) error {
 	if !reportIDRe.MatchString(id) {
-		return ui.Errorf("Not a report id", "'"+id+"' doesn't look like AX-XXXXXX.", "Copy the id andronix report printed.")
+		return ui.Errorf("not_a_report_id", "Not a report id", "'"+id+"' doesn't look like AX-XXXXXX.", "Copy the id andronix report printed.")
 	}
 	d := findDraft(id)
 	if d == nil {
-		return ui.Errorf("Report "+id+" isn't here", "There's no waiting report with that id on this phone.", "Run andronix report again.")
+		return ui.Errorf("report_not_found", "Report "+id+" isn't here", "There's no waiting report with that id on this phone.", "Run andronix report again.")
 	}
 	if t, err := time.Parse(time.RFC3339, d.ExpiresAt); err == nil && time.Now().After(t) {
-		return ui.Errorf("Report "+id+" expired", "Reports wait 24 hours for the app.", "Run andronix report again.")
+		return ui.Errorf("report_expired", "Report "+id+" expired", "Reports wait 24 hours for the app.", "Run andronix report again.")
 	}
 	if !openLink(d.Link) {
-		return ui.Errorf("Couldn't open the Andronix app", "Android didn't open the report link.", "Install or update the Andronix app, then run andronix report --open "+id+" again.")
+		return ui.Errorf("couldn_t_open_the_andronix_app", "Couldn't open the Andronix app", "Android didn't open the report link.", "Install or update the Andronix app, then run andronix report --open "+id+" again.")
 	}
 	ui.OK("Report " + id + " is in the Andronix app: add what happened, then send it there.")
 	return nil
@@ -598,7 +593,7 @@ func postDraft(ctx context.Context, rep *problemReport) (*reportDraft, error) {
 		var d reportDraft
 		status, err := postJSON(ctx, "/v1/reports?draft=1", body, nil, &d)
 		if err == nil && (!reportIDRe.MatchString(d.ID) || d.ClaimToken == "" || !strings.HasPrefix(d.Link, "andronix://report/draft/"+d.ID)) {
-			err = ui.Errorf("Couldn't send the report", "The report service's answer wasn't understood.", "Try again later, or email support@andronix.app.")
+			err = ui.Errorf("couldn_t_send_the_report", "Couldn't send the report", "The report service's answer wasn't understood.", "Try again later, or email support@andronix.app.")
 		}
 		switch {
 		case err == nil:
@@ -632,9 +627,9 @@ func finalizeDraft(ctx context.Context, d *reportDraft, desc string) error {
 			return nil
 		case status == http.StatusGone:
 			removeDraft(d.ID)
-			return ui.Errorf("Report "+d.ID+" expired", "Reports wait 24 hours.", "Run andronix report again.")
+			return ui.Errorf("report_expired", "Report "+d.ID+" expired", "Reports wait 24 hours.", "Run andronix report again.")
 		case status == http.StatusUnauthorized:
-			return ui.Errorf("Report "+d.ID+" was already sent", "The Andronix app (or another try) sent it.", "Nothing more to do. Quote "+d.ID+" if you ask for help.")
+			return ui.Errorf("report_already_sent", "Report "+d.ID+" was already sent", "The Andronix app (or another try) sent it.", "Nothing more to do. Quote "+d.ID+" if you ask for help.")
 		case status != 0 && status < 500:
 			return err
 		}
@@ -677,14 +672,14 @@ func postJSON(ctx context.Context, path string, body []byte, headers map[string]
 		}
 	}
 	if err != nil {
-		return 0, ui.Errorf("Couldn't send the report", "No connection to the report service.", "Check your internet and run andronix report again; it won't be filed twice.")
+		return 0, ui.Errorf("couldn_t_send_the_report", "Couldn't send the report", "No connection to the report service.", "Check your internet and run andronix report again; it won't be filed twice.")
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	st := resp.StatusCode
 	if st/100 == 2 {
 		if json.Unmarshal(b, out) != nil {
-			return st, ui.Errorf("Couldn't send the report", "The report service's answer wasn't understood.", "Try again later, or email support@andronix.app.")
+			return st, ui.Errorf("couldn_t_send_the_report", "Couldn't send the report", "The report service's answer wasn't understood.", "Try again later, or email support@andronix.app.")
 		}
 		return st, nil
 	}
@@ -700,9 +695,9 @@ func postJSON(ctx context.Context, path string, body []byte, headers map[string]
 		if n, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && n > 0 {
 			wait = fmt.Sprintf("%d minutes", (n+59)/60)
 		}
-		return st, ui.Errorf("Too many reports", "The report service limits how many reports a phone sends.", "Try again in "+wait+".")
+		return st, ui.Errorf("too_many_reports", "Too many reports", "The report service limits how many reports a phone sends.", "Try again in "+wait+".")
 	case st == http.StatusNotFound && e.Error == "disabled":
-		return st, ui.Errorf("Reports aren't open yet", "The report service isn't switched on.", "Ask on Discord (https://chat.andronix.app) or email support@andronix.app.")
+		return st, ui.Errorf("reports_aren_t_open_yet", "Reports aren't open yet", "The report service isn't switched on.", "Ask on Discord (https://chat.andronix.app) or email support@andronix.app.")
 	case st/100 == 4:
 		what := fmt.Sprintf("The report service refused it (%d %s).", st, e.Error)
 		if e.Message != "" {
@@ -711,7 +706,21 @@ func postJSON(ctx context.Context, path string, body []byte, headers map[string]
 				what += " (" + e.Field + ")"
 			}
 		}
-		return st, ui.Errorf("Couldn't send the report", what, "Update andronix (andronix update --self) and try again.")
+		return st, ui.Errorf("couldn_t_send_the_report", "Couldn't send the report", what, "Update andronix (andronix update --self) and try again.")
 	}
-	return st, ui.Errorf("Couldn't send the report", fmt.Sprintf("The report service answered %d.", st), "Try again later; it won't be filed twice.")
+	return st, ui.Errorf("couldn_t_send_the_report", "Couldn't send the report", fmt.Sprintf("The report service answered %d.", st), "Try again later; it won't be filed twice.")
+}
+
+// guestKernel is the phone's kernel release seen from inside a distro, or
+// "" when every source is proot's stand-in (6.12.0-andronix): sending that
+// made the desk's filter take a user's report for our test device
+// (support #498).
+func guestKernel(osrelease, version string) string {
+	if k := strings.TrimSpace(osrelease); k != "" && !strings.HasSuffix(k, "-andronix") {
+		return k
+	}
+	if f := strings.Fields(version); len(f) > 2 && f[1] == "version" && !strings.HasSuffix(f[2], "-andronix") {
+		return f[2]
+	}
+	return ""
 }

@@ -66,13 +66,23 @@ func (c *countReader) Read(p []byte) (int, error) {
 // ExtractFile unpacks one archive; call several times for image layers,
 // then Finish.
 func (x *Extractor) ExtractFile(p string) error {
-	x.init()
 	f, err := os.Open(p)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	st, _ := f.Stat()
+	err = x.ExtractReader(f)
+	if st != nil {
+		x.done += st.Size()
+	}
+	return err
+}
+
+// ExtractReader unpacks one archive (gzip, xz, zstd or plain tar) from r,
+// such as a backup streamed in on stdin.
+func (x *Extractor) ExtractReader(f io.Reader) error {
+	x.init()
 	cr := &countReader{r: f, x: x}
 	br := bufio.NewReaderSize(cr, 1<<20)
 	magic, _ := br.Peek(6)
@@ -99,11 +109,7 @@ func (x *Extractor) ExtractFile(p string) error {
 		r = zr
 	}
 	x.written = map[string]bool{}
-	err = x.extract(tar.NewReader(r))
-	if st != nil {
-		x.done += st.Size()
-	}
-	return err
+	return x.extract(tar.NewReader(r))
 }
 
 func cleanName(n string) (string, bool) {

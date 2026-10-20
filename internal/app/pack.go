@@ -74,11 +74,18 @@ func openPackPlace(distro, verb string, needRoot bool) (*packPlace, error) {
 		}
 		f, err := pkgmgr.Get(fam)
 		if err != nil {
-			return nil, ui.Errorf("Unknown package manager", "andronix can't tell which package manager this distro uses.", "Run it from Termux instead: andronix pack "+verb+" <distro> <pack>")
+			fix := "Run it from Termux instead: andronix pack " + verb + " <distro> <pack>"
+			if standaloneHost() {
+				fix = "Send a report so we can add it: andronix report"
+			}
+			return nil, ui.Errorf("unknown_package_manager", "Unknown package manager", "andronix can't tell which package manager this distro uses.", fix)
 		}
 		if needRoot && os.Geteuid() != 0 {
-			return nil, ui.Errorf("Packs need root", "Adding and removing packs installs packages.",
-				"Run it with sudo: sudo andronix pack "+verb+" <pack>. Without sudo (Manjaro), run it from Termux: andronix pack "+verb+" "+rel.Get("ANDRONIX_DISTRO")+" <pack>")
+			fix := "Run it with sudo: sudo andronix pack " + verb + " <pack>. Without sudo (Manjaro), run it from Termux: andronix pack " + verb + " " + rel.Get("ANDRONIX_DISTRO") + " <pack>"
+			if standaloneHost() {
+				fix = "Run it with sudo: sudo andronix pack " + verb + " <pack>"
+			}
+			return nil, ui.Errorf("packs_need_root", "Packs need root", "Adding and removing packs installs packages.", fix)
 		}
 		name := strings.Trim(rel.Get("ANDRONIX_NAME"), `"`)
 		if name == "" {
@@ -95,7 +102,7 @@ func openPackPlace(distro, verb string, needRoot bool) (*packPlace, error) {
 			}
 		}
 		if len(got) != 1 {
-			return nil, ui.Errorf("Which distro?", "Add the distro's name to the command.",
+			return nil, ui.Errorf("which_distro", "Which distro?", "Add the distro's name to the command.",
 				"For example: andronix pack "+verb+" debian python. 'andronix list' shows what's installed.")
 		}
 		distro = got[0]
@@ -106,7 +113,7 @@ func openPackPlace(distro, verb string, needRoot bool) (*packPlace, error) {
 	}
 	in := Open(d)
 	if !in.Installed() {
-		return nil, ui.Errorf(d.Label()+" isn't installed", "Packs go on top of an installed distro.", "Install it first: andronix install "+d.ID)
+		return nil, ui.Errorf("not_installed", d.Label()+" isn't installed", "Packs go on top of an installed distro.", "Install it first: andronix install "+d.ID)
 	}
 	f, err := pkgmgr.Get(d.Family)
 	if err != nil {
@@ -154,13 +161,13 @@ func (pp *packPlace) setChecked(id string, ok bool) {
 // loadPacks resolves pack names, with a friendly error for unknown ones.
 func loadPacks(names []string, verb string) ([]*conf.Pack, error) {
 	if len(names) == 0 {
-		return nil, ui.Errorf("Which pack?", "Name one or more packs.", "For example: andronix pack "+verb+" python. Packs: "+strings.Join(conf.PackIDs(), ", "))
+		return nil, ui.Errorf("which_pack", "Which pack?", "Name one or more packs.", "For example: andronix pack "+verb+" python. Packs: "+strings.Join(conf.PackIDs(), ", "))
 	}
 	var out []*conf.Pack
 	for _, n := range names {
 		p, err := conf.LoadPack(n)
 		if err != nil {
-			return nil, ui.Errorf("Unknown pack '"+n+"'", "There's no pack called '"+n+"'.", "Packs: "+strings.Join(conf.PackIDs(), ", "))
+			return nil, ui.Errorf("unknown_pack", "Unknown pack '"+n+"'", "There's no pack called '"+n+"'.", "Packs: "+strings.Join(conf.PackIDs(), ", "))
 		}
 		out = append(out, p)
 	}
@@ -238,7 +245,7 @@ func PackAdd(ctx context.Context, args []string) error {
 		return nil
 	}
 	if free := sys.FreeMB(pp.t.Rootfs); free >= 0 && free < int64(need+200) {
-		return ui.Errorf("Not enough space", fmt.Sprintf("These packs need about %d MB; there's %d MB free.", need+200, free),
+		return ui.Errorf("not_enough_space", "Not enough space", fmt.Sprintf("These packs need about %d MB; there's %d MB free.", need+200, free),
 			"Free some space on the phone, or add fewer packs at once.")
 	}
 	lg := NewLog("pack")
@@ -275,7 +282,7 @@ func PackAdd(ctx context.Context, args []string) error {
 					if cctx.Err() == context.DeadlineExceeded {
 						err = fmt.Errorf("the check didn't finish in 10 minutes")
 					}
-					return &ui.UserError{Title: p.Name + " was installed, but its check failed",
+					return &ui.UserError{Class: "pack_check_failed", Title: p.Name + " was installed, but its check failed",
 						What: "The pack's packages are in place, but a quick test of them didn't pass.",
 						Fix:  "Try removing and adding it again: " + pp.cmd + " remove " + p.ID + ", then add " + p.ID + ".", Err: err}
 				}
@@ -343,7 +350,7 @@ func packInstall(ctx context.Context, pp *packPlace, p *conf.Pack, r ui.Reporter
 	t, fam := pp.t, pp.fam
 	tokens := p.Packages(fam.ID)
 	if len(tokens) == 0 {
-		return ui.Errorf(p.Name+" isn't available on "+pp.label, "The "+p.ID+" pack has no package list for "+pp.label+".", "")
+		return ui.Errorf("pack_not_offered", p.Name+" isn't available on "+pp.label, "The "+p.ID+" pack has no package list for "+pp.label+".", "")
 	}
 	var alts []string
 	for _, tok := range tokens {
@@ -351,7 +358,7 @@ func packInstall(ctx context.Context, pp *packPlace, p *conf.Pack, r ui.Reporter
 	}
 	pkgs, skipped, missing := resolvePackages(tokens, lines(ctx, t, fam.FilterAvailable(alts)))
 	if missing != "" {
-		return ui.Errorf(p.Name+" isn't available on "+pp.label, "Its package '"+missing+"' isn't in "+pp.label+"'s repositories.",
+		return ui.Errorf("pack_not_offered", p.Name+" isn't available on "+pp.label, "Its package '"+missing+"' isn't in "+pp.label+"'s repositories.",
 			"Update the distro and try again: andronix update. If it still fails, this pack doesn't support "+pp.label+" yet.")
 	}
 	for _, s := range skipped {
@@ -386,7 +393,7 @@ func packInstall(ctx context.Context, pp *packPlace, p *conf.Pack, r ui.Reporter
 	}
 	if p.Post != "" {
 		if err := t.Run(ctx, p.Post, nil, func(l string) { r.Line(l) }); err != nil {
-			return &ui.UserError{Title: "Couldn't finish setting up " + p.Name, What: "The pack's setup command failed.",
+			return &ui.UserError{Class: "pack_setup_failed", Title: "Couldn't finish setting up " + p.Name, What: "The pack's setup command failed.",
 				Fix: "Run the same command again.", Err: err}
 		}
 	}
@@ -397,7 +404,7 @@ func packInstall(ctx context.Context, pp *packPlace, p *conf.Pack, r ui.Reporter
 	pp.setChecked(p.ID, false) // until the check passes
 	rootfs.EnsureBwrapShim(t.Rootfs)
 	rootfs.InstallShm(t.Rootfs) // andronix-postgres preloads it
-	r.Detail(fmt.Sprintf("%d packages", len(fresh)))
+	ui.DetailOf(r, "packages", fmt.Sprintf("%d packages", len(fresh)), map[string]any{"count": len(fresh)})
 	return nil
 }
 
@@ -510,7 +517,7 @@ func packRemove(ctx context.Context, pp *packPlace, p *conf.Pack, purge bool, r 
 		}
 	}
 	os.Remove(pp.statePath(p.ID))
-	r.Detail(fmt.Sprintf("%d packages", len(drop)))
+	ui.DetailOf(r, "packages", fmt.Sprintf("%d packages", len(drop)), map[string]any{"count": len(drop)})
 	return nil
 }
 

@@ -340,14 +340,28 @@ func msg(glyph string, st lipgloss.Style, text string) {
 	}
 }
 
-func Info(t string) { msg(GDot, sBrand, t) }
-func OK(t string)   { msg(GOK, sOK, t) }
-func Warn(t string) { msg(GWarn, sWarn, t) }
-func Fail(t string) { msg(GFail, sFail, t) }
-func Hint(t string) { msg(GArrow, sWarn, t) }
+func Info(t string) { Emit("note", map[string]any{"text": t}); msg(GDot, sBrand, t) }
+func OK(t string)   { Emit("note", map[string]any{"text": t}); msg(GOK, sOK, t) }
+func Warn(t string) { Emit("warn", map[string]any{"text": t}); msg(GWarn, sWarn, t) }
+func Fail(t string) { Emit("warn", map[string]any{"text": t}); msg(GFail, sFail, t) }
+
+// NoteKey and WarnKey are Note and Warn with a stable key for
+// --progress json, so the app can show its own (translated) text.
+func NoteKey(key, t string) { Emit("note", map[string]any{"key": key, "text": t}); noteText(t) }
+func WarnKey(key, t string) {
+	Emit("warn", map[string]any{"key": key, "text": t})
+	msg(GWarn, sWarn, t)
+}
+
+func Hint(t string) { Emit("note", map[string]any{"text": t}); msg(GArrow, sWarn, t) }
 
 // Note is muted, indented text.
 func Note(t string) {
+	Emit("note", map[string]any{"text": t})
+	noteText(t)
+}
+
+func noteText(t string) {
 	if Plain {
 		fmt.Println("  " + t)
 		return
@@ -423,9 +437,11 @@ func (e *UserError) Error() string {
 
 func (e *UserError) Unwrap() error { return e.Err }
 
-// Errorf builds a UserError.
-func Errorf(title, what, fix string) *UserError {
-	return &UserError{Title: title, What: what, Fix: fix}
+// Errorf builds a UserError. class is its fixed name for telemetry,
+// --progress json and problem reports (docs/progress-json.md lists them):
+// titles change, classes don't.
+func Errorf(class, title, what, fix string) *UserError {
+	return &UserError{Class: class, Title: title, What: what, Fix: fix}
 }
 
 // ReportHint is the error box's last line.

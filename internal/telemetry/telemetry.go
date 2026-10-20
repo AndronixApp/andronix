@@ -125,7 +125,9 @@ func id() string {
 
 // Notice prints the one-line notice the first time events are sent.
 func Notice() {
-	if !Enabled() {
+	// The standalone app asks for consent itself (and passes
+	// ANDRONIX_NO_TELEMETRY=1 when the user said no).
+	if !Enabled() || host() == "standalone" {
 		return
 	}
 	mu.Lock()
@@ -181,11 +183,19 @@ func build(name string, props map[string]any) Event {
 	// Which Termux: its version and the app's package (com.termux, or a
 	// fork's), so "unknown" flavors can be told apart (2.0.4).
 	if h := host(); h == "termux" {
-		if v := token(os.Getenv("TERMUX_VERSION")); v != "" {
+		if v := token(sys.TermuxVersion()); v != "" {
 			p["termux_version"] = v
 		}
 		if pk := termuxPackage(); pk != "" {
 			p["termux_pkg"] = pk
+		}
+		// Play's applib link (support #358) and a run without Termux's
+		// session environment (su, SSH, env -i, Tasker).
+		if st := sys.AppLibState(); st != "missing" || termuxFlavor() == "google_play_store" {
+			p["applib"] = st
+		}
+		if sys.TermuxEnvMissing() {
+			p["termux_env"] = "missing"
 		}
 	}
 	for k, v := range props {
@@ -235,9 +245,12 @@ func androidSDK() int { return sys.AndroidSDK() }
 // host is where andronix runs, exactly one of products-api's enum: termux,
 // standalone (Andronix's own app: ANDRONIX_HOST=standalone), distro
 // (inside one), or linux; app hosts are never counted as an unknown Termux.
+// Host is host() for others (andronix --progress json's hello).
+func Host() string { return host() }
+
 func host() string {
 	switch {
-	case os.Getenv("ANDRONIX_DISTRO") != "":
+	case os.Getenv("ANDRONIX_DISTRO") != "" || sys.InGuest():
 		return "distro"
 	case os.Getenv("ANDRONIX_HOST") == "standalone":
 		return "standalone"
@@ -274,21 +287,13 @@ func termuxPackage() string {
 	return ""
 }
 
-// termuxFlavor is which Termux build: google_play_store, f_droid, github,
-// or "" off Termux (TERMUX_APK_RELEASE, else TERMUX_VERSION).
+// termuxFlavor is which Termux build (sys.TermuxFlavor), "" outside
+// Termux (the standalone app, or inside a distro).
 func termuxFlavor() string {
 	if h := host(); h != "termux" && h != "linux" {
-		return "" // the standalone app, or inside a distro: no Termux to name
+		return ""
 	}
-	if r := os.Getenv("TERMUX_APK_RELEASE"); r != "" {
-		return strings.ToLower(r)
-	}
-	if v := os.Getenv("TERMUX_VERSION"); strings.HasPrefix(v, "googleplay") {
-		return "google_play_store"
-	} else if v != "" {
-		return "unknown"
-	}
-	return ""
+	return sys.TermuxFlavor()
 }
 
 var slug = regexp.MustCompile(`[^a-z0-9]+`)

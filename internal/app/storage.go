@@ -30,7 +30,7 @@ func ensureStorage() (string, error) {
 	if os.Getenv("ANDRONIX_STORAGE") == "" {
 		if _, err := os.Stat(shared); err != nil {
 			if _, err := sys.LookPath("termux-setup-storage"); err != nil {
-				return "", ui.Errorf("No access to phone storage", "Termux can't see your phone's shared storage.",
+				return "", ui.Errorf("no_access_to_phone_storage", "No access to phone storage", "Termux can't see your phone's shared storage.",
 					"Run termux-setup-storage, allow access, then try again.")
 			}
 			ui.Info("Android will ask to let Termux use your files. Tap Allow.")
@@ -42,13 +42,13 @@ func ensureStorage() (string, error) {
 				time.Sleep(500 * time.Millisecond)
 			}
 			if _, err := os.Stat(shared); err != nil {
-				return "", ui.Errorf("No access to phone storage", "Storage access wasn't granted.",
+				return "", ui.Errorf("no_access_to_phone_storage", "No access to phone storage", "Storage access wasn't granted.",
 					"Run termux-setup-storage, tap Allow, then run the same command again.")
 			}
 		}
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", ui.Errorf("Can't write to phone storage", err.Error(), "Check the phone has free space, then try again.")
+		return "", ui.Errorf("can_t_write_to_phone_storage", "Can't write to phone storage", err.Error(), "Check the phone has free space, then try again.")
 	}
 	return dir, nil
 }
@@ -85,7 +85,7 @@ func findBackups() []backupFile {
 func pickBackup() (string, error) {
 	list := findBackups()
 	if len(list) == 0 {
-		return "", ui.Errorf("No backups found", "There are no Andronix backups in "+ui.Tilde(StorageDir())+" or your Termux home.",
+		return "", ui.Errorf("no_backups_found", "No backups found", "There are no Andronix backups in "+ui.Tilde(StorageDir())+" or your Termux home.",
 			"Make one with: andronix backup <distro> --to storage")
 	}
 	if !ui.Interactive {

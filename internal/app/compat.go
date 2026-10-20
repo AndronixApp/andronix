@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	andronix "github.com/AndronixApp/andronix-distros"
 	"github.com/AndronixApp/andronix-distros/internal/compat"
@@ -41,16 +42,51 @@ func prootExecError(detail, distro, termux string, arch sys.Arch) *ui.UserError 
 		e.Fix = "Install Termux from F-Droid (f-droid.org/packages/com.termux), then run the same command again. Back up first: switching Termux erases its files."
 		return e
 	}
+	if termux == "google_play_store" {
+		if st := sys.AppLibState(); st != "" && st != "link_ok" {
+			a := appLibError(st)
+			a.Kind, a.Detail = string(pkgmgr.KindProotExec), detail
+			return a
+		}
+	}
 	e.What = "proot couldn't start a program inside " + distro + " (" + detail + "). The download is fine; proot can't run it here."
 	e.Fix = "Send a report so we can look: andronix report"
 	return e
+}
+
+// appLibError is Play Store Termux with a broken applib link (support
+// #358): its proot can't start any program until Termux remakes the link.
+func appLibError(state string) *ui.UserError {
+	what := map[string]string{
+		"dir":      "it's a folder instead of a link",
+		"missing":  "it's missing",
+		"link_bad": "it points to the wrong place",
+	}[state]
+	if what == "" {
+		what = "it isn't right"
+	}
+	return &ui.UserError{Title: "Termux needs its program link back", Class: "termux_applib",
+		What: "Termux from the Play Store starts Linux programs through a link to its own app files (~/../applib), and on this phone " + what + ". Until it's fixed, proot can't start anything.",
+		Fix:  "Run rm -rf ~/../applib, then close Termux completely (Android Settings > Apps > Termux > Force stop), open it again and run the same command: Termux remakes the link when it starts. If it still fails, use Termux from F-Droid (f-droid.org/packages/com.termux); uninstalling the Play Store Termux erases everything inside Termux."}
+}
+
+// appLibCheck refuses to start on Play Store Termux whose applib link is
+// broken, before anything is downloaded.
+func appLibCheck() error {
+	if !sys.IsTermux() || sys.TermuxFlavor() != "google_play_store" {
+		return nil
+	}
+	if st := sys.AppLibState(); st != "link_ok" {
+		return appLibError(st)
+	}
+	return nil
 }
 
 func init() {
 	// Every proot run gets the rules' env (e.g. PROOT_NO_SECCOMP), from
 	// what's known without a distro: the host and a cached probe.
 	proot.EnvHook = func() []string {
-		if !sys.IsTermux() {
+		if !sys.OnAndroid() {
 			return nil
 		}
 		return newCompat(nil, "").plan.EnvList()
@@ -124,7 +160,12 @@ func (c *compatRun) warnings(shown map[string]bool) {
 	for _, w := range c.plan.Warnings {
 		if !shown[w] {
 			shown[w] = true
-			ui.Warn(compat.Message(w, c.facts.Probe))
+			// The standalone app keeps Linux alive itself (a foreground
+			// service), so the phantom-process advice is Termux's only.
+			if w == "phantom_process" && sys.Standalone() {
+				continue
+			}
+			ui.WarnKey(w, compat.Message(w, c.facts.Probe))
 		}
 	}
 }
@@ -152,7 +193,7 @@ func (c *compatRun) refuse(d *conf.Distro) error {
 	if c.plan.Refuse == "" {
 		return nil
 	}
-	return ui.Errorf(d.Label()+" can't run on this phone yet", compat.Message(c.plan.Refuse, c.facts.Probe),
+	return ui.Errorf("compat_refused", d.Label()+" can't run on this phone yet", compat.Message(c.plan.Refuse, c.facts.Probe),
 		"Tell us on Discord (https://chat.andronix.app) which phone you have.")
 }
 
@@ -174,6 +215,40 @@ func (c *compatRun) apply(root string, arch sys.Arch, lg *Logger) {
 		p := filepath.Join(root, "etc/apt/preferences.d/andronix-compat")
 		os.MkdirAll(filepath.Dir(p), 0o755)
 		os.WriteFile(p, []byte(b.String()), 0o644)
+	}
+	if c.facts.Probe != nil && c.facts.Probe.SVEMasked {
+		clearMesaShaderCacheOnce(root, lg)
+	}
+}
+
+// clearMesaShaderCacheOnce deletes Mesa's on-disk shader cache for root and
+// every user, once per distro, on phones that need the SVE cpuinfo mask
+// (#192). Mesa keeps already-compiled SVE shaders in ~/.cache/mesa_shader_cache*,
+// so even after the cpuinfo fix the first GL draw still SIGILLs until the
+// stale cache is gone. The distro's filesystem is on the host, so this is a
+// plain host-side delete. A marker makes it run only once.
+func clearMesaShaderCacheOnce(root string, lg *Logger) {
+	marker := filepath.Join(root, "var/lib/andronix/mesa-cache-cleared")
+	if _, err := os.Stat(marker); err == nil {
+		return
+	}
+	globs := []string{
+		filepath.Join(root, "root/.cache/mesa_shader_cache*"),
+		filepath.Join(root, "home/*/.cache/mesa_shader_cache*"),
+	}
+	n := 0
+	for _, g := range globs {
+		matches, _ := filepath.Glob(g)
+		for _, m := range matches {
+			if err := os.RemoveAll(m); err == nil {
+				n++
+			}
+		}
+	}
+	os.MkdirAll(filepath.Dir(marker), 0o755)
+	os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644)
+	if n > 0 && lg != nil {
+		lg.Printf("compat: cleared %d Mesa shader cache(s) for the SVE fix (#192)", n)
 	}
 }
 
