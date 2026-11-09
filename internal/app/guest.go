@@ -288,19 +288,31 @@ func startXvnc(num int, size, listen, passwd, xstartup, logf string, extra []str
 	if listen == "no" {
 		local = "0"
 	}
+	args := xvncArgs(num, size, local, passwd, os.Getenv("ANDRONIX_VNC_UNIX"), extra)
+	return startXServer("Xvnc", args, num, xstartup, lg, logf, nil, xServerFileCap)
+}
+
+// xvncArgs builds Xvnc's command line. -nolisten local keeps Xvnc off the X11
+// abstract socket (@/tmp/.X11-unix/X<n>), which lives in the network namespace
+// proot does not isolate and so is shared by every app on the phone: another
+// app's X server on :<n> (for example a leftover Termux vncserver) would
+// otherwise hold it and ours would fail to start with "server already
+// running". The filesystem socket /tmp/.X11-unix/X<n> is private to our rootfs
+// and local X clients fall back to it, so the desktop still works (#344).
+// unixPath, when set, is the standalone app's private RFB Unix socket, used
+// instead of a TCP port (which any app on the phone could reach on 127.0.0.1).
+func xvncArgs(num int, size, local, passwd, unixPath string, extra []string) []string {
 	args := []string{fmt.Sprintf(":%d", num), "-desktop", "remote-desktop", "-localhost=" + local,
 		"-rfbport", strconv.Itoa(5900 + num), "-rfbauth", passwd, "-SecurityTypes", "VncAuth", "-depth", "24"}
-	// The standalone app's viewer: a Unix socket in the app's private
-	// storage, no TCP port (any app on the phone can reach 127.0.0.1).
-	if p := os.Getenv("ANDRONIX_VNC_UNIX"); p != "" {
+	if unixPath != "" {
 		args = []string{fmt.Sprintf(":%d", num), "-desktop", "remote-desktop", "-rfbport", "-1",
-			"-rfbunixpath", p, "-rfbunixmode", "0600", "-rfbauth", passwd, "-SecurityTypes", "VncAuth", "-depth", "24"}
+			"-rfbunixpath", unixPath, "-rfbunixmode", "0600", "-rfbauth", passwd, "-SecurityTypes", "VncAuth", "-depth", "24"}
 	}
+	args = append(args, "-nolisten", "local")
 	if size != "" {
 		args = append(args, "-geometry", size)
 	}
-	args = append(args, extra...)
-	return startXServer("Xvnc", args, num, xstartup, lg, logf, nil, xServerFileCap)
+	return append(args, extra...)
 }
 
 // xServerFileCap is the most an X server may write to any one file (its
@@ -420,9 +432,36 @@ func pidAlive(lock string) bool {
 	if len(f) < 3 || f[2] == "Z" { // gone, or a zombie
 		return false
 	}
-	// After Termux was killed the pid may belong to something else now.
+	// After Termux was killed the pid may belong to something else now, so
+	// only trust the lock when the pid is still an X server we'd start.
 	cmd, _ := os.ReadFile("/proc/" + pid + "/cmdline")
-	return strings.Contains(strings.ToLower(string(cmd)), "vnc")
+	return isXServer(string(cmd))
+}
+
+// xServers are the X server binaries Andronix or the app's Termux:X11 host
+// start and that write a /tmp/.X<n>-lock. The vnc wrappers are matched by the
+// "vnc" substring in isXServer, not here.
+var xServers = map[string]bool{
+	"x": true, "xorg": true, "xvnc": true, "xtigervnc": true,
+	"xvfb": true, "xephyr": true, "xwayland": true,
+}
+
+// isXServer reports whether a /proc cmdline (NUL-separated argv) is one of the
+// X servers we start. It is how pidAlive tells a live display from a stale
+// lock whose pid was reused by something unrelated after Termux was killed.
+// It recognises Xvfb (the Termux:X11 display host) as well as Xvnc, so a live
+// Xvfb's lock is no longer mistaken for stale and deleted out from under it
+// (#344).
+func isXServer(cmdline string) bool {
+	low := strings.ToLower(cmdline)
+	if strings.Contains(low, "vnc") { // Xvnc, Xtigervnc, the vncserver wrapper
+		return true
+	}
+	argv0 := low
+	if i := strings.IndexByte(low, 0); i >= 0 {
+		argv0 = low[:i]
+	}
+	return xServers[filepath.Base(argv0)]
 }
 
 // VNCStop is `vncserver-stop [display]`.
@@ -465,8 +504,6 @@ func VNCStop(args []string) error {
 	return nil
 }
 
-var reUser = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
-
 // userNameProblem says why s can't be the username typed at the prompt
 // ("" if it can), in words that point at the fix (support #220: a name
 // and a password with symbols typed together into the Username field).
@@ -478,6 +515,8 @@ func userNameProblem(s string) string {
 		return "no spaces: type only the name here; the password comes next"
 	case s == "root":
 		return "pick a name other than root"
+	case reservedUserName(s):
+		return "'" + s + "' is a reserved system name; pick another, e.g. alex"
 	case len(s) > 32:
 		return "use at most 32 characters"
 	case s != strings.ToLower(s) && userNameProblem(strings.ToLower(s)) == "":
@@ -491,6 +530,34 @@ func userNameProblem(s string) string {
 		}
 	}
 	return ""
+}
+
+// userNameTakenIn says why s can't be created in the rootfs at root ("" if it
+// can): a passwd or group entry already uses the name, or the aid_<user>
+// shadow entry the installer writes into the rootfs (configure.go) would
+// collide with an existing one. This is the precise, per-distro gate behind
+// the static reservedUserName list; it only catches what is actually in the
+// rootfs, so it needs the rootfs unpacked (an absent passwd/group reads as
+// "nothing taken").
+func userNameTakenIn(root, s string) string {
+	if _, _, _, ok := lookupUser(root, s); ok {
+		return s + " already exists in this distro; pick another name"
+	}
+	if groupExists(root, s) {
+		return s + " is already a group in this distro; pick another name"
+	}
+	if aid := "aid_" + s; lookupUserOrGroup(root, aid) {
+		return s + " can't be used here (it collides with " + aid + "); pick another name"
+	}
+	return ""
+}
+
+// lookupUserOrGroup reports whether name is a passwd user or a group in root.
+func lookupUserOrGroup(root, name string) bool {
+	if _, _, _, ok := lookupUser(root, name); ok {
+		return true
+	}
+	return groupExists(root, name)
 }
 
 // SetupUser is the first-boot setup: create a normal user with sudo and
@@ -512,8 +579,17 @@ func SetupUser(preset string) error {
 	// ANDRONIX_USER_PASSWORD and (optionally) ANDRONIX_VNC_PASSWORD.
 	if preset != "" {
 		pass := os.Getenv("ANDRONIX_USER_PASSWORD")
-		if !reUser.MatchString(preset) || preset == "root" || len(pass) < 4 {
+		if p := userNameProblem(preset); p != "" {
+			return ui.Errorf("can_t_set_up_that_user", "Can't set up "+preset, p, "Example: ANDRONIX_USER_PASSWORD=secret andronix setup-user --user alex")
+		}
+		if len(pass) < 4 {
 			return ui.Errorf("can_t_set_up_that_user", "Can't set up that user", "setup-user --user needs a valid name and ANDRONIX_USER_PASSWORD.", "Example: ANDRONIX_USER_PASSWORD=secret andronix setup-user --user alex")
+		}
+		// The rootfs is unpacked by now, so catch a distro-specific name the
+		// static list misses (and the aid_<user> collision) before useradd
+		// fails at the end of the install (#579).
+		if p := userNameTakenIn("/", preset); p != "" {
+			return ui.Errorf("bad_user", "Can't set up "+preset, p, "Run again with another name: andronix setup-user --user <name>")
 		}
 		if err := setLocale(os.Getenv("ANDRONIX_TZ"), os.Getenv("ANDRONIX_KEYBOARD")); err != nil {
 			return err
@@ -527,8 +603,8 @@ func SetupUser(preset string) error {
 		if p := userNameProblem(s); p != "" {
 			return errors.New(p)
 		}
-		if _, _, _, ok := lookupUser("/", s); ok {
-			return errors.New(s + " already exists")
+		if p := userNameTakenIn("/", s); p != "" {
+			return errors.New(p)
 		}
 		return nil
 	})

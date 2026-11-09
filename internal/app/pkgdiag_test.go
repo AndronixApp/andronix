@@ -128,6 +128,28 @@ func (nopRep) Line(s string)                          {}
 func (nopRep) Detail(s string)                        {}
 func (nopRep) Label(s string)                         {}
 
+func TestDownloadPeakMB(t *testing.T) {
+	deb, _ := conf.LoadDistro("debian")
+	base := int64(float64(deb.DiskMB) * 1.2)
+	// A 200 MiB download sits on disk while the base rootfs unpacks (#301).
+	if got, want := downloadPeakMB(deb, 200<<20), 200+base; got != want {
+		t.Errorf("200 MiB download: peak %d MB, want %d", got, want)
+	}
+	// The download term is additive, so a bigger download needs more.
+	if downloadPeakMB(deb, 400<<20) <= downloadPeakMB(deb, 200<<20) {
+		t.Error("a bigger download should raise the peak")
+	}
+	// The peak must clear the compressed download alone, with the unpacked
+	// rootfs on top — the gap the phone-check (spaceNeed) alone missed.
+	if downloadPeakMB(deb, 300<<20) <= 300 {
+		t.Error("peak must exceed the download size alone")
+	}
+	// Rounds partial MiB up, never down to 0 for a non-empty file.
+	if downloadPeakMB(deb, 1) != 1+base {
+		t.Errorf("1 byte: %d MB, want %d", downloadPeakMB(deb, 1), 1+base)
+	}
+}
+
 func TestSpaceNeed(t *testing.T) {
 	deb, _ := conf.LoadDistro("debian")
 	xfce, _ := conf.ResolveDesktop("xfce")
@@ -326,6 +348,163 @@ func TestMirrorUnusable(t *testing.T) {
 	}
 }
 
+// #341: after a mirror fallback the package index is re-synced before the
+// install is retried; and when the new mirror can't be refreshed either, the
+// step fails with the network error, not a misleading "Unable to locate
+// package". A connect failure forces the switch (http.kali.org -> berkeley).
+func TestMirrorSwitchRefresh(t *testing.T) {
+	setup := func(t *testing.T) (*conf.Distro, *pkgmgr.Family, string) {
+		root := t.TempDir()
+		src := filepath.Join(root, "etc/apt/sources.list.d/kali.sources")
+		os.MkdirAll(filepath.Dir(src), 0o755)
+		os.WriteFile(src, []byte("URIs: http://http.kali.org/kali/\n"), 0o644)
+		d, err := conf.LoadDistro("kali")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fam, _ := pkgmgr.Get(d.Family)
+		return d, fam, root
+	}
+	connectFail := `echo "E: Failed to fetch http.kali.org Unable to connect to http.kali.org:80:"; exit 100`
+
+	// The index refresh after the switch succeeds (drops a marker): the next
+	// install attempt finds it and the step passes.
+	t.Run("resync then install", func(t *testing.T) {
+		d, famReal, root := setup(t)
+		marker := filepath.Join(t.TempDir(), "refreshed")
+		fam := *famReal
+		fam.Update = "touch " + marker
+		lg := NewLog("test")
+		p := newPkgOps(&proot.Target{Rootfs: root, Local: true}, &fam, d, lg)
+		p.sleep = func(time.Duration) {}
+		err := p.do(context.Background(), "[ -e "+marker+" ] && exit 0; "+connectFail, 0, nopRep{}, false)
+		lg.Close()
+		b, _ := os.ReadFile(lg.Path)
+		if err != nil {
+			t.Fatalf("install didn't recover after the resync: %v", err)
+		}
+		if _, e := os.Stat(marker); e != nil {
+			t.Error("the index wasn't refreshed after the switch")
+		}
+		if s, _ := os.ReadFile(filepath.Join(root, "etc/apt/sources.list.d/kali.sources")); !strings.Contains(string(s), "berkeley") {
+			t.Errorf("sources didn't switch: %s", s)
+		}
+		if !strings.Contains(string(b), "refreshing the package index for the new mirror") {
+			t.Errorf("no refresh logged after the switch:\n%s", b)
+		}
+		if !p.switched || p.indexStale {
+			t.Errorf("switched=%v indexStale=%v", p.switched, p.indexStale)
+		}
+	})
+
+	// The new mirror can't be reached either (the refresh fails): the step
+	// stops with the connect failure, not an "Unable to locate package".
+	t.Run("resync fails, clear network error", func(t *testing.T) {
+		d, famReal, root := setup(t)
+		fam := *famReal
+		fam.Update = "exit 1"
+		lg := NewLog("test")
+		p := newPkgOps(&proot.Target{Rootfs: root, Local: true}, &fam, d, lg)
+		p.sleep = func(time.Duration) {}
+		err := p.do(context.Background(), connectFail, 0, nopRep{}, false)
+		lg.Close()
+		var f *pkgmgr.Failure
+		if !errors.As(err, &f) || f.Kind != pkgmgr.KindConnect {
+			t.Fatalf("want a connect failure, got %v", err)
+		}
+		if !p.switched || !p.indexStale {
+			t.Errorf("switched=%v indexStale=%v", p.switched, p.indexStale)
+		}
+	})
+
+	// The update step after a switch does not carry on with the abandoned
+	// mirror's stale lists: a whole-mirror DNS failure fails clearly instead.
+	t.Run("update step doesn't carry stale lists after a switch", func(t *testing.T) {
+		d, famReal, root := setup(t)
+		// Build-time lists exist (aptListsUsable would say yes).
+		os.MkdirAll(filepath.Join(root, "var/lib/apt/lists"), 0o755)
+		os.WriteFile(filepath.Join(root, "var/lib/apt/lists/http.kali.org_kali_dists_kali-rolling_main_binary-arm64_Packages"), []byte("Package: x\n"), 0o644)
+		fam := *famReal
+		lg := NewLog("test")
+		p := newPkgOps(&proot.Target{Rootfs: root, Local: true}, &fam, d, lg)
+		p.sleep = func(time.Duration) {}
+		dns := `echo "E: Failed to fetch http.kali.org Could not resolve host http.kali.org"; exit 100`
+		err := p.do(context.Background(), dns, 0, nopRep{}, true)
+		lg.Close()
+		if err == nil {
+			t.Fatal("update carried on with the abandoned mirror's stale lists")
+		}
+		if !p.switched {
+			t.Error("no switch happened")
+		}
+	})
+
+	// #341 regression (AX-PBXKW9, Oct 29): a mirror_unusable fallback (the old
+	// mirror sent apt in a redirection loop, not a plain connect failure) must
+	// also re-sync the new mirror's index before retrying, so the retried
+	// install finds the package instead of "Unable to locate package". This
+	// exercises the KindMirror recover branch, not the connect/DNS one.
+	t.Run("mirror_unusable switch then install", func(t *testing.T) {
+		d, famReal, root := setup(t)
+		marker := filepath.Join(t.TempDir(), "refreshed")
+		fam := *famReal
+		fam.Update = "touch " + marker
+		lg := NewLog("test")
+		p := newPkgOps(&proot.Target{Rootfs: root, Local: true}, &fam, d, lg)
+		p.sleep = func(time.Duration) {}
+		redirLoop := `echo "E: Failed to fetch http.kali.org Redirection loop encountered"; exit 100`
+		err := p.do(context.Background(), "[ -e "+marker+" ] && exit 0; "+redirLoop, 0, nopRep{}, false)
+		lg.Close()
+		if err != nil {
+			t.Fatalf("install didn't recover after the mirror_unusable switch: %v", err)
+		}
+		if _, e := os.Stat(marker); e != nil {
+			t.Error("the index wasn't refreshed after the mirror_unusable switch")
+		}
+		if s, _ := os.ReadFile(filepath.Join(root, "etc/apt/sources.list.d/kali.sources")); !strings.Contains(string(s), "berkeley") {
+			t.Errorf("sources didn't switch: %s", s)
+		}
+		if !p.switched || p.indexStale {
+			t.Errorf("switched=%v indexStale=%v", p.switched, p.indexStale)
+		}
+	})
+
+	// #341 regression (AX-GA83W8, Oct 29): when the switch happens on the update
+	// step and the new mirror is reachable, the update must actually re-fetch
+	// the new mirror rather than take the "apt has usable lists" shortcut on the
+	// abandoned mirror's build-time lists. On the report that shortcut let the
+	// update "work", and the next step (basics) then failed with "Package
+	// adduser has no installation candidate" because the new mirror had no
+	// lists on disk yet.
+	t.Run("update step re-fetches the new mirror, not the old lists", func(t *testing.T) {
+		d, famReal, root := setup(t)
+		// Build-time lists exist, so the shortcut would fire if it weren't gated
+		// on !p.switched.
+		os.MkdirAll(filepath.Join(root, "var/lib/apt/lists"), 0o755)
+		os.WriteFile(filepath.Join(root, "var/lib/apt/lists/http.kali.org_kali_dists_kali-rolling_main_binary-arm64_Packages"), []byte("Package: x\n"), 0o644)
+		fam := *famReal
+		lg := NewLog("test")
+		p := newPkgOps(&proot.Target{Rootfs: root, Local: true}, &fam, d, lg)
+		p.sleep = func(time.Duration) {}
+		src := filepath.Join(root, "etc/apt/sources.list.d/kali.sources")
+		// Fails (DNS) while the sources still name the old mirror; succeeds only
+		// once they point at the new one, so only a real post-switch fetch
+		// counts as success.
+		cmd := `grep -q berkeley ` + src + ` && exit 0; echo "E: Failed to fetch http.kali.org Could not resolve host http.kali.org"; exit 100`
+		err := p.do(context.Background(), cmd, 0, nopRep{}, true)
+		lg.Close()
+		if err != nil {
+			t.Fatalf("update didn't recover onto the reachable new mirror: %v", err)
+		}
+		if !p.switched {
+			t.Error("the shortcut masked the dead mirror instead of switching")
+		}
+		if s, _ := os.ReadFile(src); !strings.Contains(string(s), "berkeley") {
+			t.Errorf("sources didn't switch to the reachable mirror: %s", s)
+		}
+	})
+}
+
 // The install ends with how to start it again (support #164 #176 #218).
 func TestStartLine(t *testing.T) {
 	k, _ := conf.LoadDistro("kali")
@@ -387,4 +566,88 @@ func TestSeccompRetry(t *testing.T) {
 		}
 	}
 	proot.NoSeccomp, pmSaved = false, ""
+}
+
+// #319 experiment: a dpkg op that SIGSEGV'd proot ("signal 11") gets one retry
+// with --link2symlink dropped when ANDRONIX_L2S_RETRY=1, and the outcome is
+// logged and kept (<kind>_l2s_retried / <kind>_l2s_not_fixed). The segv line
+// plus the dpkg-interrupted error reproduce the #1619/#1632/AX-YC2SMT shape.
+func TestL2SRetry(t *testing.T) {
+	segv := `echo "proot warning: signal 11 received from process -1"; echo "E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct the problem."; exit 100`
+	for _, c := range []struct {
+		name    string
+		script  string
+		wantErr bool
+		want    string // pmSaved, or the failure kind
+	}{
+		{"l2s fixed", `if [ -e "$M" ]; then exit 0; fi; touch "$M"; ` + segv, false, "proot_crash_l2s_retried"},
+		{"l2s not fixed", segv, true, "proot_crash_l2s_not_fixed"},
+	} {
+		d, err := conf.LoadDistro("ubuntu")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fam, _ := pkgmgr.Get(d.Family)
+		proot.NoLink2Symlink, pmSaved = false, ""
+		t.Setenv("ANDRONIX_L2S_RETRY", "1")
+		t.Setenv("M", filepath.Join(t.TempDir(), "marker"))
+		lg := NewLog("test")
+		p := newPkgOps(&proot.Target{Rootfs: t.TempDir(), Local: true}, fam, d, lg)
+		p.sleep = func(time.Duration) {}
+		err = p.do(context.Background(), c.script, 0, nopRep{}, false)
+		lg.Close()
+		b, _ := os.ReadFile(lg.Path)
+		if !proot.NoLink2Symlink {
+			t.Errorf("%s: --link2symlink not dropped for the retry", c.name)
+		}
+		var f *pkgmgr.Failure
+		switch {
+		case c.wantErr && (!errors.As(err, &f) || string(f.Kind) != c.want):
+			t.Errorf("%s: err %v, want kind %s", c.name, err, c.want)
+		case !c.wantErr && (err != nil || pmSaved != c.want):
+			t.Errorf("%s: err %v, pmSaved %q", c.name, err, pmSaved)
+		}
+		if strings.Count(string(b), "trying again with --link2symlink off") != 1 {
+			t.Errorf("%s: retried not exactly once:\n%s", c.name, b)
+		}
+	}
+	proot.NoLink2Symlink, pmSaved = false, ""
+}
+
+// #319 part A: the --kernel-release spoof may be skipped only on kernels that
+// clear EVERY shipped distro's minimum-kernel requirement. This guards the
+// floor against being lowered below a family's requirement, and fails if a
+// new distro family is added without a documented floor. Sources: glibc
+// --enable-kernel (Arch/Manjaro 4.4; Debian/Ubuntu/Kali 3.2; Void 3.2),
+// systemd ~4.15; Alpine uses musl, which has no kernel-version check.
+func TestKernelSpoofFloorClearsEveryDistro(t *testing.T) {
+	famFloor := map[string][2]int{
+		"apt":    {3, 2},
+		"pacman": {4, 4},
+		"dnf":    {5, 15}, // Fedora glibc: conservative upper bound; none confirmed >= 6.0
+		"xbps":   {3, 2},
+		"apk":    {0, 0}, // musl: no kernel-version check
+	}
+	floor := [2]int{proot.KernelSpoofFloorMajor, proot.KernelSpoofFloorMinor}
+	for _, id := range conf.DistroIDs() {
+		d, err := conf.LoadDistro(id)
+		if err != nil {
+			t.Fatalf("%s: %v", id, err)
+		}
+		f, ok := famFloor[d.Family]
+		if !ok {
+			t.Errorf("%s: family %q has no documented min-kernel; add it and confirm the spoof floor still clears it", id, d.Family)
+			continue
+		}
+		if floor[0] < f[0] || (floor[0] == f[0] && floor[1] < f[1]) {
+			t.Errorf("%s (%s): spoof floor %d.%d is below the family min kernel %d.%d; skipping --kernel-release would break it",
+				id, d.Family, floor[0], floor[1], f[0], f[1])
+		}
+	}
+	if proot.SpoofKernelRelease("6.6.127-android15-8-ge56cf6b09cca-ab15511674-4k") {
+		t.Error("6.6 android15 (the #319 cluster) should not be spoofed")
+	}
+	if !proot.SpoofKernelRelease("3.18.140") {
+		t.Error("3.18 should still be spoofed")
+	}
 }

@@ -60,7 +60,7 @@ func linkerRuns(p string) bool {
 	if abs, err := filepath.Abs(p); err == nil {
 		p = abs
 	}
-	return strings.HasPrefix(p, appData) && isELF(p)
+	return inAppStorage(p) && isELF(p)
 }
 
 func fixLinkerArgs(exe, self string, args []string) []string {
@@ -97,6 +97,23 @@ func ViaLinker() bool { return linkerPath != "" }
 // appData is where W^X applies (a variable for tests).
 var appData = "/data/"
 
+// appLibDir is the app's real nativeLibraryDir when it isn't under /data/:
+// adopted storage (/mnt/expand/<uuid>/...) or similar, where some phones put
+// an app's native libraries (ANDROID-23: Samsung SM-X133, Android 16). The
+// app passes it as ANDRONIX_LIB_DIR; empty when unset.
+func appLibDir() string { return os.Getenv("ANDRONIX_LIB_DIR") }
+
+// inAppStorage reports whether p is in app-controlled storage where W^X
+// applies, so the linker may map a 0644 ELF there: under /data/, or under the
+// app's nativeLibraryDir when the app placed it elsewhere (ANDROID-23).
+func inAppStorage(p string) bool {
+	if strings.HasPrefix(p, appData) {
+		return true
+	}
+	d := strings.TrimRight(appLibDir(), "/")
+	return d != "" && (p == d || strings.HasPrefix(p, d+"/"))
+}
+
 // Executable is os.Executable, except that when started through the
 // linker it is andronix's own path, not the linker's.
 func Executable() (string, error) {
@@ -117,7 +134,7 @@ func viaLinker(path string, argv []string) (string, []string, string) {
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
-	if !strings.HasPrefix(path, appData) {
+	if !inAppStorage(path) {
 		return path, argv, ""
 	}
 	if interp, arg, ok := shebang(path); ok {

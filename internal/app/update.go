@@ -693,6 +693,9 @@ func betaResolve(ctx context.Context, token string) (*Resolved, error) {
 		return nil, &ui.UserError{Title: "No beta right now", Class: "beta_none",
 			What: "There's no beta build for this phone at the moment.", Fix: "Stay on the release: andronix update", Err: err}
 	}
+	if ce, ok := clockCertErr(err); ok {
+		return nil, ce
+	}
 	return nil, &ui.UserError{Title: "Couldn't reach the beta channel", Class: "download",
 		What: "The Andronix server didn't answer.", Fix: "Check your connection and run the same command again.", Err: err}
 }

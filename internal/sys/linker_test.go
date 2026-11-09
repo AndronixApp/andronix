@@ -99,3 +99,40 @@ func TestLinkerNoExecBit(t *testing.T) {
 		t.Errorf("0644 ELF outside app data found")
 	}
 }
+
+// ANDROID-23: the app's nativeLibraryDir can be outside /data/ (adopted
+// storage, /mnt/expand/...), so the 0644 ELF self-check wrongly failed with
+// "executable file not found". A readable ELF under the lib dir the app
+// passes as ANDRONIX_LIB_DIR is runnable through the linker.
+func TestLinkerNativeLibDir(t *testing.T) {
+	lib := t.TempDir()
+	elf := filepath.Join(lib, "libproot.so")
+	os.WriteFile(elf, []byte("\x7fELF rest"), 0o644)
+	text := filepath.Join(lib, "notes")
+	os.WriteFile(text, []byte("hi"), 0o644)
+	outside := filepath.Join(t.TempDir(), "libproot.so")
+	os.WriteFile(outside, []byte("\x7fELF rest"), 0o644)
+
+	defer func(a string) { appData, linkerPath, selfPath = a, "", "" }(appData)
+	appData = "/data/" // the lib dir is NOT under here
+	linkerPath = "/system/bin/linker64"
+
+	// Without ANDRONIX_LIB_DIR this is the ANDROID-23 bug: not found.
+	if _, err := LookPath(elf); err == nil {
+		t.Errorf("no ANDRONIX_LIB_DIR: ELF outside /data found")
+	}
+	t.Setenv("ANDRONIX_LIB_DIR", lib)
+	if p, err := LookPath(elf); err != nil || p != elf {
+		t.Errorf("ELF in the app's lib dir: %q %v", p, err)
+	}
+	if _, err := LookPath(text); err == nil {
+		t.Errorf("0644 non-ELF in the lib dir found")
+	}
+	if _, err := LookPath(outside); err == nil {
+		t.Errorf("ELF outside both /data and the lib dir found")
+	}
+	linkerPath = ""
+	if _, err := LookPath(elf); err == nil {
+		t.Errorf("started directly: 0644 ELF found")
+	}
+}

@@ -198,3 +198,29 @@ func TestHostEnvNoSeccomp(t *testing.T) {
 		t.Error("cleared NoSeccomp still changes the environment")
 	}
 }
+
+// #319: --kernel-release (and so proot's kompat traps) is kept on old phones
+// that need the kernel-version spoof, and dropped once the real kernel clears
+// the floor — covering the GKI 6.6/6.12 "android15/16" crash cluster.
+func TestSpoofKernelRelease(t *testing.T) {
+	for _, c := range []struct {
+		rel  string
+		want bool
+	}{
+		{"3.18.140", true},
+		{"4.4.302-perf+", true},
+		{"4.14.117", true},
+		{"5.10.101", true},
+		{"5.15.78-android13", true},
+		{"6.0.0", false},
+		{"6.1.0-android14", false},
+		{"6.6.127-android15-8-ge56cf6b09cca-ab15511674-4k", false},
+		{"6.12.69-android16-00001-g1234-4k", false},
+		{"", true},      // unparseable: keep the spoof
+		{"weird", true}, // unparseable: keep the spoof
+	} {
+		if got := SpoofKernelRelease(c.rel); got != c.want {
+			t.Errorf("SpoofKernelRelease(%q) = %v, want %v", c.rel, got, c.want)
+		}
+	}
+}

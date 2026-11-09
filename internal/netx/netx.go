@@ -83,14 +83,19 @@ func Head(ctx context.Context, url string) (int, int64, error) {
 	return resp.StatusCode, resp.ContentLength, nil
 }
 
-// Download fetches url into dst, resuming a partial file, with up to 8
-// attempts (#286: flaky mobile links stalled through the old 5). progress
+// Download fetches url into dst, resuming a partial file. It gives up after
+// 8 attempts in a row that fetched nothing (#286: flaky mobile links stalled
+// through the old 5); an attempt that got some bytes before it stalled or
+// dropped resets that count, so a slow link that keeps moving finishes
+// instead of failing after a fixed number of stalls (#1108, AX-WXCDVP). A
+// hard ceiling of maxAttempts stops a link that never settles. progress
 // gets (bytes so far, total). Returns the sha256 of the finished file.
 func Download(ctx context.Context, url, dst string, headers map[string]string, total int64, progress func(cur, total int64)) (string, error) {
 	var lastErr error
 	var validator string // ETag/Last-Modified of the object, for If-Range across resumes
-	for try := 0; try < 8; try++ {
-		err := downloadOnce(ctx, url, dst, headers, total, progress, &validator)
+	idle := 0            // attempts in a row that fetched nothing
+	for try := 0; try < maxAttempts && idle < idleAttempts; try++ {
+		got, err := downloadOnce(ctx, url, dst, headers, total, progress, &validator)
 		if err == nil {
 			return FileSHA256(dst)
 		}
@@ -98,20 +103,34 @@ func Download(ctx context.Context, url, dst string, headers map[string]string, t
 		if se, ok := err.(*StatusError); ok && se.Code != 416 && se.Code < 500 {
 			return "", err
 		}
-		if !sleep(ctx, try) {
+		if got > 0 {
+			idle = 0
+		} else {
+			idle++
+		}
+		if !sleep(ctx, idle) {
 			return "", ctx.Err()
 		}
 	}
 	return "", lastErr
 }
 
-func downloadOnce(ctx context.Context, url, dst string, headers map[string]string, total int64, progress func(cur, total int64), validator *string) error {
+// idleAttempts: attempts in a row with no bytes before Download gives up;
+// maxAttempts: all attempts, progress or not.
+const idleAttempts, maxAttempts = 8, 60
+
+// stallTimeout is how long a download may go silent before the attempt
+// ends and resumes (a variable for tests).
+var stallTimeout = 60 * time.Second
+
+// downloadOnce is one attempt; got is the bytes it wrote.
+func downloadOnce(ctx context.Context, url, dst string, headers map[string]string, total int64, progress func(cur, total int64), validator *string) (got int64, err error) {
 	var have int64
 	if st, err := os.Stat(dst); err == nil {
 		have = st.Size()
 	}
 	if total > 0 && have == total {
-		return nil
+		return 0, nil
 	}
 	if total > 0 && have > total {
 		os.Remove(dst)
@@ -133,7 +152,7 @@ func downloadOnce(ctx context.Context, url, dst string, headers map[string]strin
 	}
 	resp, err := Client.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	if validator != nil && *validator == "" {
@@ -151,16 +170,16 @@ func downloadOnce(ctx context.Context, url, dst string, headers map[string]strin
 		flags |= os.O_TRUNC
 		have = 0
 	case 416:
-		return nil // already complete
+		return 0, nil // already complete
 	default:
-		return &StatusError{resp.StatusCode, url}
+		return 0, &StatusError{resp.StatusCode, url}
 	}
 	if total <= 0 && resp.ContentLength > 0 {
 		total = have + resp.ContentLength
 	}
 	f, err := os.OpenFile(dst, flags, 0o644)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 	buf := make([]byte, 256<<10)
@@ -168,12 +187,13 @@ func downloadOnce(ctx context.Context, url, dst string, headers map[string]strin
 	for {
 		// A stalled connection on mobile data: give up after 60 s of
 		// silence and let the retry resume.
-		n, rerr := readWithTimeout(resp.Body, buf, 60*time.Second)
+		n, rerr := readWithTimeout(resp.Body, buf, stallTimeout)
 		if n > 0 {
 			if _, err := f.Write(buf[:n]); err != nil {
-				return err
+				return got, err
 			}
 			cur += int64(n)
+			got += int64(n)
 			if progress != nil {
 				progress(cur, total)
 			}
@@ -182,13 +202,13 @@ func downloadOnce(ctx context.Context, url, dst string, headers map[string]strin
 			break
 		}
 		if rerr != nil {
-			return rerr
+			return got, rerr
 		}
 	}
 	if total > 0 && cur < total {
-		return io.ErrUnexpectedEOF
+		return got, io.ErrUnexpectedEOF
 	}
-	return nil
+	return got, nil
 }
 
 func readWithTimeout(r io.Reader, buf []byte, d time.Duration) (int, error) {
@@ -220,11 +240,14 @@ func FileSHA256(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// retryUnit scales the pause between tries (a variable for tests).
+var retryUnit = time.Second
+
 func sleep(ctx context.Context, try int) bool {
 	select {
 	case <-ctx.Done():
 		return false
-	case <-time.After(time.Duration(2*(try+1)) * time.Second):
+	case <-time.After(time.Duration(2*(try+1)) * retryUnit):
 		return true
 	}
 }

@@ -4,7 +4,9 @@
 # its clang runs through binfmt (qemu), with amd64 glibc from multiarch.
 # (Go itself under qemu crashes, hence not a whole amd64 image.)
 # ci/build-go.sh uses this when ANDROID_NDK_HOME isn't set.
-FROM golang:1.26.5-bookworm
+FROM golang:1.26.10-bookworm
+# go.mod needs go >= 1.26.10; the image keeps GOTOOLCHAIN=local (no toolchain downloads in the build).
+ENV GOTOOLCHAIN=local
 ARG NDK=r30
 ARG NDK_SHA1=5107f898313790e449e87eee2183d9a20602dee9
 RUN if [ "$(dpkg --print-architecture)" != amd64 ]; then dpkg --add-architecture amd64; x=":amd64"; fi && \

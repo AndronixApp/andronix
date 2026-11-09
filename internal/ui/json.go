@@ -109,8 +109,20 @@ func Emit(t string, fields map[string]any) {
 // SetDone adds a field to the final done event (distro, edition, outcome).
 func SetDone(k string, v any) { doneInfo[k] = v }
 
-// EmitDone writes the done event for err.
+// doneEmitted: the done event went out already (EmitDone is once per run).
+var doneEmitted bool
+
+// EmitDone writes the done event for err, once: a finished install sends it
+// as soon as the last step is done (#290), and the closing call in main is
+// then a no-op.
 func EmitDone(err error) {
+	jsonMu.Lock()
+	again := doneEmitted
+	doneEmitted = true
+	jsonMu.Unlock()
+	if again {
+		return
+	}
 	f := map[string]any{"status": "ok"}
 	switch {
 	case err != nil && errors.Is(err, ErrCancelled):

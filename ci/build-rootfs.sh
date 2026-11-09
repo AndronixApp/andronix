@@ -105,14 +105,18 @@ for arch in "${arches[@]}"; do
         image=$DISTRO_IMAGE
         docker pull -q --platform "$plat" "$image" >/dev/null
     fi
-    # DISTRO_PRE_UPGRADE is baked in (with the package lists it needs;
-    # CLEAN drops them again), then clean by construction (DESIGN.md
-    # section 9), then export that container.
+    # apt's DISTRO_PRE_UPGRADE (Ubuntu's coreutils pin) is baked in here (with
+    # the package lists it needs; CLEAN drops them again), then clean by
+    # construction (DESIGN.md section 9), then export that container. Other
+    # families use DISTRO_PRE_UPGRADE as a pure install-time step the Go
+    # installer runs on-device (pacman keyring refresh, #1230): baking it at
+    # build time would refresh against stale build-time repos and defeat the
+    # purpose, so it is NOT baked here — left to run at install.
     pre=""
     if [ -n "${DISTRO_PRE_UPGRADE:-}" ]; then
         case "$DISTRO_FAMILY" in
             apt) pre="apt-get update -qq && { $DISTRO_PRE_UPGRADE; } && " ;;
-            *) echo "DISTRO_PRE_UPGRADE: no refresh command for family $DISTRO_FAMILY" >&2; exit 1 ;;
+            *) : ;; # install-time only; don't bake
         esac
     fi
     cid=$(docker create --platform "$plat" "$image" /bin/sh -c "$pre$CLEAN")

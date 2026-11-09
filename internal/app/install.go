@@ -11,11 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	andronix "github.com/AndronixApp/andronix-distros"
@@ -141,6 +141,16 @@ func install(ctx context.Context, o InstallOpts) error {
 		return err
 	}
 	rep.distro = d.ID
+	// Reject a bad or reserved --user up front, before downloading anything:
+	// a name like "shadow" or "audio" would otherwise fail useradd at the very
+	// end of a finished install (#579). This is the static layer (no rootfs
+	// yet); setupUserScripted re-checks against the unpacked passwd/group.
+	if o.User != "" {
+		if p := userNameProblem(o.User); p != "" {
+			return &ui.UserError{Title: "Can't use that user name", Class: "bad_user",
+				What: "'" + o.User + "': " + p + ".", Fix: "Install again with a different name, e.g. --user alex."}
+		}
+	}
 	unlock, err := lockDistro(d, "install")
 	if err != nil {
 		return err
@@ -445,7 +455,7 @@ func install(ctx context.Context, o InstallOpts) error {
 					imgFallback = reason
 					lg.Printf("image: %s, using the package install", reason)
 				}
-				s, err = pickSource(ctx, d, arch, paths, lg)
+				s, err = pickSource(ctx, d, arch, paths, lg, r.Line)
 			}
 			if err != nil {
 				return err
@@ -469,6 +479,22 @@ func install(ctx context.Context, o InstallOpts) error {
 			if haveRootfs || src.kind == "local" {
 				return ui.Skip("nothing to download")
 			}
+			// Before spending a long download, check the phone can hold the
+			// compressed file and the unpacked base rootfs at the same time
+			// (card #301: free space is ~23% of install failures; the
+			// phone-check before this ran without the download size, yet a
+			// stored tarball sits on disk while it unpacks). The image path
+			// streams into the rootfs with no stored copy, so it is exempt.
+			if (src.kind == "tarball" || src.kind == "upstream") && src.size > 0 {
+				dlMB := (src.size + (1 << 20) - 1) >> 20
+				peak := downloadPeakMB(d, src.size)
+				if free := sys.FreeMB(sys.Home()); free >= 0 && free < peak {
+					lg.Printf("pre-download space: free=%dMB < download %dMB + unpacked base %dMB", free, dlMB, peak-dlMB)
+					return &ui.UserError{Title: "Not enough space", Class: "not_enough_space",
+						What: fmt.Sprintf("Your phone has %d MB free; downloading and unpacking %s needs about %d MB at once (a %d MB download that stays on disk while the system unpacks).", free, d.Label(), peak, dlMB),
+						Fix:  fmt.Sprintf("Free up about %d MB (old videos, app caches), then run the same command again.", peak-free)}
+				}
+			}
 			if src.kind == "image" {
 				// Downloaded straight into the rootfs (no copy on disk), hashed
 				// on the way; on any failure, wipe it and fall back silently.
@@ -477,6 +503,12 @@ func install(ctx context.Context, o InstallOpts) error {
 				x := &rootfs.Extractor{Root: in.Rootfs}
 				n, reason, err := unpackImage(ctx, src, x, func(c, t int64) { r.Progress(c, t, "bytes") })
 				rep.downloadBytes += n // all bytes fetched, a failed image's included
+				if reason == fbNoSpace {
+					// Disk full mid-unpack: abort with the clear result, don't
+					// fall back to a package install that would also run out (#1147).
+					lg.Printf("image: out of space while unpacking: %v", err)
+					return notEnoughSpace(d, de, haveRootfs)
+				}
 				if reason == "" {
 					x.Finish()
 					for _, w := range x.Warnings {
@@ -499,7 +531,7 @@ func install(ctx context.Context, o InstallOpts) error {
 				}
 				imgFallback = reason
 				rootfs.Remove(in.Rootfs)
-				base, err := pickSource(ctx, d, arch, paths, lg)
+				base, err := pickSource(ctx, d, arch, paths, lg, r.Line)
 				if err != nil {
 					return err
 				}
@@ -604,6 +636,12 @@ func install(ctx context.Context, o InstallOpts) error {
 			}
 			for _, f := range files {
 				if err := x.ExtractFile(f); err != nil {
+					if errors.Is(err, syscall.ENOSPC) {
+						// Stopped on the first out-of-space write, not left
+						// half-unpacked to fail later at "Setting up" (#1147).
+						lg.Printf("unpack: out of space: %v", err)
+						return notEnoughSpace(d, de, haveRootfs)
+					}
 					return ui.Errorf("unpacking_failed", "Unpacking failed", "The files couldn't be unpacked: "+err.Error(), "Free up some space, then run the same command again.")
 				}
 			}
@@ -729,7 +767,21 @@ func install(ctx context.Context, o InstallOpts) error {
 			pkgs := append([]string{}, d.BasePkgs...)
 			if !de.None() {
 				pkgs = append(pkgs, de.Packages(d.Family)...)
-				pkgs = append(pkgs, fam.VNC...)
+				// VNC packages: install only those the distro's archive
+				// actually has. A renamed or dropped supplementary package
+				// (Ubuntu 26.04 "resolute" dropped tigervnc-tools; the
+				// server stayed tigervnc-standalone-server) must not fail
+				// the whole desktop with "Unable to locate package" (#1625).
+				// If none resolve, keep the original list so the install
+				// errors by name; either way the Xvnc/vncpasswd check in
+				// setupDesktop still fails loudly if no server installs.
+				var vncHave []string
+				t.Run(ctx, fam.FilterAvailable(fam.VNC), nil, func(l string) {
+					if l = strings.TrimSpace(l); l != "" && !strings.Contains(l, " ") {
+						vncHave = append(vncHave, l)
+					}
+				})
+				pkgs = append(pkgs, vncPackages(fam.VNC, vncHave)...)
 				// Optional packages: only those this distro has.
 				var opt []string
 				for _, o := range de.OptionalPackages(d.Family) {
@@ -1142,13 +1194,20 @@ func moddedSource(d *conf.Distro, de *conf.Desktop, arch sys.Arch, p Paths, toke
 // passwords, time zone and keyboard written to its stdin: proot passes a
 // session's environment on its command line, which /proc shows.
 func setupUserScripted(ctx context.Context, in *Inst, name string, onLine func(string)) error {
-	if !regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`).MatchString(name) || name == "root" {
+	if p := userNameProblem(name); p != "" {
 		return &ui.UserError{Title: "Can't use that user name", Class: "bad_user",
-			What: "'" + name + "' isn't a valid user name.", Fix: "Use lower-case letters, digits, _ and -, starting with a letter."}
+			What: "'" + name + "': " + p + ".", Fix: "Use a different name, e.g. alex."}
 	}
 	if len(os.Getenv("ANDRONIX_USER_PASSWORD")) < 4 {
 		return &ui.UserError{Title: "No password for " + name, Class: "bad_user",
 			What: "ANDRONIX_USER_PASSWORD must hold the new user's password (4 characters or more).", Fix: "Set it in the environment, never on the command line."}
+	}
+	// A reserved name the static list missed, or one this distro's rootfs
+	// already uses (passwd/group), or the aid_<user> collision: catch it here,
+	// host-side, before useradd fails at the very end of the install (#579).
+	if p := userNameTakenIn(in.Rootfs, name); p != "" {
+		return &ui.UserError{Title: "Can't use that user name", Class: "bad_user",
+			What: p + ".", Fix: "Run again with another name: andronix install " + in.D.ID + " --user <name>"}
 	}
 	rootfs.InstallSelf(in.Rootfs) // setup-user --user needs this build's in-distro andronix
 	t := in.Target(true)
@@ -1281,7 +1340,80 @@ func installLabel(de *conf.Desktop) string {
 	return "Installing " + de.Name + " desktop"
 }
 
-func pickSource(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg *Logger) (source, error) {
+// mirrorRetryWait is the pause before the second try of our mirror, and
+// headWait the one between HEAD tries (variables for tests).
+var mirrorRetryWait, headWait = 3 * time.Second, 2 * time.Second
+
+// sleepCtx waits d, or returns false when ctx ends first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// headRetry is netx.Head with up to 3 tries on a network error or a 5xx
+// (#357: one dropped HEAD sent the install to Docker Hub). It reports
+// whether the last failure was such a transient one.
+func headRetry(ctx context.Context, u string) (code int, size int64, err error, transient bool) {
+	for try := 0; try < 3; try++ {
+		if try > 0 && !sleepCtx(ctx, time.Duration(try)*headWait) {
+			return 0, 0, ctx.Err(), false
+		}
+		code, size, err = netx.Head(ctx, u)
+		transient = ctx.Err() == nil && (err != nil || code >= 500)
+		if !transient {
+			return
+		}
+	}
+	return
+}
+
+// mirrorTarball looks for the distro's tarball: the API's answer first (see
+// resolve.go), then the built-in mirror URL. ok: use s. transient: it was
+// skipped only because the network failed (worth another try later).
+func mirrorTarball(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg *Logger) (s source, ok, transient bool) {
+	name := fmt.Sprintf("%s-%s-%s.tar.xz", d.ID, d.Version, arch)
+	if res := resolve(ctx, "rootfs", url.Values{"distro": {d.ID}, "ver": {d.Version}}); res != nil {
+		for _, u := range res.urls() {
+			code, size, err := netx.Head(ctx, u)
+			lg.Printf("resolved tarball %s (%s): %d %v", u, res.Version, code, err)
+			if err == nil && code == 200 {
+				if res.Size > 0 {
+					size = res.Size
+				}
+				return source{kind: "tarball", url: u, size: size, sha: res.SHA256, file: filepath.Join(p.Cache, name)}, true, false
+			}
+		}
+	}
+	u := fmt.Sprintf("%s/rootfs/%s/%s/%s", Mirror(), d.ID, d.Version, name)
+	code, size, err, transient := headRetry(ctx, u)
+	lg.Printf("tarball %s: %d %v", u, code, err)
+	if err != nil || code != 200 {
+		return source{}, false, transient
+	}
+	s = source{kind: "tarball", url: u, size: size, file: filepath.Join(p.Cache, name)}
+	b, _, gerr := netx.Get(ctx, u+".sha256", nil)
+	if gerr == nil {
+		if fs := strings.Fields(string(b)); len(fs) > 0 && sha256Re.MatchString(fs[0]) {
+			s.sha = fs[0]
+		}
+	}
+	// Never unchecked: without a checksum, the registry (whose layers are
+	// checked by digest) is used instead.
+	if s.sha != "" {
+		return s, true, false
+	}
+	lg.Printf("tarball %s: no checksum, using the registry", u)
+	return source{}, false, netx.Unreachable(ctx, gerr)
+}
+
+// pickSource finds the base rootfs: a local file (ANDRONIX_ROOTFS), our
+// mirror's tarball, else the distro's registry image. say (may be nil)
+// shows a progress line.
+func pickSource(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg *Logger, say func(string)) (source, error) {
 	if f := os.Getenv("ANDRONIX_ROOTFS"); f != "" {
 		if _, err := os.Stat(f); err != nil {
 			return source{}, ui.Errorf("rootfs_file_not_found", "Rootfs file not found", "ANDRONIX_ROOTFS points at '"+f+"', which doesn't exist.", "Fix the path or unset ANDRONIX_ROOTFS.")
@@ -1295,37 +1427,15 @@ func pickSource(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg 
 		return s, nil
 	}
 	mode := os.Getenv("ANDRONIX_SOURCE")
+	// tarTransient: our mirror's tarball was skipped only because the network
+	// failed on the way (not a 404 or a missing checksum), so it's worth
+	// another try if the registry fails too (#357).
+	tarTransient := false
 	if mode != "registry" {
-		name := fmt.Sprintf("%s-%s-%s.tar.xz", d.ID, d.Version, arch)
-		// The API's answer first (see resolve.go), then the built-in URL.
-		if res := resolve(ctx, "rootfs", url.Values{"distro": {d.ID}, "ver": {d.Version}}); res != nil {
-			for _, u := range res.urls() {
-				code, size, err := netx.Head(ctx, u)
-				lg.Printf("resolved tarball %s (%s): %d %v", u, res.Version, code, err)
-				if err == nil && code == 200 {
-					if res.Size > 0 {
-						size = res.Size
-					}
-					return source{kind: "tarball", url: u, size: size, sha: res.SHA256, file: filepath.Join(p.Cache, name)}, nil
-				}
-			}
-		}
-		u := fmt.Sprintf("%s/rootfs/%s/%s/%s", Mirror(), d.ID, d.Version, name)
-		code, size, err := netx.Head(ctx, u)
-		lg.Printf("tarball %s: %d %v", u, code, err)
-		if err == nil && code == 200 {
-			s := source{kind: "tarball", url: u, size: size, file: filepath.Join(p.Cache, name)}
-			if b, _, err := netx.Get(ctx, u+".sha256", nil); err == nil {
-				if fs := strings.Fields(string(b)); len(fs) > 0 && sha256Re.MatchString(fs[0]) {
-					s.sha = fs[0]
-				}
-			}
-			// Never unchecked: without a checksum, the registry (whose
-			// layers are checked by digest) is used instead.
-			if s.sha != "" {
-				return s, nil
-			}
-			lg.Printf("tarball %s: no checksum, using the registry", u)
+		var s source
+		var ok bool
+		if s, ok, tarTransient = mirrorTarball(ctx, d, arch, p, lg); ok {
+			return s, nil
 		}
 		if mode == "tarball" {
 			return source{}, ui.Errorf("download_not_available", "Download not available", "The "+d.Label()+" download isn't reachable right now.", "Check your connection and try again in a few minutes.")
@@ -1337,6 +1447,22 @@ func pickSource(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg 
 	if err != nil {
 		var np *oci.ErrNoPlatform
 		var se *netx.StatusError
+		// #357: Docker Hub blips (auth.docker.io TLS timeouts, a 403/429/5xx)
+		// failed installs outright at "Finding the best download" even for
+		// distros our mirror has. When the mirror was skipped only because
+		// the network failed on the way, try it once more before giving up.
+		if tarTransient && !errors.As(err, &np) && ctx.Err() == nil {
+			lg.Printf("registry failed (%v); trying the Andronix mirror again", err)
+			if say != nil {
+				say("Docker Hub is busy; trying the Andronix mirror again...")
+			}
+			if !sleepCtx(ctx, mirrorRetryWait) {
+				return source{}, ctx.Err()
+			}
+			if s, ok, _ := mirrorTarball(ctx, d, arch, p, lg); ok {
+				return s, nil
+			}
+		}
 		switch {
 		case errors.As(err, &np) && d.UpstreamTarball(string(arch)) != "":
 			// No OCI image for this CPU (Arch Linux ARM): the distro's own tarball.
@@ -1355,6 +1481,9 @@ func pickSource(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg 
 			return source{}, ui.Errorf("the_image_server_is_busy", "The image server is busy", "Docker Hub limits downloads per network, and your network hit the limit.",
 				"Wait an hour, or switch between Wi-Fi and mobile data, then run the same command again.")
 		}
+		if ce, ok := clockCertErr(err); ok {
+			return source{}, ce
+		}
 		return source{}, ui.Errorf("couldn_t_reach_the_download_servers", "Couldn't reach the download servers", err.Error(), "Check your internet connection, then run the same command again.")
 	}
 	return source{kind: "registry", image: im}, nil
@@ -1371,6 +1500,9 @@ func pickSource(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg 
 func downloadErr(err error, tokenAuth bool) error {
 	if errors.Is(err, context.Canceled) {
 		return ui.ErrCancelled
+	}
+	if ce, ok := clockCertErr(err); ok {
+		return ce
 	}
 	var se *netx.StatusError
 	if tokenAuth && errors.As(err, &se) && se.Code == 403 {
@@ -1456,6 +1588,38 @@ func termuxPkgErr(title, manual string, err error) error {
 // (DISTRO_DISK_MB). The desktop part comes from DISTRO_XFCE_MB (measured
 // with XFCE) scaled by the desktop's size against XFCE's; distros not
 // measured use the older estimate.
+// notEnoughSpace is the "Not enough space" result built when an extraction
+// hits ENOSPC mid-unpack, after the pre-download check passed (#1147: the
+// estimate was within a few MB of free and still ran out). It reports the same
+// need/free numbers as the pre-download check (install.go phone-check) so the
+// two agree, and the same Class so the app treats it identically.
+func notEnoughSpace(d *conf.Distro, de *conf.Desktop, haveRootfs bool) *ui.UserError {
+	need := spaceNeed(d, de, haveRootfs)
+	free := sys.FreeMB(sys.Home())
+	deLabel := "the command line"
+	if !de.None() {
+		deLabel = de.Name
+	}
+	gap := need - free
+	if gap < 1 {
+		gap = 1
+	}
+	return &ui.UserError{Title: "Not enough space", Class: "not_enough_space",
+		What: fmt.Sprintf("Ran out of space while unpacking %s with %s: the phone has %d MB free and it needs about %d MB. Unpacking stopped instead of leaving a half-finished system.", d.Label(), deLabel, free, need),
+		Fix:  fmt.Sprintf("Free up about %d MB (old videos, app caches), then run the same command again.", gap)}
+}
+
+// downloadPeakMB is the space (MB) a stored download needs at its peak: the
+// compressed tarball on disk plus the unpacked base rootfs (DISTRO_DISK_MB,
+// +20%) it is being unpacked into. The desktop's packages are installed
+// afterwards, once the tarball is gone, so they aren't in this peak — the
+// later desktop peak is spaceNeed, which the phone-check already enforced.
+// The streamed image path has no stored copy and doesn't use this (#301).
+func downloadPeakMB(d *conf.Distro, size int64) int64 {
+	dlMB := (size + (1 << 20) - 1) >> 20
+	return dlMB + int64(float64(d.DiskMB)*1.2)
+}
+
 func spaceNeed(d *conf.Distro, de *conf.Desktop, haveRootfs bool) int64 {
 	base := d.DiskMB
 	if haveRootfs {
@@ -1481,6 +1645,20 @@ func spaceNeed(d *conf.Distro, de *conf.Desktop, haveRootfs bool) int64 {
 // (DISTRO_XFCE_MB is measured without them): about 60-80 MB, measured on an
 // API 36 emulator with Debian 13 XFCE (sv2-startup).
 const standaloneExtrasMB = 80
+
+// vncPackages chooses the VNC packages to install: those the distro's
+// archive actually has (have), or the full list (all) when the availability
+// check resolved none. It never returns empty from a non-empty list, so a
+// transient check failure can't silently drop the VNC server; in that case
+// the install errors by name and the Xvnc/vncpasswd check in setupDesktop
+// still fails loudly. Dropping only the missing supplementary packages is
+// what fixes Ubuntu 26.04 "resolute" (tigervnc-tools gone, server kept).
+func vncPackages(all, have []string) []string {
+	if len(have) == 0 {
+		return all
+	}
+	return have
+}
 
 // standaloneExtras are the packages a desktop install adds for the app's own
 // display and sound (standalone only): DISTRO_XVFB and DISTRO_PULSE, the ones
@@ -1569,6 +1747,15 @@ func pkgErr(title string, err error) error {
 		if sys.Standalone() {
 			e.Fix = "Update the Andronix app, then try again. If it still fails, send a report from the app."
 		}
+	case f.Kind == pkgmgr.KindProotCrash || f.Kind == "proot_crash_l2s_not_fixed":
+		e.Class = "proot_crash"
+		e.Title = "proot crashed on this phone, so the install couldn't finish"
+		e.What = "proot (the layer that runs Linux on Android) crashed with signal 11 while the package manager was working (" + f.Detail + "), which left the install half-finished. It isn't your network or the distro — it's Termux's proot on this phone's kernel."
+		e.Fix = "Install from the Andronix app instead — its built-in proot runs where Termux's crashes. Or first update Termux: run pkg upgrade in Termux (let it finish), then run the same command again. If it still fails, send a report: andronix report."
+		if sys.Standalone() {
+			e.What = "proot (the layer that runs Linux on Android) crashed with signal 11 while the package manager was working (" + f.Detail + "), which left the install half-finished. It isn't your network or the distro."
+			e.Fix = "Update the Andronix app, then try again. If it still fails, send a report from the app."
+		}
 	case f.Kind == pkgmgr.KindFakeRoot || f.Kind == "fake_root_not_fixed":
 		e.Title = "The distro's tools don't see root access on this phone"
 		e.What = "A program in the distro refused to run because it isn't root (" + f.Detail + "). proot pretends to be root, and on this phone that didn't work, even after a second try."
@@ -1584,7 +1771,28 @@ func pkgErr(title string, err error) error {
 		e.What = "The package servers didn't answer, on any mirror we tried (" + f.Detail + ")."
 		e.Fix = "Check your internet (switch between Wi-Fi and mobile data, or turn a VPN off), then run the same command again. It goes on where it stopped."
 	case f.Kind == pkgmgr.KindClock || f.Kind == pkgmgr.KindGPG:
+		if now, behind := clockBehind(); behind {
+			// #354: every signature check fails with the clock this far back.
+			e.Class = "clock_wrong"
+			e.Title = "Your phone's date is wrong"
+			e.What = "The phone's date is " + now.Format("2 January 2006") + ". With the date that far back, every package signature check fails (the signing keys look like they were made in the future), so nothing can be installed."
+		}
 		e.Fix = "Make sure the phone's date and time are set automatically (Settings, Date and time), then run the same command again."
+	case f.Kind == pkgmgr.KindUnauth:
+		e.Title = "The package lists couldn't be verified"
+		e.What = "The package manager refused packages it couldn't verify (" + f.Detail + "): the package lists' signature check failed during the refresh, even after refreshing again."
+		e.Fix = "Make sure the phone's date and time are set automatically (Settings, Date and time). If you're on public Wi-Fi, open a browser and sign in, or switch to mobile data. Then run the same command again."
+	case f.Kind == pkgmgr.KindGuestLibs:
+		e.Class = "guest_libs"
+		e.Title = "Linux programs can't load their libraries on this phone"
+		e.What = "The distro's own programs couldn't load their system libraries under proot (" + f.Detail + "). It isn't your network or a bad download, and installing again won't change it."
+		if sys.DetectArch() == "arm" {
+			e.What = "The distro's own programs couldn't load their system libraries under proot (" + f.Detail + "). We've seen this only on 32-bit phones with an old Android kernel (3.18), and we're working on it. It isn't your network or a bad download, and installing again won't change it."
+		}
+		e.Fix = "Please send a report so we can look: andronix report"
+		if sys.Standalone() {
+			e.Fix = "Please send a report from the app so we can look."
+		}
 	case f.Kind == pkgmgr.KindKilled:
 		e.Fix = "Android stopped the install (signal 9). Keep Termux open in front while it runs, and see docs.andronix.app on the phantom process killer; then run the same command again."
 		if sys.Standalone() {
@@ -1673,8 +1881,27 @@ func pkgRun(ctx context.Context, t *proot.Target, f *pkgmgr.Family, cmd string, 
 	})
 }
 
+// doneBefore emits the "done" event without waiting for send (started
+// first, so a process ended right after "done" has already spawned it),
+// then waits for send to return.
+func doneBefore(send func()) {
+	sent := make(chan struct{})
+	go func() { send(); close(sent) }()
+	ui.EmitDone(nil)
+	<-sent
+}
+
 func finish(in *Inst, de *conf.Desktop, user string, noStart, userStopped bool, rep *installReport) {
 	d := in.D
+	if ui.JSON {
+		// #290 (#884, #1052, #4255): in the app, "done" waited for the
+		// install_result telemetry spawn (a fork+exec of this binary, slow
+		// on linker64 phones) and the closing box, so every step showed ok
+		// with no completion for seconds and users cancelled into a
+		// "Cancelled" after a finished install. Start the send, tell the
+		// app at once, then let the send finish before going on.
+		doneBefore(func() { rep.send("ok") })
+	}
 	if sys.Standalone() {
 		// In the Andronix app: the app opens the terminal and the desktop.
 		fmt.Println()

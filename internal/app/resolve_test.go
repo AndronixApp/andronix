@@ -101,11 +101,11 @@ func TestMirrorTarballNeedsChecksum(t *testing.T) {
 	t.Setenv("ANDRONIX_MIRROR", mirror.URL) // also skips the resolver
 	t.Setenv("ANDRONIX_ROOTFS", "")
 	t.Setenv("ANDRONIX_SOURCE", "tarball")
-	if s, err := pickSource(context.Background(), d, "aarch64", Paths{Cache: t.TempDir()}, lg); err == nil {
+	if s, err := pickSource(context.Background(), d, "aarch64", Paths{Cache: t.TempDir()}, lg, nil); err == nil {
 		t.Errorf("no checksum: want no tarball, got %+v", s)
 	}
 	withSum = true
-	if s, err := pickSource(context.Background(), d, "aarch64", Paths{Cache: t.TempDir()}, lg); err != nil || s.sha != sha || s.kind != "tarball" {
+	if s, err := pickSource(context.Background(), d, "aarch64", Paths{Cache: t.TempDir()}, lg, nil); err != nil || s.sha != sha || s.kind != "tarball" {
 		t.Errorf("with checksum: %+v %v", s, err)
 	}
 }

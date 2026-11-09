@@ -407,10 +407,60 @@ func (r *redactor) do(s string) string {
 		s = strings.ReplaceAll(s, r.home, "~")
 	}
 	s = reAppUID.ReplaceAllString(s, "<uid>")
-	for _, u := range r.users {
-		s = regexp.MustCompile(`\b`+regexp.QuoteMeta(u)+`\b`).ReplaceAllString(s, "<user>")
+	return redactUserNames(s, r.users)
+}
+
+// collisionWords are user names that are also distro, desktop or platform
+// words, where the old "every whole-word match" rule wiped real log text
+// (card #300: a user named kali blanked "kali-rolling",
+// "/kali", the Kali package names). For these the name is redacted only in a
+// genuine user context (rules P1-P7 below); any other name is still redacted
+// on every whole-word match. Frozen against user-redaction-vectors.json
+// (TestUserRedactionCollisionWordsFrozen); the app ports the same list.
+var collisionWords = map[string]bool{
+	"alpine": true, "arch": true, "debian": true, "fedora": true, "kali": true,
+	"manjaro": true, "ubuntu": true, "void": true, "xfce": true, "kde": true,
+	"lxqt": true, "mate": true, "none": true, "user": true, "android": true,
+	"termux": true, "linux": true, "andronix": true, "proot": true, "admin": true,
+	"guest": true,
+}
+
+// userMark stands in for a redacted name while the rules run, so a span that
+// one rule redacts is never matched again by a later rule or a later name; it
+// becomes "<user>" at the end. Null bytes never occur in a real log line.
+const userMark = "\x00U\x00"
+
+// redactUserNames replaces the distro user names in s with <user>, following
+// card #300. A name that collides with a distro/desktop/platform word is
+// redacted only in a real user context (P1 home path, P2 shell prompt, P3 id
+// output, P4 the "user" keyword, P5 su/sudo -u/--user, P6 chown, P7 an
+// account command with the name last on the line); any other name is redacted
+// on every whole-word match, as before. Longest name first, so a name that is
+// a prefix of another can't mask it. Mirrors reference.js on the card.
+func redactUserNames(s string, users []string) string {
+	us := make([]string, 0, len(users))
+	for _, u := range users {
+		if len(u) >= 2 && u != "root" {
+			us = append(us, u)
+		}
 	}
-	return s
+	sort.Slice(us, func(i, j int) bool { return len(us[i]) > len(us[j]) })
+	for _, u := range us {
+		U := regexp.QuoteMeta(u)
+		if !collisionWords[strings.ToLower(u)] {
+			s = regexp.MustCompile(`\b`+U+`\b`).ReplaceAllString(s, userMark)
+			continue
+		}
+		s = regexp.MustCompile(`/home/`+U+`\b`).ReplaceAllString(s, "/home/"+userMark)                                                      // P1
+		s = regexp.MustCompile(`\b`+U+`@`).ReplaceAllString(s, userMark+"@")                                                                // P2
+		s = regexp.MustCompile(`([=,]\d+)\(`+U+`\)`).ReplaceAllString(s, "${1}("+userMark+")")                                              // P3
+		s = regexp.MustCompile(`\b(user|User|USER)(\s*[:=]?\s*)(['"]?)`+U+`\b`).ReplaceAllString(s, "${1}${2}${3}"+userMark)                // P4
+		s = regexp.MustCompile(`(--user[= ]|\bsu\s+(?:-\s+|-l\s+|--login\s+)?|\bsudo\s+-u\s+)`+U+`\b`).ReplaceAllString(s, "${1}"+userMark) // P5
+		s = regexp.MustCompile(`(\bchown\s+(?:-\S+\s+)*)`+U+`:`+U+`\b`).ReplaceAllString(s, "${1}"+userMark+":"+userMark)                   // P6a
+		s = regexp.MustCompile(`(\bchown\s+(?:-\S+\s+)*)`+U+`\b`).ReplaceAllString(s, "${1}"+userMark)                                      // P6b
+		s = regexp.MustCompile(`(?m)^(.*\b(?:useradd|adduser|usermod|userdel|passwd)\b.*\s)`+U+`$`).ReplaceAllString(s, "${1}"+userMark)    // P7
+	}
+	return strings.ReplaceAll(s, userMark, "<user>")
 }
 
 // Report is `andronix report [--dry-run] [--message TEXT] [--open AX-ID]

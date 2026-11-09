@@ -20,8 +20,10 @@ import (
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
 
-// Version is set at build time (-ldflags "-X .../app.Version=...").
-var Version = "2.0.0-dev"
+// Version is set at build time (-ldflags "-X .../app.Version=...", from
+// VERSION or git describe in ci/build-go.sh); this default names the line
+// a plain go build is from.
+var Version = "2.1.5-rc1"
 
 // VersionLabel is "v0.2.0" for releases, the git hash for dev builds.
 func VersionLabel() string {
@@ -153,6 +155,21 @@ func lookupUser(root, name string) (uid, gid, home string, ok bool) {
 		}
 	}
 	return
+}
+
+// groupExists reports whether name is a group in root's /etc/group. A missing
+// file reads as "no groups" (the rootfs may not be unpacked yet).
+func groupExists(root, name string) bool {
+	b, err := os.ReadFile(filepath.Join(root, "etc/group"))
+	if err != nil {
+		return false
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		if i := strings.IndexByte(l, ':'); i >= 0 && l[:i] == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Logger writes the install log.

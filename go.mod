@@ -1,6 +1,6 @@
 module github.com/AndronixApp/andronix-distros
 
-go 1.26.5
+go 1.26.10
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0

@@ -52,6 +52,12 @@ const (
 	// proot stopped with another fatal error ("see proot --help" ends
 	// every proot fatal error, not only option ones).
 	KindProotFailed Kind = "proot_failed"
+	// proot itself SIGSEGV'd mid-run ("proot warning: signal 11 received"),
+	// crashing a package op and leaving it half-done — not the network, not
+	// the distro. Seen on GKI 6.6/6.12 "android15/android16" kernels with
+	// Termux's own proot build, across dpkg and pacman; the app's bundled
+	// proot doesn't (card #319).
+	KindProotCrash Kind = "proot_crash"
 	// pacman-key couldn't make the local keyring: gpg-agent didn't start
 	// under proot (support #119: Redmi Note 8 Pro, kernel 4.14).
 	KindKeyring Kind = "keyring"
@@ -64,7 +70,21 @@ const (
 	// as "not signed" (support #470/#471: Blackview SHARK 8, Android 13,
 	// kernel 5.10, Play Termux 2026.02.11). Not the network.
 	KindProotSyscall Kind = "proot_syscall"
-	KindOther        Kind = "other"
+	// apt refused packages from lists it couldn't verify ("There were
+	// unauthenticated packages", "cannot be authenticated"): the refresh's
+	// signature check failed (a wrong clock, a network rewriting downloads,
+	// a mirror mid-sync) yet older, unverified lists were still used (#354,
+	// #4213: Debian 13 at "Updating", Nov 4).
+	KindUnauth Kind = "unauthenticated"
+	// The distro's own programs can't load their libraries: the dynamic
+	// loader reports every symbol version missing, glibc's included
+	// ("version `GLIBCXX_3.4.21' not found", "CXXABI_1.3", "GLIBC_2.4",
+	// even apt's own APTPKG_6.0), or "symbol lookup error". Seen only on
+	// 32-bit (armhf) Termux on kernel 3.18 (card #377: SM-T580, SM-G611F,
+	// SM-J701F; Debian 13 and Ubuntu 24.04), at the first apt run. Not
+	// the network and not a broken mirror; retrying can't change it.
+	KindGuestLibs Kind = "guest_libs"
+	KindOther     Kind = "other"
 )
 
 // Most specific first: a 404 or a hash mismatch also prints "Failed to
@@ -78,12 +98,17 @@ var patterns = []struct {
 	{KindProotExec, regexp.MustCompile(`(?i)proot error: execve\(`)},
 	{KindProotArgs, regexp.MustCompile(`(?i)proot error: .*(unknown|invalid|unrecognized|bad) option|option .*requires an argument`)},
 	{KindProotFailed, regexp.MustCompile(`(?i)see .?proot --help`)},
+	// Before the dpkg/reinstreq/hook symptoms: a proot SIGSEGV is the root
+	// cause of the half-done package op it leaves behind (card #319).
+	{KindProotCrash, regexp.MustCompile(`(?i)proot (warning|error|info):.*signal 11`)},
+	{KindGuestLibs, regexp.MustCompile("(?i)version `(GLIBC|GLIBCXX|CXXABI|GCC|APTPKG)_[A-Z0-9_.]+' not found|symbol lookup error")},
 	{KindHook, regexp.MustCompile(`(?i)problem executing scripts|post-invoke|^e: sub-process returned an error code$`)},
 	{KindReinstreq, regexp.MustCompile(`(?i)very bad inconsistent state|should be reinstalled before|reinstreq`)},
 	{KindDpkg, regexp.MustCompile(`(?i)dpkg was interrupted|dpkg --configure -a`)},
 	{KindFakeRoot, regexp.MustCompile(`(?i)needs to be run as root|must be run as root|requires superuser privilege|unless you are root|you must be root|are you root\?`)},
 	{KindLock, regexp.MustCompile(`(?i)could not get lock|unable to acquire the dpkg frontend lock|unable to lock database|db\.lck|waiting for cache lock`)},
-	{KindClock, regexp.MustCompile(`(?i)is not valid yet|not valid until|release file .* is expired|invalid for another`)},
+	// gpg's own words for a clock behind a key's creation time (#354).
+	{KindClock, regexp.MustCompile(`(?i)is not valid yet|not valid until|release file .* is expired|invalid for another|time warp or clock problem|created \d+ seconds? in the future`)},
 	{KindHash, regexp.MustCompile(`(?i)hash sum mismatch|file has unexpected size|hashes of expected file|mirror sync in progress|invalid or corrupted package|checksum doesn't match|sha256 mismatch`)},
 	{KindMirror, regexp.MustCompile(`(?i)redirection loop|does not have a release file`)},
 	{KindHTTP404, regexp.MustCompile(`(?i)\b404\s+not found|error 404|http/[0-9.]+ 404`)},
@@ -95,6 +120,7 @@ var patterns = []struct {
 	// After GPG: "not signed" with a real key error is GPG; alone, the
 	// download wasn't the mirror's (a login page or a filter).
 	{KindIntercepted, regexp.MustCompile(`(?i)in?release'? is not signed|clearsigned file isn't valid|got noclearsign|NOSPLIT`)},
+	{KindUnauth, regexp.MustCompile(`(?i)there were unauthenticated packages|packages cannot be authenticated|unauthenticated packages`)},
 	{KindBroken, regexp.MustCompile(`(?i)unmet dependencies|held broken packages|broken packages|unresolvable|nothing provides|conflicting (files|requests)|cannot install both|unable to satisfy`)},
 	{KindKilled, regexp.MustCompile(`(?i)signal: killed|^killed$|signal 9|exit status 137`)},
 }
@@ -108,7 +134,12 @@ type Failure struct {
 	Detail string // the error line, safe for telemetry
 	Line   string // the same line as printed (local use only: paths, URLs)
 	Err    error
+	// sigLine: some line of the run named a package signature (pacman's
+	// "(PGP signature)", "signature from ... is unknown trust").
+	sigLine bool
 }
+
+var sigLineRe = regexp.MustCompile(`(?i)pgp signature|signature from .* is (unknown|invalid|marginal)|unknown trust`)
 
 func (f *Failure) Error() string {
 	if f.Detail != "" {
@@ -117,6 +148,19 @@ func (f *Failure) Error() string {
 	return f.Err.Error()
 }
 func (f *Failure) Unwrap() error { return f.Err }
+
+// Signature reports whether the failure is a package-signature check:
+// these all fail on a phone whose clock is far behind (gpg rejects keys
+// "created in the future"), whatever the mirror (#354).
+func (f *Failure) Signature() bool {
+	switch f.Kind {
+	case KindGPG, KindIntercepted, KindClock, KindUnauth:
+		return true
+	case KindHash:
+		return f.sigLine
+	}
+	return false
+}
 
 // network reports whether another mirror or a wait might fix it.
 func (k Kind) Network() bool {
@@ -131,6 +175,12 @@ func Diagnose(lines []string, err error) *Failure {
 		return f
 	}
 	all := append(append([]string{}, lines...), err.Error())
+	for _, l := range all {
+		if sigLineRe.MatchString(l) {
+			f.sigLine = true
+			break
+		}
+	}
 	for _, p := range patterns {
 		for _, l := range all {
 			if p.re.MatchString(l) {

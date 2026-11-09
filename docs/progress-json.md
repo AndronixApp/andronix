@@ -100,6 +100,9 @@ Every error the installer explains has a fixed class: titles change, classes don
 | `termux_pkg` | installing a Termux package (proot, Termux:X11) failed |
 | `proot_is_missing` | no usable proot |
 | `proot_exec` | proot can't start programs inside the distro ("Linux can't start on this phone") |
+| `proot_crash` | proot itself crashed (signal 11) mid-run, leaving a package op half-done; Termux's proot build on some kernels. The message routes to the app's bundled proot or a Termux update (card #319) |
+| `clock_wrong` | The phone's date is before this installer was built, so every package signature check fails (gpg sees the signing keys as "made in the future"); the install stops and asks to set the date automatically (card #354) |
+| `guest_libs` | The distro's own programs can't load their libraries under proot (every symbol version "not found", or "symbol lookup error"); seen on 32-bit phones with kernel 3.18 (card #377). Not retried |
 | `termux_applib` | Play Store Termux's applib link (to its own libraries, which its proot needs to start programs) is broken: remove it and restart Termux (support #358). Termux only; kind `proot_exec` when proot already failed |
 | `compat_refused` | a compat rule says this distro can't run on this phone yet |
 | `kernel_too_new` | the distro needs an older kernel than the phone's |
@@ -223,7 +226,7 @@ Every error the installer explains has a fixed class: titles change, classes don
 
 Why it failed, for `package_manager`, `termux_pkg`, `download`, `proot_exec` and space. Only added, never renamed.
 
-Package manager: `network_dns`, `network_connect`, `network_intercepted` (a captive portal or proxy answered instead of the mirror), `http_404`, `http_5xx`, `hash_mismatch`, `clock_skew`, `gpg`, `keyring` (the distro's signing keys can't be read), `fake_root` (a program in the distro wasn't root under proot; one retry with `PROOT_NO_SECCOMP=1`, and `fake_root_not_fixed` when that didn't help), `proot_syscall` (a program in the distro got "Function not implemented" or gpgv died under proot; one retry with `PROOT_NO_SECCOMP=1`, and `proot_syscall_not_fixed` when that didn't help), `dpkg_interrupted`, `dpkg_reinstreq`, `mirror_unusable`, `apt_hook` (an apt update or dpkg hook failed), `lock`, `broken_deps`, `disk_full`, `killed`, `cancelled`, `other`.
+Package manager: `network_dns`, `network_connect`, `network_intercepted` (a captive portal or proxy answered instead of the mirror), `http_404`, `http_5xx`, `hash_mismatch`, `clock_skew`, `gpg`, `keyring` (the distro's signing keys can't be read), `fake_root` (a program in the distro wasn't root under proot; one retry with `PROOT_NO_SECCOMP=1`, and `fake_root_not_fixed` when that didn't help), `proot_syscall` (a program in the distro got "Function not implemented" or gpgv died under proot; one retry with `PROOT_NO_SECCOMP=1`, and `proot_syscall_not_fixed` when that didn't help), `proot_crash` (proot itself SIGSEGV'd mid-run and the install stopped; `proot_crash_l2s_not_fixed` when the opt-in `--link2symlink`-off retry didn't help either), `dpkg_interrupted`, `dpkg_reinstreq`, `mirror_unusable`, `apt_hook` (an apt update or dpkg hook failed), `lock`, `broken_deps`, `unauthenticated` (apt refused packages from lists it couldn't verify; one list refresh, then it stops), `guest_libs` (the distro's programs can't load their libraries under proot; 32-bit, kernel 3.18, card #377), `disk_full`, `killed`, `cancelled`, `other`.
 
 proot: `proot_exec` (it can't start programs in the distro), `proot_args` (it refused an option), `proot_failed` (any other proot error).
 

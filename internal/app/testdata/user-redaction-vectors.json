@@ -1,0 +1,217 @@
+{
+ "name": "user-redaction-vectors",
+ "version": 1,
+ "about": "Shared vectors for the user-name step of report redaction (andronix-distros internal/app/problem.go and the app's StandaloneReport.kt). The input is the text as it reaches the user-name step: tokens, emails and the home path are already replaced. Each case: users = the distro user names, input, expected. Lines end in \\n only.",
+ "collisionWords": [
+  "alpine",
+  "arch",
+  "debian",
+  "fedora",
+  "kali",
+  "manjaro",
+  "ubuntu",
+  "void",
+  "xfce",
+  "kde",
+  "lxqt",
+  "mate",
+  "none",
+  "user",
+  "android",
+  "termux",
+  "linux",
+  "andronix",
+  "proot",
+  "admin",
+  "guest"
+ ],
+ "cases": [
+  {
+   "name": "kali: distro words stay",
+   "users": [
+    "kali"
+   ],
+   "input": "Setting up kali-linux-core (2026.3) ...\nandronix install kali --de xfce\nGet:1 http://http.kali.org/kali kali-rolling InRelease",
+   "expected": "Setting up kali-linux-core (2026.3) ...\nandronix install kali --de xfce\nGet:1 http://http.kali.org/kali kali-rolling InRelease"
+  },
+  {
+   "name": "kali: prompt",
+   "users": [
+    "kali"
+   ],
+   "input": "kali@localhost:~$ startxfce4",
+   "expected": "<user>@localhost:~$ startxfce4"
+  },
+  {
+   "name": "kali: home path",
+   "users": [
+    "kali"
+   ],
+   "input": "cp: cannot create regular file '/home/kali/.bashrc': Permission denied",
+   "expected": "cp: cannot create regular file '/home/<user>/.bashrc': Permission denied"
+  },
+  {
+   "name": "kali: id output",
+   "users": [
+    "kali"
+   ],
+   "input": "uid=1000(kali) gid=1000(kali) groups=1000(kali),27(sudo)",
+   "expected": "uid=1000(<user>) gid=1000(<user>) groups=1000(<user>),27(sudo)"
+  },
+  {
+   "name": "kali: parenthesised distro name stays",
+   "users": [
+    "kali"
+   ],
+   "input": "Installing Kali Linux (kali) rolling",
+   "expected": "Installing Kali Linux (kali) rolling"
+  },
+  {
+   "name": "kali: user keyword, quoted",
+   "users": [
+    "kali"
+   ],
+   "input": "useradd: user 'kali' already exists",
+   "expected": "useradd: user '<user>' already exists"
+  },
+  {
+   "name": "kali: su and sudo -u",
+   "users": [
+    "kali"
+   ],
+   "input": "su - kali -c startxfce4\nsudo -u kali dbus-launch xfce4-session",
+   "expected": "su - <user> -c startxfce4\nsudo -u <user> dbus-launch xfce4-session"
+  },
+  {
+   "name": "kali: chown user:group and home",
+   "users": [
+    "kali"
+   ],
+   "input": "chown -R kali:kali /home/kali",
+   "expected": "chown -R <user>:<user> /home/<user>"
+  },
+  {
+   "name": "kali: account command, name last on the line",
+   "users": [
+    "kali"
+   ],
+   "input": "useradd -m -s /bin/zsh kali\nadduser kali sudo",
+   "expected": "useradd -m -s /bin/zsh <user>\nadduser kali sudo"
+  },
+  {
+   "name": "debian: package names and release stay",
+   "users": [
+    "debian"
+   ],
+   "input": "E: Unable to locate package debian-archive-keyring\nDebian GNU/Linux 13 (trixie)\ndebian@localhost:~$ ls /home/debian/Desktop",
+   "expected": "E: Unable to locate package debian-archive-keyring\nDebian GNU/Linux 13 (trixie)\n<user>@localhost:~$ ls /home/<user>/Desktop"
+  },
+  {
+   "name": "ubuntu: prompt only",
+   "users": [
+    "ubuntu"
+   ],
+   "input": "ubuntu@localhost:~$ sudo apt install ubuntu-desktop-minimal\nE: ubuntu-desktop-minimal has no installation candidate",
+   "expected": "<user>@localhost:~$ sudo apt install ubuntu-desktop-minimal\nE: ubuntu-desktop-minimal has no installation candidate"
+  },
+  {
+   "name": "arch: architecture words stay",
+   "users": [
+    "arch"
+   ],
+   "input": "error: package not available for arch aarch64\nuser arch has no password\n/home/arch/.xinitrc missing",
+   "expected": "error: package not available for arch aarch64\nuser <user> has no password\n/home/<user>/.xinitrc missing"
+  },
+  {
+   "name": "xfce: desktop words stay",
+   "users": [
+    "xfce"
+   ],
+   "input": "Installing XFCE desktop: xfce4 xfce4-goodies\ndesktop=xfce\n/home/xfce/.config/xfce4/xfconf missing",
+   "expected": "Installing XFCE desktop: xfce4 xfce4-goodies\ndesktop=xfce\n/home/<user>/.config/xfce4/xfconf missing"
+  },
+  {
+   "name": "user: the word user stays; only real user contexts change",
+   "users": [
+    "user"
+   ],
+   "input": "user is not in the sudoers file. This incident will be reported.\nuser@localhost:~$ id\nuid=1000(user) gid=1000(user)",
+   "expected": "user is not in the sudoers file. This incident will be reported.\n<user>@localhost:~$ id\nuid=1000(<user>) gid=1000(<user>)"
+  },
+  {
+   "name": "android: Android words stay",
+   "users": [
+    "android"
+   ],
+   "input": "Android 14 (android sdk 34) on arm64\n/home/android/storage -> /sdcard",
+   "expected": "Android 14 (android sdk 34) on arm64\n/home/<user>/storage -> /sdcard"
+  },
+  {
+   "name": "termux: package and paths stay",
+   "users": [
+    "termux"
+   ],
+   "input": "com.termux 0.119.0-beta.3 (termux-app)\ntermux@localhost:~$ andronix start",
+   "expected": "com.termux 0.119.0-beta.3 (termux-app)\n<user>@localhost:~$ andronix start"
+  },
+  {
+   "name": "normal name: every whole-word match (today's rule)",
+   "users": [
+    "priya"
+   ],
+   "input": "priya@localhost:~$ ls /home/priya\necho priya done; priya-laptop",
+   "expected": "<user>@localhost:~$ ls /home/<user>\necho <user> done; <user>-laptop"
+  },
+  {
+   "name": "normal name: case-sensitive, as today",
+   "users": [
+    "priya"
+   ],
+   "input": "Priya's phone; priya",
+   "expected": "Priya's phone; <user>"
+  },
+  {
+   "name": "normal name inside a longer word stays",
+   "users": [
+    "ravi"
+   ],
+   "input": "gravity ravi_2 ravi",
+   "expected": "gravity ravi_2 <user>"
+  },
+  {
+   "name": "two users: longest first, each by its own rule",
+   "users": [
+    "kali",
+    "rahul"
+   ],
+   "input": "rahul@localhost:~$ su - kali\nkali-rolling rahul",
+   "expected": "<user>@localhost:~$ su - <user>\nkali-rolling <user>"
+  },
+  {
+   "name": "root and one-letter names are never scrubbed",
+   "users": [
+    "root",
+    "a"
+   ],
+   "input": "root@localhost:~# a b c",
+   "expected": "root@localhost:~# a b c"
+  },
+  {
+   "name": "collision check ignores case",
+   "users": [
+    "Kali"
+   ],
+   "input": "Kali Linux; Kali@localhost:~$",
+   "expected": "Kali Linux; <user>@localhost:~$"
+  },
+  {
+   "name": "a name that is the placeholder word: no double scrub",
+   "users": [
+    "kali",
+    "user"
+   ],
+   "input": "kali@localhost user@phone",
+   "expected": "<user>@localhost <user>@phone"
+  }
+ ]
+}

@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
 	"github.com/AndronixApp/andronix-distros/internal/netx"
@@ -43,6 +44,7 @@ const (
 	fbChecksum = "checksum"    // the stream didn't match its .sha256
 	fbDownload = "download"    // the download failed after retries
 	fbUnpack   = "unpack"      // the archive couldn't be unpacked
+	fbNoSpace  = "nospace"     // the phone ran out of space mid-unpack (#1147): abort, don't fall back
 	fbNoDesk   = "no_desktop"  // unpacked, but the desktop's session isn't in it
 	fbOff      = "off"         // ANDRONIX_NO_IMAGE
 )
@@ -191,6 +193,12 @@ func unpackImage(ctx context.Context, s source, x *rootfs.Extractor, progress fu
 	}
 	if src.err != nil {
 		return downloaded(), fbDownload, src.err
+	}
+	// Out of space: a distinct reason so the caller aborts with the clear
+	// "Not enough space" result instead of falling back to the package
+	// install, which would run the phone out of space all over again (#1147).
+	if errors.Is(xerr, syscall.ENOSPC) {
+		return downloaded(), fbNoSpace, xerr
 	}
 	// The phone's own trouble (disk full, permissions): stop now, without
 	// downloading the rest just to check it.

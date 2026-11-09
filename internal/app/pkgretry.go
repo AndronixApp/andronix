@@ -35,12 +35,31 @@ type pkgOps struct {
 	// seccompRetry: the next attempt is a retry with proot on ptrace only
 	// (PROOT_NO_SECCOMP=1), for this kind (#312 fake_root, #471 proot_syscall).
 	seccompRetry pkgmgr.Kind
+	// l2sRetry: the next attempt dropped proot's --link2symlink (experiment
+	// #319, opt-in via ANDRONIX_L2S_RETRY=1), for this kind; the outcome is
+	// logged and kept as <kind>_l2s_retried / <kind>_l2s_not_fixed.
+	l2sRetry pkgmgr.Kind
+	l2sTried bool // the --link2symlink-off retry has fired this run
+	// prootSegv: the last attempt's captured output had a proot "signal 11".
+	prootSegv bool
 	// keyringAgent: start gpg-agent ourselves inside each retried run
 	// (a keyring failure, support #119).
 	keyringAgent bool
 	// noUpdateHooks: refresh without apt's APT::Update hooks (one failed,
 	// and no hook file we know of matched it).
 	noUpdateHooks bool
+	// #341: a mirror fallback switched the sources this run (switched), and
+	// whether the index re-sync for the new mirror failed (indexStale). With
+	// a stale index the caller stops with the network failure instead of
+	// retrying the install against the old mirror's stale or empty lists and
+	// reporting packages "not found" / "not in repository pool".
+	switched   bool
+	indexStale bool
+	// keyringRefresh is the pacman distros' DISTRO_PRE_UPGRADE (pull the
+	// current *-keyring packages and re-populate), run again when a package
+	// still fails its PGP signature check (#354/#283).
+	keyringRefresh string
+	keyringRetried bool
 }
 
 // withoutUpdateHooks points the first apt-get in cmd (the update, not the
@@ -65,6 +84,9 @@ func newPkgOps(t *proot.Target, fam *pkgmgr.Family, d *conf.Distro, lg *Logger) 
 	if d != nil {
 		p.mirrors = d.MirrorFallbacks()
 		p.cur = make([]int, len(p.mirrors))
+		if fam != nil && fam.ID == "pacman" {
+			p.keyringRefresh = d.PreUpgrade
+		}
 	}
 	return p
 }
@@ -126,6 +148,7 @@ func (p *pkgOps) do(ctx context.Context, cmd string, n int, r ui.Reporter, isUpd
 		if p.keyringAgent {
 			p.t.Run(ctx, "tail -n 20 "+keyringAgentLog+" 2>/dev/null", nil, func(l string) { p.lg.Printf("keyring agent: %s", l) })
 		}
+		p.prootSegv = prootSignal11(lines)
 		if err == nil {
 			if attempt > 1 {
 				p.lg.Printf("package manager: worked on attempt %d", attempt)
@@ -138,6 +161,11 @@ func (p *pkgOps) do(ctx context.Context, cmd string, n int, r ui.Reporter, isUpd
 				p.lg.Printf("package manager: %s: the retry with PROOT_NO_SECCOMP=1 worked", p.seccompRetry)
 				pmSaved = string(p.seccompRetry) + "_retried"
 				p.seccompRetry = ""
+			}
+			if p.l2sRetry != "" {
+				p.lg.Printf("package manager: %s: the retry with --link2symlink off worked", p.l2sRetry)
+				pmSaved = string(p.l2sRetry) + "_l2s_retried"
+				p.l2sRetry = ""
 			}
 			return nil
 		}
@@ -159,12 +187,25 @@ func (p *pkgOps) do(ctx context.Context, cmd string, n int, r ui.Reporter, isUpd
 				f.Kind = k + "_not_fixed"
 			}
 		}
+		if k := p.l2sRetry; k != "" {
+			p.l2sRetry = ""
+			p.lg.Printf("package manager: %s: the retry with --link2symlink off didn't help (%s)", k, f.Kind)
+			if f.Kind == k {
+				f.Kind = k + "_l2s_not_fixed"
+			}
+		}
 		if attempt == pkgAttempts || !p.recover(ctx, f, seen[f.Kind], isUpdate, r) {
 			break
 		}
 		r.Line(fmt.Sprintf("Trying again (%s)...", strings.ReplaceAll(string(f.Kind), "_", " ")))
 	}
-	if isUpdate && p.fam.ID == "apt" && f.Kind != pkgmgr.KindCancelled && f.Kind != pkgmgr.KindDiskFull && p.aptListsUsable() {
+	// A refresh where only some sources failed goes on with the lists apt
+	// has — but not once a mirror fallback has fired (!p.switched): the lists
+	// on disk are then the abandoned mirror's, and carrying on with them is
+	// the #341 bug (a later install reports packages "not found"). After a
+	// switch, surface the refresh failure so the user sees the network error.
+	if isUpdate && p.fam.ID == "apt" && f.Kind != pkgmgr.KindCancelled && f.Kind != pkgmgr.KindDiskFull && f.Kind != pkgmgr.KindGuestLibs &&
+		!clockWrong(f) && !p.switched && p.aptListsUsable() {
 		p.lg.Printf("package manager: some sources failed (%s); going on with the lists apt has", f.Detail)
 		r.Line("Some package sources didn't answer; going on with the others.")
 		p.t.Run(ctx, "dpkg -s ca-certificates >/dev/null 2>&1 || "+p.fam.Install([]string{"ca-certificates"}), nil, nil)
@@ -184,6 +225,39 @@ func (p *pkgOps) halfInstalled(ctx context.Context) string {
 	return strings.Join(out, " ")
 }
 
+// prootSignal11 reports whether proot logged a SIGSEGV ("signal 11") in the
+// captured output — the crash class in #319 on GKI 6.6/6.12 kernels.
+func prootSignal11(lines []string) bool {
+	for _, l := range lines {
+		if strings.Contains(l, "proot") && strings.Contains(l, "signal 11") {
+			return true
+		}
+	}
+	return false
+}
+
+// tryL2SOff is the #319 experiment (opt-in via ANDRONIX_L2S_RETRY=1): when a
+// dpkg op SIGSEGV'd proot, retry once with --link2symlink dropped, to test
+// whether its hardlink emulation is the cause. Fires at most once a run and
+// only on the proot-SIGSEGV dpkg class, so it leaves every other path (and
+// the #312 seccomp experiment) untouched. Off by default: without
+// --link2symlink dpkg's hardlinks go straight through and may fail.
+func (p *pkgOps) tryL2SOff(f *pkgmgr.Failure) bool {
+	if p.l2sTried || proot.NoLink2Symlink || !p.prootSegv || os.Getenv("ANDRONIX_L2S_RETRY") != "1" {
+		return false
+	}
+	switch f.Kind {
+	case pkgmgr.KindDpkg, pkgmgr.KindReinstreq, pkgmgr.KindProotCrash:
+	default:
+		return false
+	}
+	proot.NoLink2Symlink = true
+	p.l2sTried = true
+	p.l2sRetry = f.Kind
+	p.lg.Printf("package manager: %s with proot SIGSEGV (%s); trying again with --link2symlink off", f.Kind, f.Detail)
+	return true
+}
+
 // recover prepares the next try for this failure (the n-th of its kind),
 // or reports that trying again won't help.
 func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate bool, r ui.Reporter) bool {
@@ -194,6 +268,24 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 			p.t.Run(ctx, p.fam.Update, nil, r.Line)
 		}
 	}
+	// #319 experiment: a dpkg op that SIGSEGV'd proot gets one retry with
+	// --link2symlink dropped, ahead of the normal dpkg recovery (which itself
+	// crashes under proot here). Opt-in and naturally scoped by prootSegv.
+	if p.tryL2SOff(f) {
+		return true
+	}
+	// A signature check failing on a phone whose clock is far behind: no
+	// mirror or retry fixes that, so stop and say to fix the date (#354).
+	// (apt's own "not valid yet" date check keeps its one retry with the
+	// date checks off below: that can work when only the Release is newer.)
+	if f.Signature() && f.Kind != pkgmgr.KindClock {
+		if now, behind := clockBehind(); behind {
+			p.lg.Printf("package manager: %s (%s) with the phone's clock at %s, before this installer was built; not retrying", f.Kind, f.Detail, now.UTC().Format(time.RFC3339))
+			f.Kind = pkgmgr.KindClock
+			f.Detail = clockDetail(now)
+			return false
+		}
+	}
 	switch f.Kind {
 	case pkgmgr.KindCancelled, pkgmgr.KindDiskFull:
 		return false
@@ -202,9 +294,11 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 			p.sleep(5 * time.Second)
 			return true
 		}
-		if p.nextMirror(r) {
-			refresh()
-			return true
+		if p.switchMirror(ctx, r, isUpdate) {
+			// Retry on the new mirror only if its index re-synced; a refresh
+			// that failed too means the network is down, so stop with the
+			// connect/DNS failure rather than a misleading not-found (#341).
+			return !p.indexStale
 		}
 		if n <= 3 {
 			p.sleep(time.Duration(n*10) * time.Second)
@@ -215,20 +309,38 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 		if n > 2 {
 			return false
 		}
-		if n == 2 && !p.nextMirror(r) {
-			return false
+		if n == 2 {
+			if !p.switchMirror(ctx, r, isUpdate) {
+				return false
+			}
+			return !p.indexStale // #341: re-synced the new mirror, else stop
 		}
-		refresh() // stale lists name packages the mirror replaced
+		refresh() // n==1: stale lists name packages the mirror replaced
 		return true
 	case pkgmgr.KindHash:
 		if n > 2 {
 			return false
 		}
+		// pacman: a package still fails its PGP signature after the keyring
+		// refresh in "Preparing ... for updates" (or that step was skipped):
+		// refresh the keyring packages once more, then retry (#354/#283).
+		if p.fam.ID == "pacman" && f.Signature() && p.keyringRefresh != "" && !p.keyringRetried {
+			p.keyringRetried = true
+			p.lg.Printf("package manager: PGP signature failure (%s); refreshing the keyring again", f.Detail)
+			r.Line("Refreshing the package signing keys...")
+			sh(p.keyringRefresh)
+		}
 		if apt {
 			sh("rm -rf /var/lib/apt/lists/partial/* /var/lib/apt/lists/*_* /var/cache/apt/archives/partial/*; apt-get clean")
 		}
-		if n == 2 && !p.nextMirror(r) && !apt {
-			return false
+		if n == 2 {
+			if p.switchMirror(ctx, r, isUpdate) {
+				return !p.indexStale // #341: re-synced the new mirror, else stop
+			}
+			if !apt {
+				return false
+			}
+			// apt with no other mirror: refetch the same mirror after the clean.
 		}
 		refresh()
 		return true
@@ -327,21 +439,47 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 	case pkgmgr.KindMirror:
 		// Once on the next mirror, a direct one (not a redirector); if it
 		// happens there too, it's the network (the message says so).
-		if n > 1 || !p.nextMirror(r) {
+		if n > 1 || !p.switchMirror(ctx, r, isUpdate) {
 			return false
 		}
-		refresh()
-		return true
+		return !p.indexStale // #341: retry only with a fresh index for it
 	case pkgmgr.KindIntercepted:
 		// One other mirror, in case it's that mirror; if it happens there
 		// too, it's the network (the message says so).
-		if n > 1 || !p.nextMirror(r) {
+		if n > 1 || !p.switchMirror(ctx, r, isUpdate) {
 			return false
 		}
-		refresh()
-		return true
+		return !p.indexStale // #341
 	case pkgmgr.KindProotExec:
 		return false // the same exec fails again; nothing to change from here
+	case pkgmgr.KindGuestLibs:
+		// Not retried (the same load fails again). Log what tells the
+		// causes apart (card #377): whether distinct libraries read as the
+		// same file (device:inode) under proot — the loader then merges
+		// them, which fits every version reading as missing — and what is
+		// preloaded. One-library programs (stat, cat) still run then.
+		p.t.Run(ctx, guestLibsProbe, nil, func(l string) { p.lg.Printf("guest libs: %s", l) })
+		return false
+	case pkgmgr.KindUnauth:
+		// Packages from lists apt couldn't verify (#354, #4213): fetch the
+		// lists again, once; if that refresh fails its checks too, stop with
+		// this error rather than install unverified packages.
+		if !apt || n > 1 {
+			return false
+		}
+		p.lg.Printf("package manager: unauthenticated packages (%s); refreshing the package lists", f.Detail)
+		if err := p.t.Run(ctx, p.fam.Update, nil, r.Line); err != nil {
+			p.lg.Printf("package manager: the refresh failed too: %v", err)
+			return false
+		}
+		return true
+	case pkgmgr.KindProotCrash:
+		// proot SIGSEGV'd; retrying the same proot just crashes again and
+		// loops on a half-done package op. Stop now and let the user message
+		// route to the app's bundled proot / a Termux update (card #319).
+		// (The opt-in --link2symlink-off experiment above may still fire.)
+		p.lg.Printf("package manager: proot crashed (%s); not retrying, the proot build can't run this op on this phone", f.Detail)
+		return false
 	case pkgmgr.KindProotArgs:
 		if n > 1 {
 			return false
@@ -361,15 +499,18 @@ func (p *pkgOps) recover(ctx context.Context, f *pkgmgr.Failure, n int, isUpdate
 		return true
 	case pkgmgr.KindGPG:
 		// A mirror in the middle of a sync, once.
-		if n > 1 || !p.nextMirror(r) {
+		if n > 1 || !p.switchMirror(ctx, r, isUpdate) {
 			return false
 		}
-		refresh()
-		return true
+		return !p.indexStale // #341
 	}
 	// killed (Android stopped it) and anything else: once more.
 	return n == 1
 }
+
+// guestLibsProbe prints the identity of the libraries apt needs and the
+// preload list, for the install log (card #377).
+const guestLibsProbe = `for f in /lib/*-linux-gnu*/libc.so.6 /lib/*-linux-gnu*/libstdc++.so.6 /lib/*-linux-gnu*/libgcc_s.so.1 /lib/*-linux-gnu*/libapt-pkg.so.* /lib/*-linux-gnu*/libapt-private.so.*; do [ -e "$f" ] && stat -L -c '%d:%i %s %n' "$f"; done 2>&1 | head -n 12; echo "ld.so.preload: $(cat /etc/ld.so.preload 2>/dev/null | tr '\n' ' ')"; uname -rm`
 
 // keyringReset clears a half-made pacman keyring (the retried Update
 // makes the keys again) and reports where gpg wants its sockets.
@@ -431,6 +572,44 @@ func (p *pkgOps) nextMirror(r ui.Reporter) bool {
 		r.Line("Switching to another mirror: " + hostOf(to))
 	}
 	return moved
+}
+
+// switchMirror moves the sources to the next mirror and re-syncs the package
+// index for it before the caller retries. #341: without the re-sync the retry
+// runs against the old mirror's stale or empty lists and reports packages
+// "not found" / "not in repository pool"; if the re-sync itself fails (the new
+// mirror is unreachable too) it sets indexStale, so the caller stops with the
+// network failure instead of the misleading not-found. On the update step the
+// retried command is itself the index refresh, so only the switch is done here.
+// Returns false when there is no further mirror to move to.
+func (p *pkgOps) switchMirror(ctx context.Context, r ui.Reporter, isUpdate bool) bool {
+	if !p.nextMirror(r) {
+		return false
+	}
+	p.switched = true
+	if isUpdate {
+		return true
+	}
+	p.lg.Printf("package manager: refreshing the package index for the new mirror")
+	r.Line("Refreshing the package index for the new mirror...")
+	if err := p.t.Run(ctx, p.fam.Update, nil, r.Line); err != nil {
+		p.lg.Printf("package manager: couldn't refresh the index after the mirror switch: %v", err)
+		p.indexStale = true
+	} else {
+		p.indexStale = false
+	}
+	return true
+}
+
+// clockDetail names the phone's (wrong) date, for the error and telemetry.
+func clockDetail(now time.Time) string {
+	return "the phone's date is " + now.Format("2 January 2006") + ", which is too early"
+}
+
+// clockWrong: f is a clock failure on a phone whose clock is behind.
+func clockWrong(f *pkgmgr.Failure) bool {
+	_, behind := clockBehind()
+	return f.Kind == pkgmgr.KindClock && behind
 }
 
 func hostOf(u string) string {

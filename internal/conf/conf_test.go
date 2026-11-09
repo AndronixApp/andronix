@@ -244,8 +244,16 @@ func TestPreUpgrade(t *testing.T) {
 	if !strings.Contains(k.PreUpgrade, "systemd-standalone-tmpfiles") || !strings.Contains(k.PreUpgrade, "install ok installed") {
 		t.Errorf("kali PreUpgrade: %q", k.PreUpgrade)
 	}
+	// Arch and Manjaro refresh the pacman keyring before the first upgrade
+	// (#1230/#1091); see TestPacmanKeyringPreUpgrade for the full checks.
+	withPreUpgrade := map[string]bool{"ubuntu": true, "kali": true, "arch": true, "manjaro": true}
+	for _, id := range []string{"arch", "manjaro"} {
+		if d, _ := LoadDistro(id); !strings.Contains(d.PreUpgrade, "pacman-key --populate") {
+			t.Errorf("%s PreUpgrade: %q", id, d.PreUpgrade)
+		}
+	}
 	for _, id := range DistroIDs() {
-		if d, _ := LoadDistro(id); id != "ubuntu" && id != "kali" && d.PreUpgrade != "" {
+		if d, _ := LoadDistro(id); !withPreUpgrade[id] && d.PreUpgrade != "" {
 			t.Errorf("%s: unexpected PreUpgrade %q", id, d.PreUpgrade)
 		}
 	}

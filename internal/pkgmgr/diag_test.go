@@ -12,6 +12,13 @@ func TestDiagnoseSupportKinds(t *testing.T) {
 	}{
 		{[]string{"Reading package lists...", "E: Problem executing scripts APT::Update::Post-Invoke-Success 'if /usr/bin/test -w /var/lib/command-not-found/ ...'", "E: Sub-process returned an error code"}, KindHook},
 		{[]string{"E: Sub-process returned an error code"}, KindHook},
+		// #354 (#4213, Debian 13 at "Updating"): unverified lists in use.
+		{[]string{"WARNING: The following packages cannot be authenticated!", "  libc6 libc-bin", "E: There were unauthenticated packages and -y was used without --allow-unauthenticated"}, KindUnauth},
+		// #354: gpg rejecting a key made "in the future" is the phone's clock.
+		{[]string{"gpgv: key 6ED0E7B82643E131 was created 913412 seconds in the future (time warp or clock problem)", "E: The repository 'http://deb.debian.org/debian trixie InRelease' is not signed."}, KindClock},
+		// #377 (AX-4G45SJ, SM-T580 armhf, kernel 3.18): apt can't load its libraries.
+		{[]string{"apt-get: /lib/arm-linux-gnueabihf/libapt-private.so.0.0: version `GLIBCXX_3.4.21' not found (required by apt-get)", "apt-get: /lib/arm-linux-gnueabihf/libapt-private.so.0.0: version `GLIBC_2.4' not found (required by /lib/arm-linux-gnueabihf/libapt-private.so.0.0)"}, KindGuestLibs},
+		{[]string{"apt: symbol lookup error: /lib/arm-linux-gnueabihf/libapt-pkg.so.6.0: undefined symbol: _ZTVN10__cxxabiv117__class_type_infoE, version CXXABI_1.3", "E: Sub-process returned an error code"}, KindGuestLibs},
 		// support #312: proot's fake root didn't take
 		{[]string{"==> ERROR: pacman-key needs to be run as root for this operation."}, KindFakeRoot},
 		{[]string{"E: Could not open lock file /var/lib/dpkg/lock-frontend - open (13: Permission denied)", "E: Unable to acquire the dpkg frontend lock (/var/lib/dpkg/lock-frontend), are you root?"}, KindFakeRoot},
@@ -30,6 +37,9 @@ func TestDiagnoseSupportKinds(t *testing.T) {
 		// Support #171 (Galaxy SM-E135F, armv8l, Play Termux): not an option problem.
 		{[]string{`proot error: execve("/usr/bin/env"): No such file or directory`, "proot info: possible causes:", "fatal error: see `proot --help`.", "proot error: can't chmod '/data/data/com.termux/files/home/.andronix/tmp/proot-12566-d4IFWa': No such file or directory"}, KindProotExec},
 		{[]string{"proot error: can't create glue rootfs", "fatal error: see `proot --help`."}, KindProotFailed},
+		// #319: a proot SIGSEGV wins over the dpkg/reinstreq symptom it leaves.
+		{[]string{"Unpacking openssl-provider-legacy (3.5.5-1ubuntu3.7) over (3.5.5-1ubuntu3.5) ...", "proot warning: signal 11 received from process -1", "E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct the problem."}, KindProotCrash},
+		{[]string{"proot warning: signal 11 received from process -1", "error: failed to synchronize all databases (unexpected error)"}, KindProotCrash},
 		// Support #201 (TECNO KI7, Kali XFCE, a resumed install): a package
 		// left half-unpacked; not "other", not the plain interrupted case.
 		{[]string{"7 not fully installed or removed.", "dpkg: error processing package cpp-16-aarch64-linux-gnu (--configure):", " package is in a very bad inconsistent state; it should", " be reinstalled before attempting configuration", "E: Sub-process /usr/bin/dpkg returned an error code (1)"}, KindReinstreq},
@@ -59,5 +69,27 @@ func TestDiagnoseKeyring(t *testing.T) {
 	// A real signature problem stays gpg.
 	if got := Diagnose([]string{"error: archlinuxarm: signature from \"X\" is invalid"}, errors.New("exit status 1")); got.Kind != KindGPG {
 		t.Errorf("bad signature: got %s", got.Kind)
+	}
+}
+
+// TestFailureSignature: the kinds that a far-behind phone clock causes, and
+// pacman's PGP "invalid or corrupted package" (a hash_mismatch by kind) but
+// not a plain checksum mismatch (#354).
+func TestFailureSignature(t *testing.T) {
+	for _, c := range []struct {
+		lines []string
+		want  bool
+	}{
+		{[]string{":: File /var/cache/pacman/pkg/glibc-2.42-1-aarch64.pkg.tar.xz is corrupted (invalid or corrupted package (PGP signature))."}, true},
+		{[]string{"error: glibc: signature from \"Arch Linux ARM Build System <builder@archlinuxarm.org>\" is unknown trust", "error: failed to commit transaction (invalid or corrupted package)"}, true},
+		{[]string{"E: Failed to fetch http://x/y.deb  Hash Sum mismatch"}, false},
+		{[]string{"E: The repository 'http://deb.debian.org/debian trixie InRelease' is not signed."}, true},
+		{[]string{"E: There were unauthenticated packages and -y was used without --allow-unauthenticated"}, true},
+		{[]string{"E: Unable to locate package foo"}, false},
+	} {
+		f := Diagnose(c.lines, errors.New("exit status 1"))
+		if got := f.Signature(); got != c.want {
+			t.Errorf("%q: kind %s, Signature()=%v, want %v", c.lines, f.Kind, got, c.want)
+		}
 	}
 }

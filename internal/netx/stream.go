@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"time"
 )
 
 // ErrSourceChanged: a resumed download could not be spliced onto what was
@@ -104,7 +103,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 				continue
 			}
 		}
-		n, err := readWithTimeout(s.body, p, 60*time.Second)
+		n, err := readWithTimeout(s.body, p, stallTimeout)
 		if n > 0 {
 			s.cur += int64(n)
 			s.tries = 0

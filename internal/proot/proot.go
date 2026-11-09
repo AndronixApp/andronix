@@ -154,12 +154,27 @@ func (t *Target) Args() []string {
 	if Minimal {
 		optional = []string{"--link2symlink"}
 	}
+	// Experiment (#319): drop --link2symlink to test whether its hardlink
+	// emulation is what SIGSEGVs proot during dpkg unpack on GKI 6.6/6.12
+	// "android15/android16" kernels. Off by default; without it dpkg's
+	// hardlinks go straight through and may fail, so this is only ever a
+	// last-resort retry (NoLink2Symlink, set by pkgOps) or a hand-set A/B
+	// lever (ANDRONIX_NO_L2S=1), never the shipped default.
+	if NoLink2Symlink || os.Getenv("ANDRONIX_NO_L2S") == "1" {
+		kept := optional[:0:0]
+		for _, f := range optional {
+			if f != "--link2symlink" {
+				kept = append(kept, f)
+			}
+		}
+		optional = kept
+	}
 	for _, f := range optional {
 		if Has(f) {
 			a = append(a, f)
 		}
 	}
-	if Has("--kernel-release") && !Minimal {
+	if Has("--kernel-release") && !Minimal && spoofKernelRelease() {
 		a = append(a, "--kernel-release=6.12.0-andronix")
 	}
 	if t.User != "" && t.UID != "" {
@@ -580,6 +595,14 @@ func hostEnv() []string {
 // proot -0 (support #312).
 var NoSeccomp bool
 
+// NoLink2Symlink drops proot's --link2symlink for the rest of this run
+// (experiment #319): set after a package op SIGSEGV'd proot, to test whether
+// link2symlink's hardlink emulation is the cause. Also forced from the start
+// by ANDRONIX_NO_L2S=1 (a hand-set A/B lever). Default off: without it dpkg's
+// hardlinks go straight through and may fail, so it is never the shipped
+// default.
+var NoLink2Symlink bool
+
 // EnvHook returns environment for every proot run (the compat rules, set
 // by the app). Called once, lazily.
 var (
@@ -640,6 +663,49 @@ func oldSyscallOrder(release string) bool {
 		return false
 	}
 	return major < 4 || major == 4 && minor < 8
+}
+
+// KernelSpoofFloor is the kernel (major.minor) at or above which Andronix
+// stops passing --kernel-release. The 6.12 spoof exists only so a modern
+// distro's minimum-kernel check passes on OLD phones; the highest floor
+// among the distros we ship is Arch/Manjaro's glibc (--enable-kernel 4.4),
+// Debian/Ubuntu/Kali glibc is 3.2, systemd is ~4.15, and musl (Alpine) has
+// no check — so a real kernel this new clears every one by years. On such a
+// phone the guest sees its real, modern release and proot's kompat
+// extension (which --kernel-release turns on, and whose stock Termux
+// handlers SIGSEGV on GKI 6.6/6.12 "android15/16" kernels, card #319) never
+// runs. 6.0 covers the whole crash cluster (all 6.6/6.12) with margin.
+const (
+	KernelSpoofFloorMajor = 6
+	KernelSpoofFloorMinor = 0
+)
+
+// SpoofKernelRelease reports whether a phone on this kernel release still
+// needs the --kernel-release spoof: true when the release is older than the
+// floor, or can't be parsed (the safe default — keep the old behaviour).
+// Pure; the env override and the real kernel are applied by the caller.
+func SpoofKernelRelease(release string) bool {
+	var major, minor int
+	if n, _ := fmt.Sscanf(release, "%d.%d", &major, &minor); n < 2 {
+		return true
+	}
+	if major != KernelSpoofFloorMajor {
+		return major < KernelSpoofFloorMajor
+	}
+	return minor < KernelSpoofFloorMinor
+}
+
+// spoofKernelRelease decides it for this run. ANDRONIX_KERNEL_RELEASE_SPOOF
+// forces it either way for an A/B: "1"/"always" keeps the spoof (the old
+// behaviour, the control), "0"/"never" drops it.
+func spoofKernelRelease() bool {
+	switch os.Getenv("ANDRONIX_KERNEL_RELEASE_SPOOF") {
+	case "1", "always":
+		return true
+	case "0", "never":
+		return false
+	}
+	return SpoofKernelRelease(sys.KernelRelease())
 }
 
 var tmpOnce sync.Once

@@ -285,3 +285,29 @@ func TestDesktopLeft(t *testing.T) {
 		t.Error("nothing there: want false")
 	}
 }
+
+// A dropped supplementary VNC package (Ubuntu 26.04 "resolute" removed
+// tigervnc-tools) is filtered out while the server is kept; a check that
+// resolves nothing falls back to the full list so the server can't be
+// silently dropped (#1625).
+func TestVncPackages(t *testing.T) {
+	all := []string{"tigervnc-standalone-server", "tigervnc-tools"}
+	for _, tc := range []struct {
+		name string
+		all  []string
+		have []string
+		want []string
+	}{
+		{"resolute drops tools", all, []string{"tigervnc-standalone-server"}, []string{"tigervnc-standalone-server"}},
+		{"all present", all, all, all},
+		{"none resolved falls back to all", all, nil, all},
+		{"empty stays empty", nil, nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := vncPackages(tc.all, tc.have)
+			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
+				t.Errorf("vncPackages(%v, %v) = %v, want %v", tc.all, tc.have, got, tc.want)
+			}
+		})
+	}
+}

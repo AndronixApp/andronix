@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/AndronixApp/andronix-distros/internal/sys"
@@ -142,6 +143,14 @@ func (x *Extractor) extract(tr *tar.Reader) error {
 			continue
 		}
 		if err := x.entry(tr, h, name); err != nil {
+			// A full disk can't be warned past: every later file would fail
+			// the same way and we'd finish "successfully" with a half-unpacked
+			// rootfs, failing much later at "Setting up" with a confusing
+			// mkdir error (#1147). Stop on the first ENOSPC and let the caller
+			// map it to the clear "Not enough space" result.
+			if errors.Is(err, syscall.ENOSPC) {
+				return fmt.Errorf("%s: %w", name, err)
+			}
 			x.warn("%s: %v", name, err)
 		}
 	}
