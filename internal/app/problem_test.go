@@ -27,14 +27,16 @@ func TestRedact(t *testing.T) {
 		"/data/data/com.termux/files/home/.andronix/logs/install.log and /data/user/0/com.termux/files/home/x",
 		"uid u0_a214 ran as alex in /home/alex; alexander stays",
 		`Authorization: Bearer abc.def`,
+		"WARNING: updating https://bob:s3cr3t!pw@repo.example.org/alpine/main/aarch64/APKINDEX.tar.gz: HTTP 403: Forbidden",
+		"Err:1 http://tok_9f8e7d@apt.example.net/debian stable InRelease",
 	}, "\n")
 	out := r.do(in)
-	for _, bad := range []string{"KEY123", "KEY9", "abc%2Bdef", "HASH", "jane.doe", "example.com", "com.termux/files/home", "u0_a214", "/home/alex", "abc.def"} {
+	for _, bad := range []string{"KEY123", "KEY9", "abc%2Bdef", "HASH", "jane.doe", "example.com", "com.termux/files/home", "u0_a214", "/home/alex", "abc.def", "s3cr3t", "bob:", "tok_9f8e7d"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("%q left in:\n%s", bad, out)
 		}
 	}
-	for _, keep := range []string{"--token <token>", "ubuntu.tar.xz?<redacted>", "~/.andronix/logs/install.log", "alexander stays", "<uid>", "<email>"} {
+	for _, keep := range []string{"--token <token>", "ubuntu.tar.xz?<redacted>", "~/.andronix/logs/install.log", "alexander stays", "<uid>", "<email>", "https://<redacted>@repo.example.org/alpine/main", "http://<redacted>@apt.example.net/debian"} {
 		if !strings.Contains(out, keep) {
 			t.Errorf("want %q in:\n%s", keep, out)
 		}

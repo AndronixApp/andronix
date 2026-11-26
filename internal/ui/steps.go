@@ -242,7 +242,63 @@ type stepModel struct {
 	cancel context.CancelFunc
 	rep    *teaRep
 	log    Logger
+	runs   stepRuns
 }
+
+// stepRuns counts the step functions that are running, so runTea can let a
+// cancelled one finish: it is ending the processes it started (proot.Run),
+// and an andronix that exits under it leaves them running.
+type stepRuns struct {
+	mu     sync.Mutex
+	n      int
+	closed bool
+}
+
+// begin reports whether a step may start: not once wait was called.
+func (r *stepRuns) begin() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return false
+	}
+	r.n++
+	return true
+}
+
+func (r *stepRuns) end() {
+	r.mu.Lock()
+	r.n--
+	r.mu.Unlock()
+}
+
+// wait lets no further step start and waits, limit at most, for the ones
+// running. It reports whether they all ended.
+func (r *stepRuns) wait(limit time.Duration) bool {
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
+	for end := time.Now().Add(limit); ; time.Sleep(10 * time.Millisecond) {
+		r.mu.Lock()
+		n := r.n
+		r.mu.Unlock()
+		if n == 0 {
+			return true
+		}
+		if time.Now().After(end) {
+			return false
+		}
+	}
+}
+
+// stepStopWait is how long a cancelled step gets to end its processes
+// before andronix exits anyway, and stepStopNote how long before it says
+// so (variables for tests). Ending proot's processes takes well under a
+// second; a step that doesn't watch for a cancel (unpacking) has nothing
+// to end and is left after the wait.
+var (
+	stepStopWait = 3 * time.Second
+	stepStopNote = time.Second
+)
 
 func newStepModel(ctx context.Context, steps []Step, log Logger) *stepModel {
 	sp := spinner.New()
@@ -272,7 +328,13 @@ func (m *stepModel) startStep() tea.Cmd {
 	m.log.Printf("== step: %s", s.Label)
 	rep := m.rep
 	ctx := m.ctx
-	return func() tea.Msg { return doneMsg{s.Run(ctx, rep)} }
+	return func() tea.Msg {
+		if !m.runs.begin() {
+			return nil
+		}
+		defer m.runs.end()
+		return doneMsg{s.Run(ctx, rep)}
+	}
 }
 
 func (m *stepModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -374,9 +436,34 @@ func runTea(ctx context.Context, steps []Step, log Logger) error {
 	}
 	p := tea.NewProgram(m, opts...)
 	m.rep = &teaRep{send: p.Send, log: log}
-	if _, err := p.Run(); err != nil {
-		return err
-	}
+	_, err := p.Run()
 	m.cancel()
-	return m.err
+	// However the list ended, a step that is still running was just
+	// cancelled: it gets to end its processes before andronix exits.
+	if !m.runs.wait(stepStopNote) {
+		Note("Stopping...")
+		if !m.runs.wait(stepStopWait - stepStopNote) {
+			log.Printf("the cancelled step didn't end within %v", stepStopWait)
+		}
+	}
+	return listResult(err, m.err, m.idx < len(m.steps))
+}
+
+// listResult is what the step list returns: err is bubbletea's, stepErr the
+// failed step's (or ErrCancelled after Ctrl-C as a key), undone whether
+// steps are left.
+func listResult(err, stepErr error, undone bool) error {
+	switch {
+	case errors.Is(err, tea.ErrInterrupted):
+		// Ctrl-C while the list takes no keys (--yes, a prompt-less run):
+		// the terminal sends SIGINT and bubbletea ends with this error.
+		// It is a cancel, not "Something went wrong".
+		return ErrCancelled
+	case err != nil:
+		return err
+	case stepErr == nil && undone:
+		// SIGTERM: bubbletea quits without an error, with steps undone.
+		return ErrCancelled
+	}
+	return stepErr
 }

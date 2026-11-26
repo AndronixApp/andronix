@@ -37,7 +37,48 @@ import (
 //	                 zero-copy window covers, so the app draws it there.
 //	app -> helper: G   asks for the geometry now
 //
-// Older apps ignore both lines.
+// Older apps ignore both lines. On a cursor change the area under the
+// pointer is also marked damaged (fbcursor.go), so the framebuffer's own
+// cursor never goes stale for apps that don't draw X.
+
+// cursorSerialMax is how many cursor serials one connection remembers, the
+// same as the app's CursorCache.MAX: an animated cursor has 24-60 frames, one
+// XFixes serial each.
+const cursorSerialMax = 128
+
+// cursorSerials is the set of cursor serials whose image this connection has,
+// least recently used first and bounded at cursorSerialMax. The app keeps the
+// same bound with the same order (every X line, full or short, counts as a
+// use on both sides), so a serial still named here in short form is one the
+// app still has, and one that fell out is sent with its image again.
+type cursorSerials struct {
+	order []uint32
+}
+
+// seen reports whether serial's image went to this connection (no use counted).
+func (c *cursorSerials) seen(serial uint32) bool {
+	for _, v := range c.order {
+		if v == serial {
+			return true
+		}
+	}
+	return false
+}
+
+// sent records an X line for serial (image or short form): most recently used
+// now; past the bound the least recently used serial is forgotten.
+func (c *cursorSerials) sent(serial uint32) {
+	for i, v := range c.order {
+		if v == serial {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
+	}
+	c.order = append(c.order, serial)
+	if len(c.order) > cursorSerialMax {
+		c.order = c.order[1:]
+	}
+}
 
 // geomRect is one window: its frame and its client, in root coordinates.
 type geomRect struct{ fx, fy, fw, fh, cx, cy, cw, ch int }
@@ -50,7 +91,7 @@ type geomState struct {
 	lastG       string
 	clients     map[xproto.Window]xproto.Window // frame -> client (0: none), until a map/unmap/reparent
 	watched     map[xproto.Window]bool          // clients with StructureNotify selected
-	sentSerials map[uint32]bool                 // cursors this connection has the image of
+	sentSerials cursorSerials                   // cursors this connection has the image of (bounded, LRU)
 	lastSerial  uint32
 	cursorSent  bool // an X line went to this connection
 }
@@ -60,7 +101,7 @@ type geomState struct {
 // StructureNotify on each client found (a client moving inside its frame).
 func (h *fbHelper) geomInit() error {
 	g := &geomState{dirty: make(chan struct{}, 1), cursorDirty: make(chan struct{}, 1),
-		clients: map[xproto.Window]xproto.Window{}, watched: map[xproto.Window]bool{}, sentSerials: map[uint32]bool{}}
+		clients: map[xproto.Window]xproto.Window{}, watched: map[xproto.Window]bool{}}
 	if a, err := xproto.InternAtom(h.x, false, uint16(len("WM_STATE")), "WM_STATE").Reply(); err == nil {
 		g.wmState = a.Atom
 	}
@@ -128,10 +169,13 @@ func (h *fbHelper) geomSender() {
 }
 
 // cursorSender sends X for the newest cursor: one sender, so an older image
-// never arrives after a newer one.
+// never arrives after a newer one. A cursor change is also when programs
+// warp the pointer (a drag's grab cursor, a game), so the position is
+// checked too (fbcursor.go).
 func (h *fbHelper) cursorSender() {
 	for range h.geom.cursorDirty {
 		h.sendCursor(false)
+		h.checkPointer()
 	}
 }
 
@@ -287,8 +331,9 @@ func (h *fbHelper) geomNewClient() {
 		return
 	}
 	h.geom.mu.Lock()
-	h.geom.sentSerials = map[uint32]bool{}
+	h.geom.sentSerials = cursorSerials{}
 	h.geom.cursorSent = false
+	h.geom.lastSerial = 0
 	h.geom.lastG = ""
 	h.geom.mu.Unlock()
 }
@@ -342,17 +387,20 @@ func (h *fbHelper) sendCursor(always bool) {
 	if err != nil {
 		return
 	}
+	g := h.geom
+	g.mu.Lock()
+	changed := img.CursorSerial != g.lastSerial
+	g.lastSerial = img.CursorSerial
+	same := g.cursorSent && !changed
+	seen := g.sentSerials.seen(img.CursorSerial)
+	g.mu.Unlock()
+	h.noteCursor(img, changed) // the area under the pointer shows the new image
 	h.mu.Lock()
 	c := h.client
 	h.mu.Unlock()
 	if c == nil {
 		return
 	}
-	g := h.geom
-	g.mu.Lock()
-	same := g.cursorSent && img.CursorSerial == g.lastSerial
-	seen := g.sentSerials[img.CursorSerial]
-	g.mu.Unlock()
 	if same && !always {
 		return
 	}
@@ -362,8 +410,7 @@ func (h *fbHelper) sendCursor(always bool) {
 	}
 	h.writeLine(c, line)
 	g.mu.Lock()
-	g.sentSerials[img.CursorSerial] = true
-	g.lastSerial = img.CursorSerial
+	g.sentSerials.sent(img.CursorSerial)
 	g.cursorSent = true
 	g.mu.Unlock()
 }

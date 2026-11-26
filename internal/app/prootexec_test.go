@@ -1,11 +1,13 @@
 package app
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/AndronixApp/andronix-distros/internal/compat"
 	"github.com/AndronixApp/andronix-distros/internal/sys"
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
@@ -86,5 +88,43 @@ func TestAppLibError(t *testing.T) {
 	os.Remove(applib)
 	if err := appLibCheck(); err != nil {
 		t.Errorf("F-Droid Termux: %v", err)
+	}
+}
+
+// Support #5402: the prober itself crashed inside the distro (Go's runtime
+// on a 32-bit phone: "futexwakeup ... returned -38", SIGSEGV, exit status
+// 2). A probe that measures nothing must not stop setup, whatever it
+// printed; only proot failing to start any program (execve) does.
+func TestProbeFailedStopsOnlyOnProotExec(t *testing.T) {
+	c := &compatRun{name: "Kali Linux", facts: compat.Facts{Probe: &compat.Probe{}}}
+	crash := strings.Join([]string{
+		"futexwakeup addr=0xc804e324 returned -38",
+		"SIGSEGV: segmentation violation",
+		"PC=0x64488 m=0 sigcode=1 addr=0x1006",
+		"",
+		"goroutine 0 gp=0xa9a468 m=0 mp=0xa9bcf0 [idle]:",
+		"runtime.futexwakeup(0xc804e324, 0x1)",
+		"    runtime/os_linux.go:98 +0x70 fp=0xff9ac2e4 sp=0xff9ac2b8 pc=0x64488",
+		"runtime.morestack()",
+		"    runtime/asm_arm.s:406 +0x60 fp=0xff9ac4f8 sp=0xff9ac4f4 pc=0xac23c",
+		"trap    0x0",
+		"fault   0x1006",
+	}, "\n")
+	for name, out := range map[string]string{
+		"go runtime crash": crash,
+		"morestack on g0":  "fatal: morestack on g0\n",
+		"killed":           "",
+		"sh error":         "/bin/sh: 1: /usr/local/bin/andronix: Exec format error\n",
+	} {
+		for _, err := range []error{errors.New("exit status 2"), errors.New("signal: killed"), nil} {
+			if got := c.probeFailed(out, err); got != nil {
+				t.Errorf("%s (%v): the probe stopped the install: %v", name, err, got)
+			}
+		}
+	}
+	out := "proot error: execve(\"/usr/bin/env\"): No such file or directory\nfatal error: see `proot --help`.\n"
+	var ue *ui.UserError
+	if err := c.probeFailed(out, errors.New("exit status 1")); !errors.As(err, &ue) || ue.Class != "proot_exec" {
+		t.Errorf("proot execve failure: got %v, want the proot_exec error", err)
 	}
 }

@@ -23,10 +23,22 @@ func TestPacmanKeyringPreUpgrade(t *testing.T) {
 		if strings.Contains(cmd, `\$`) || strings.Contains(cmd, `\"`) {
 			t.Errorf("%s: PreUpgrade has literal backslash escapes (conf parser doesn't unescape): %q", id, cmd)
 		}
-		for _, want := range []string{"pacman -Sy", "pacman-key --populate", "--refresh-keys", "-keyring"} {
+		for _, want := range []string{"pacman -Sy --needed --noconfirm $h", "pacman-key --populate", "-keyring"} {
 			if !strings.Contains(cmd, want) {
 				t.Errorf("%s: PreUpgrade missing %q", id, want)
 			}
+		}
+		// No keyserver (support #5349): under proot a refresh from one only
+		// cost three minutes whenever the mirror was slow, and fixed nothing.
+		for _, bad := range []string{"--refresh-keys", "--recv-keys", "keyserver"} {
+			if strings.Contains(cmd, bad) {
+				t.Errorf("%s: PreUpgrade depends on a keyserver (%q): %q", id, bad, cmd)
+			}
+		}
+		// Best-effort: the step must not fail, and populate runs even when
+		// the keyring packages couldn't be fetched.
+		if !strings.HasSuffix(cmd, "pacman-key --populate; true") {
+			t.Errorf("%s: PreUpgrade must end with `pacman-key --populate; true`: %q", id, cmd)
 		}
 		// Balanced quotes and braces — a rough guard that the conf value wasn't
 		// mangled (bash -n would be stronger but exec is barred in this repo).

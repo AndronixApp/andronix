@@ -8,6 +8,30 @@ libandronix.so install debian --de xfce --yes --user alex --progress json
 
 `--progress json` implies `--yes` and no questions.
 
+## Android 11: start the installer without `setsid` (card #395)
+
+The process the app starts has to be the installer itself, with the pid the app keeps. The app reads the events until that process ends, takes its exit code for the result when no `done` line came (exit 0 counts as installed), and sends Stop's signals to that pid.
+
+App 10.1.8 to 10.2.3 start it with a shell script: `echo $$ > install.pid`, then `exec setsid <installer> ...` when the shell doesn't lead a process group and `setsid` exists, else `exec <installer> ...`. With `setsid` the pid is kept on Android 8 to 10 and on 12 and later (sources checked: 8, 9, 10, 12, 14), where toybox's `setsid` only forks when its caller already leads a process group. Android 11's `setsid` calls `setpgid(0, 0)` before `setsid()`, so `setsid()` always fails and it always forks: the installer is a child with another pid, and the process the app started exits 0 at once. Android closes the app's end of the output pipe when the process it started exits, so on Android 11:
+
+- the app gets at most the first few events and shows the install as finished within a second;
+- the install goes on unseen (writing events fails without stopping it) and holds the distro's lock until it ends;
+- Stop has nothing to signal;
+- another install of that distro in that time gets `install_running`, which is true: one is running.
+
+The installer can't repair this from its side: it only starts after the fork, as a process the app doesn't know and whose output it won't read.
+
+**App 10.2.3 fixes it** (Andronix-App PR #14), without anything from the installer, so it holds for every installer version:
+
+- `setsid` gets `-w` wherever it takes it (Android 11 and later; the flag came to toybox together with the forking). On Android 11 the process the app started is then `setsid -w`, which waits for the installer and ends with its exit code (128 + the signal when it was killed). Elsewhere `setsid` doesn't fork and the app's process is the installer, as before. On Android 11, `setsid` is never run without `-w`.
+- `install.pid` is written after `setsid`, by a shell that then becomes the installer (`setsid [-w] sh -c 'echo $$ > install.pid; exec <installer> ...'`). So it always holds the installer's own pid, and that pid leads the session and process group Stop kills.
+
+So the installer doesn't call `setsid()` itself, and must not: it already leads its session, where `setsid()` fails.
+
+**Stop on Android 11 used to crash the installer** (fixed in 2.1.6). With the app fixed, Stop's SIGTERM reaches the installer there for the first time. To stop its child (proot), Go's `os/exec` sends through a pidfd (`pidfd_send_signal`) on kernels that have one, as Android 11's 5.4 kernels do, and Android's seccomp policy before Android 12 answers that system call with SIGSYS: the installer died with "SIGSYS: bad system call" (exit 2) and no `done` line. The app still showed the install as cancelled (it knows the user stopped it), nothing was left running and the lock was free, but the installer never got to say `cancelled`. From 2.1.6 the installer signals by pid (`internal/sys/signal.go`, and the cancel of a command in a distro, `internal/proot`; a test reads the source for `.Process.Kill(`, `.Process.Signal(`, `os.FindProcess(` and `.WaitDelay`, which all end in that system call; the one `WaitDelay` in `internal/proot` is let through, since os/exec only kills there when the command hasn't ended 5 s after our own SIGKILL), and a Stop ends with `done` `cancelled` and exit 130 on Android 11 as everywhere else. Installers before 2.1.6 keep that crash on Android 11 phones with a 5.4 kernel; the app's result is the same either way.
+
+In the numbers (installer `install_result` events in OpenPanel, host `standalone`, by `android_sdk`, Oct 1 to Nov 10): 167 of about 1,000 results from Android 11 are `install_running` and none is `cancelled`; the other Android versions have 3 to 9% `cancelled` and next to no `install_running`. In a sample of 235 app events `standalone_install` with `ok=true` and `seconds=0` from Nov 7 to 9, 196 are from Android 11.
+
 ## Events (`t`)
 
 | t | fields | when |
@@ -146,7 +170,7 @@ Every error the installer explains has a fixed class: titles change, classes don
 |---|---|
 | `not_installed` | the distro (or edition) isn't installed |
 | `not_finished` | the distro's install didn't finish |
-| `install_running` | another andronix is installing, updating, removing or restoring the same distro (another Termux session); wait for it |
+| `install_running` | another andronix is installing, updating, removing or restoring the same distro (another Termux session, or in the app a run it lost sight of: see "Android 11" above); wait for it. The lock is held by the running process and ends with it, however it ends: a cancelled or killed run never leaves it behind |
 | `remove_failed` | removing left files behind |
 | `couldn_t_remove_the_older_install` | the older install's files couldn't be removed |
 | `couldn_t_remove_everything`, `couldn_t_remove_the_old_copy` | removing an edition left files behind |
@@ -226,7 +250,7 @@ Every error the installer explains has a fixed class: titles change, classes don
 
 Why it failed, for `package_manager`, `termux_pkg`, `download`, `proot_exec` and space. Only added, never renamed.
 
-Package manager: `network_dns`, `network_connect`, `network_intercepted` (a captive portal or proxy answered instead of the mirror), `http_404`, `http_5xx`, `hash_mismatch`, `clock_skew`, `gpg`, `keyring` (the distro's signing keys can't be read), `fake_root` (a program in the distro wasn't root under proot; one retry with `PROOT_NO_SECCOMP=1`, and `fake_root_not_fixed` when that didn't help), `proot_syscall` (a program in the distro got "Function not implemented" or gpgv died under proot; one retry with `PROOT_NO_SECCOMP=1`, and `proot_syscall_not_fixed` when that didn't help), `proot_crash` (proot itself SIGSEGV'd mid-run and the install stopped; `proot_crash_l2s_not_fixed` when the opt-in `--link2symlink`-off retry didn't help either), `dpkg_interrupted`, `dpkg_reinstreq`, `mirror_unusable`, `apt_hook` (an apt update or dpkg hook failed), `lock`, `broken_deps`, `unauthenticated` (apt refused packages from lists it couldn't verify; one list refresh, then it stops), `guest_libs` (the distro's programs can't load their libraries under proot; 32-bit, kernel 3.18, card #377), `disk_full`, `killed`, `cancelled`, `other`.
+Package manager: `network_dns`, `network_connect`, `network_intercepted` (a captive portal or proxy answered instead of the mirror), `http_404`, `http_5xx`, `hash_mismatch`, `clock_skew`, `gpg`, `keyring` (the distro's signing keys can't be read), `fake_root` (a program in the distro wasn't root under proot; one retry with `PROOT_NO_SECCOMP=1`, and `fake_root_not_fixed` when that didn't help), `proot_syscall` (a program in the distro got "Function not implemented" or gpgv died under proot; one retry with `PROOT_NO_SECCOMP=1`, and `proot_syscall_not_fixed` when that didn't help), `proot_crash` (proot itself SIGSEGV'd mid-run and the install stopped; `proot_crash_l2s_not_fixed` when the opt-in `--link2symlink`-off retry didn't help either), `dpkg_interrupted`, `dpkg_reinstreq`, `pacman_db` (pacman's local database has a half-installed package from a run that was killed while unpacking it; reinstalled once, then it stops), `mirror_unusable`, `apt_hook` (an apt update or dpkg hook failed), `lock`, `broken_deps`, `unauthenticated` (apt refused packages from lists it couldn't verify; one list refresh, then it stops), `package_not_found` (distros on apt only; Termux's own packages keep `other`. apt knows no version of a package: "has no installation candidate", "Unable to locate package"; the package lists are fetched again once, and the main archive moves to the next mirror when they don't arrive. With no lists from any mirror tried the error is the refresh's instead: `network_dns`, `network_connect`, `mirror_unusable` and so on, titled as a failed refresh; a refresh that failed for a reason of its own keeps that line as `other`), `guest_libs` (the distro's programs can't load their libraries under proot; 32-bit, kernel 3.18, card #377; musl's "Error relocating" on Alpine too), `disk_full`, `killed`, `cancelled`, `other`.
 
 proot: `proot_exec` (it can't start programs in the distro), `proot_args` (it refused an option), `proot_failed` (any other proot error).
 

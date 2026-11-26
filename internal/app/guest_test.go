@@ -3,6 +3,9 @@ package app
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/AndronixApp/andronix-distros/internal/sys"
 )
 
 // card #138: the app blocks some desktops on kernels before 4.8 and says
@@ -106,5 +109,30 @@ func TestIsXServer(t *testing.T) {
 		if got := isXServer(c.cmdline); got != c.want {
 			t.Errorf("%s: isXServer(%q) = %v, want %v", c.name, c.cmdline, got, c.want)
 		}
+	}
+}
+
+// m3 (review-helper.md): startXServer waits up to 10 s for the X socket;
+// an Xvfb that rejected an option (-nocursor on an old server) exits at
+// once and the wait must end with it, not run out.
+func TestProcessExited(t *testing.T) {
+	done := sys.Command("true")
+	if err := done.Start(); err != nil {
+		t.Skip(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !processExited(done.Process.Pid) {
+		if time.Now().After(deadline) {
+			t.Fatal("an exited process still counts as running")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	running := sys.Command("sleep", "5")
+	if err := running.Start(); err != nil {
+		t.Skip(err)
+	}
+	defer func() { running.Process.Kill(); running.Wait() }()
+	if processExited(running.Process.Pid) {
+		t.Fatal("a running process counts as exited")
 	}
 }

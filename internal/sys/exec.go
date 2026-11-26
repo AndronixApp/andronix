@@ -71,6 +71,9 @@ func CommandContext(ctx context.Context, name string, arg ...string) *exec.Cmd {
 		c = exec.Command(p, argv[1:]...)
 	} else {
 		c = exec.CommandContext(ctx, p, argv[1:]...)
+		// exec's own Cancel is Process.Kill, which Android 11 answers
+		// with SIGSYS (see Kill).
+		c.Cancel = func() error { return Kill(c.Process) }
 	}
 	c.Args = argv
 	if self != "" {

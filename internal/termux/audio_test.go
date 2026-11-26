@@ -2,11 +2,14 @@ package termux
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/AndronixApp/andronix-distros/internal/pkgmgr"
 )
 
 // fakePulse puts pulseaudio, pactl and pkg stand-ins on PATH. They keep
@@ -212,5 +215,25 @@ func TestEnsureAudioCheckWrongButDaemonUp(t *testing.T) {
 	l.Close()
 	if did, _ := EnsureAudio(context.Background(), false, nil); did != "started PulseAudio" {
 		t.Errorf("nothing listening: did = %q", did)
+	}
+}
+
+// A Termux package apt doesn't find stays "other" for telemetry (class
+// termux_pkg), with the recovery it has always had: the next mirror and
+// fresh lists once, one full-upgrade, then the error. package_not_found is
+// the distros' kind (their lists are fetched again, their mirror moves).
+func TestPkgInstallNotFoundStaysOther(t *testing.T) {
+	dir := fakePulse(t, false, false, "")
+	os.WriteFile(filepath.Join(dir, "bin", "apt-get"), []byte(`#!/bin/sh
+echo "apt-get $*" >>`+dir+`/calls
+case "$*" in *"install pulseaudio"*) echo "E: Unable to locate package pulseaudio"; exit 100 ;; esac
+`), 0o755)
+	err := pkgInstall(context.Background(), nil, "pulseaudio")
+	var f *pkgmgr.Failure
+	if !errors.As(err, &f) || f.Kind != pkgmgr.KindOther || !strings.Contains(f.Detail, "Unable to locate package pulseaudio") {
+		t.Fatalf("got %v (%+v)\n%s", err, f, calls(dir))
+	}
+	if c := calls(dir); strings.Count(c, "install pulseaudio") != 3 || strings.Count(c, "apt-get update") != 2 || !strings.Contains(c, "full-upgrade") {
+		t.Fatalf("calls:\n%s", c)
 	}
 }

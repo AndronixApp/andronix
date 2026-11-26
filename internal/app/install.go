@@ -360,6 +360,7 @@ func install(ctx context.Context, o InstallOpts) error {
 		return t.Run(ctx, cmd, nil, func(l string) { r.Line(l) })
 	}
 	ops := newPkgOps(t, fam, d, lg) // retries, mirror fallback, repairs
+	defer ops.close()
 
 	var steps []ui.Step
 	// proot comes from Termux's packages: install it here (with pkg's lock
@@ -485,15 +486,8 @@ func install(ctx context.Context, o InstallOpts) error {
 			// phone-check before this ran without the download size, yet a
 			// stored tarball sits on disk while it unpacks). The image path
 			// streams into the rootfs with no stored copy, so it is exempt.
-			if (src.kind == "tarball" || src.kind == "upstream") && src.size > 0 {
-				dlMB := (src.size + (1 << 20) - 1) >> 20
-				peak := downloadPeakMB(d, src.size)
-				if free := sys.FreeMB(sys.Home()); free >= 0 && free < peak {
-					lg.Printf("pre-download space: free=%dMB < download %dMB + unpacked base %dMB", free, dlMB, peak-dlMB)
-					return &ui.UserError{Title: "Not enough space", Class: "not_enough_space",
-						What: fmt.Sprintf("Your phone has %d MB free; downloading and unpacking %s needs about %d MB at once (a %d MB download that stays on disk while the system unpacks).", free, d.Label(), peak, dlMB),
-						Fix:  fmt.Sprintf("Free up about %d MB (old videos, app caches), then run the same command again.", peak-free)}
-				}
+			if err := downloadSpaceErr(d, src, lg); err != nil {
+				return err
 			}
 			if src.kind == "image" {
 				// Downloaded straight into the rootfs (no copy on disk), hashed
@@ -540,10 +534,15 @@ func install(ctx context.Context, o InstallOpts) error {
 				if src.kind == "local" {
 					return nil
 				}
+				// The image streamed into the rootfs; this one is stored.
+				if err := downloadSpaceErr(d, src, lg); err != nil {
+					return err
+				}
 			}
-			if src.kind == "tarball" || src.kind == "upstream" || src.kind == "modded" {
-				part := src.file + ".part"
-				sum, err := netx.Download(ctx, src.url, part, nil, src.size, func(c, t int64) { r.Progress(c, t, "bytes") })
+			// One archive (our mirror, the distro's own, a Modded edition),
+			// checked against its sha256.
+			tarball := func() error {
+				damaged, err := fetchTarball(ctx, src, func(c, t int64) { r.Progress(c, t, "bytes") })
 				rep.downloadBytes += src.size
 				if err != nil {
 					if e := earlyErr(err, ed); e != nil {
@@ -551,50 +550,20 @@ func install(ctx context.Context, o InstallOpts) error {
 					}
 					return downloadErr(err, src.kind == "modded")
 				}
-				if src.sha != "" && sum != src.sha {
-					os.Remove(part)
+				if damaged {
 					return ui.Errorf("download_is_damaged", "Download is damaged", "The file's checksum doesn't match, so it was deleted.", "Run the same command again to download it fresh.")
 				}
 				ui.DetailOf(r, "verify.sha256", "sha256 checked", nil)
-				return os.Rename(part, src.file)
+				return os.Rename(src.file+".part", src.file)
 			}
-			// Registry layers, each verified against its digest.
-			dir := filepath.Join(paths.Cache, "layers-"+d.ID)
-			os.MkdirAll(dir, 0o755)
-			var done int64
-			for _, l := range src.image.Layers {
-				dst := filepath.Join(dir, strings.TrimPrefix(l.Digest, "sha256:"))
-				if sum, _ := netx.FileSHA256(dst); "sha256:"+sum == l.Digest {
-					done += l.Size
-					continue
-				}
-				base := done
-				blob := func() (string, error) {
-					return netx.Download(ctx, src.image.BlobURL(l), dst+".part", src.image.Headers(), l.Size,
-						func(c, _ int64) { r.Progress(base+c, src.image.Total, "bytes") })
-				}
-				sum, err := blob()
-				var se *netx.StatusError
-				if errors.As(err, &se) && se.Code == 401 {
-					// The registry (docker.io) bearer expired mid-pull, not
-					// the user's token (#243/#658): refresh it and resume the
-					// blob from the .part (netx.Download Ranges).
-					lg.Printf("registry blob %s: 401, refreshing bearer", l.Digest)
-					if rerr := src.image.RefreshToken(ctx); rerr == nil {
-						sum, err = blob()
-					}
-				}
-				if err != nil {
-					// A 401 that survives the refresh is a plain download
-					// failure here, never the user's "token refused".
-					return downloadErr(err, false)
-				}
-				if "sha256:"+sum != l.Digest {
-					os.Remove(dst + ".part")
-					return ui.Errorf("download_is_damaged", "Download is damaged", "A layer's checksum doesn't match, so it was deleted.", "Run the same command again to download it fresh.")
-				}
-				os.Rename(dst+".part", dst)
-				done += l.Size
+			if src.kind == "tarball" || src.kind == "upstream" || src.kind == "modded" {
+				return tarball()
+			}
+			// Registry layers, each verified against its digest; our
+			// mirror's tarball when the registry refuses them (#394).
+			viaMirror, err := downloadRegistry(ctx, &src, d, arch, paths, lg, r, tarball)
+			if err != nil || viaMirror {
+				return err
 			}
 			ui.DetailOf(r, "verify.digests", "digests checked", nil)
 			return nil
@@ -952,6 +921,7 @@ func install(ctx context.Context, o InstallOpts) error {
 		}
 		return err
 	}
+	ops.close() // the package work is over: not kept through the user setup
 	rep.step, rep.stepKey = "", ""
 	if o.ImageBuild {
 		ui.SetDone("distro", d.ID)
@@ -1477,9 +1447,8 @@ func pickSource(ctx context.Context, d *conf.Distro, arch sys.Arch, p Paths, lg 
 			return s, nil
 		case errors.As(err, &np):
 			return source{}, ui.Errorf("no_build_for_your_cpu", "No build for your CPU", d.Label()+" has no image for "+arch.Label()+".", "Pick another distro in the Andronix app.")
-		case errors.As(err, &se) && se.Code == 429:
-			return source{}, ui.Errorf("the_image_server_is_busy", "The image server is busy", "Docker Hub limits downloads per network, and your network hit the limit.",
-				"Wait an hour, or switch between Wi-Fi and mobile data, then run the same command again.")
+		case errors.As(err, &se) && se.Code == 429 && oci.ParseRef(d.Image).Host == "registry-1.docker.io":
+			return source{}, imageServerBusy()
 		}
 		if ce, ok := clockCertErr(err); ok {
 			return source{}, ce
@@ -1609,6 +1578,30 @@ func notEnoughSpace(d *conf.Distro, de *conf.Desktop, haveRootfs bool) *ui.UserE
 		Fix:  fmt.Sprintf("Free up about %d MB (old videos, app caches), then run the same command again.", gap)}
 }
 
+// homeFreeMB is the free space (MB) where installs go, -1 when it can't be
+// read (a variable for the tests).
+var homeFreeMB = func() int64 { return sys.FreeMB(sys.Home()) }
+
+// downloadSpaceErr is the check before a stored download (our mirror's
+// tarball, the distro's own): not_enough_space when the phone can't hold the
+// compressed file and the unpacked base rootfs at once (downloadPeakMB), nil
+// otherwise and for the sources that keep no copy or have no known size.
+func downloadSpaceErr(d *conf.Distro, s source, lg *Logger) error {
+	if (s.kind != "tarball" && s.kind != "upstream") || s.size <= 0 {
+		return nil
+	}
+	dlMB := (s.size + (1 << 20) - 1) >> 20
+	peak := downloadPeakMB(d, s.size)
+	free := homeFreeMB()
+	if free < 0 || free >= peak {
+		return nil
+	}
+	lg.Printf("pre-download space: free=%dMB < download %dMB + unpacked base %dMB", free, dlMB, peak-dlMB)
+	return &ui.UserError{Title: "Not enough space", Class: "not_enough_space",
+		What: fmt.Sprintf("Your phone has %d MB free; downloading and unpacking %s needs about %d MB at once (a %d MB download that stays on disk while the system unpacks).", free, d.Label(), peak, dlMB),
+		Fix:  fmt.Sprintf("Free up about %d MB (old videos, app caches), then run the same command again.", peak-free)}
+}
+
 // downloadPeakMB is the space (MB) a stored download needs at its peak: the
 // compressed tarball on disk plus the unpacked base rootfs (DISTRO_DISK_MB,
 // +20%) it is being unpacked into. The desktop's packages are installed
@@ -1722,6 +1715,11 @@ func pkgErr(title string, err error) error {
 	if f.Detail != "" {
 		e.What = "The package manager stopped: " + f.Detail
 	}
+	// An install that found no package lists and couldn't fetch them: the
+	// refresh is what failed, and the error says so, whatever the step.
+	if f.Lists {
+		title, e.Title = refreshTitle, refreshTitle
+	}
 	switch {
 	case f.Kind == pkgmgr.KindCancelled:
 		return ui.ErrCancelled
@@ -1760,6 +1758,13 @@ func pkgErr(title string, err error) error {
 		e.Title = "The distro's tools don't see root access on this phone"
 		e.What = "A program in the distro refused to run because it isn't root (" + f.Detail + "). proot pretends to be root, and on this phone that didn't work, even after a second try."
 		e.Fix = "Send a report so we can look: andronix report. Meanwhile, another distro (Debian, Ubuntu) may install fine."
+	case f.Kind == pkgmgr.KindPacmanDB:
+		e.Title = "An earlier install was stopped half-way"
+		e.What = "A package was only partly installed when an earlier run stopped, and reinstalling it didn't work (" + f.Detail + ")."
+		e.Fix = "Remove this distro with andronix remove, then install it again. Keep Termux open in front while it installs."
+		if sys.Standalone() {
+			e.Fix = "Uninstall this Linux in the Andronix app, then install it again. Keep the app open while it installs."
+		}
 	case f.Kind == pkgmgr.KindKeyring:
 		e.Title = "The package signing keys couldn't be set up"
 		e.What = "The key tool (gpg-agent) wouldn't start under proot on this phone (" + f.Detail + ")."

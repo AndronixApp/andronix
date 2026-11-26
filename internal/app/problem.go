@@ -385,6 +385,10 @@ var (
 	reTokenFlag = regexp.MustCompile(`(--token[= ]+)('[^']*'|"[^"]*"|\S+)`)
 	reTokenKV   = regexp.MustCompile(`\b[kehfpv]=[^&\s'"]+(?:&[kehfpv]=[^&\s'"]+)+`)
 	reQuery     = regexp.MustCompile(`(https?://[^\s?'"]+)\?[^\s'"]*`)
+	// user:password@ (or a token@) in a URL: a private package source. Up to
+	// the last '@' of the word: a password may have an '@', a '/' or a quote
+	// of its own (a path with an '@' then goes too).
+	reURLCred   = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://)\S*@`)
 	reEmail     = regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+`)
 	reAppUID    = regexp.MustCompile(`\bu\d+_a\d+\b`)
 	reAuth      = regexp.MustCompile(`(?i)(authorization|password|passwd)(["']?\s*[:=]\s*["']?)(?:bearer\s+)?[^\s"',]+`)
@@ -397,6 +401,8 @@ func (r *redactor) do(s string) string {
 		return s
 	}
 	s = reTokenFlag.ReplaceAllString(s, "${1}<token>")
+	// Before reQuery: a '?' in a password isn't the start of a query.
+	s = reURLCred.ReplaceAllString(s, "${1}<redacted>@")
 	s = reQuery.ReplaceAllString(s, "${1}?<redacted>")
 	s = reTokenKV.ReplaceAllString(s, "<token>")
 	s = reEmail.ReplaceAllString(s, "<email>")

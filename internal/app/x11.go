@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/AndronixApp/andronix-distros/internal/conf"
+	"github.com/AndronixApp/andronix-distros/internal/proot"
 	"github.com/AndronixApp/andronix-distros/internal/rootfs"
 	"github.com/AndronixApp/andronix-distros/internal/telemetry"
 	"github.com/AndronixApp/andronix-distros/internal/termux"
@@ -403,21 +404,7 @@ func stopSession(proot int) {
 }
 
 // tracees are the processes proot traces: everything in its session.
-func tracees(tracer int) []int {
-	var out []int
-	want := "TracerPid:\t" + strconv.Itoa(tracer) + "\n"
-	entries, _ := os.ReadDir("/proc")
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || tracer <= 0 {
-			continue
-		}
-		if b, err := os.ReadFile("/proc/" + e.Name() + "/status"); err == nil && strings.Contains(string(b), want) {
-			out = append(out, pid)
-		}
-	}
-	return out
-}
+func tracees(tracer int) []int { return proot.Tracees(tracer) }
 
 // DesktopStop is `andronix desktop stop`: ends the Termux:X11 desktop and
 // its server from any Termux session.

@@ -66,6 +66,48 @@ echo 'NAME ALL=(ALL:ALL) ALL' > /etc/sudoers.d/NAME && chmod 440 /etc/sudoers.d/
 ```
 - Result: **works** with `sudo -S` and a password (sudo 1.9.17p2). Needs `shadow` for `useradd`/`chpasswd`, already in `DISTRO_BASE_PKGS`.
 
+## Errors and name lookups (card #398, 2.1.6)
+
+apk-tools 3 reports a source it can't fetch as a warning and exits with the number of failed sources, so both sources failing is "exit status 2" and nothing starts with `ERROR`:
+
+```
+WARNING: updating https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/APKINDEX.tar.gz: DNS: transient error (try again later)
+WARNING: updating https://dl-cdn.alpinelinux.org/alpine/v3.24/community/aarch64/APKINDEX.tar.gz: DNS: transient error (try again later)
+0 unavailable, 2 stale; 28581 distinct packages available
+```
+
+(`updating and opening` when there is no index yet; `ERROR: <package>: <why>` for a package download.) The reasons, word for word from `libapk.so.3.0.0`, and their kinds (`internal/pkgmgr/diag.go`):
+
+| apk says | kind |
+|---|---|
+| `DNS: transient error (try again later)`, `DNS: non-recoverable failure`, `DNS: name does not exist`, `DNS: no address for host`, `DNS: address family for host not supported` | `network_dns` |
+| `Connection refused`, `Host is unreachable`, `operation timed out`, `could not connect to server (check repositories file)`, `network error (check Internet connection and firewall)`, `network connection aborted`, `temporary error (try again later)`, `TLS: handshake failed (client cert needed?)`, `TLS: server certificate not trusted`, `TLS: server hostname mismatch`, `TLS: unspecified error` | `network_connect` |
+| `HTTP 404: Not Found` | `http_404` |
+| `HTTP 500: ...` to `HTTP 504: ...` | `http_5xx` |
+| `UNTRUSTED signature`, `BAD signature` | `gpg` |
+| `file integrity error` | `hash_mismatch` |
+| `Unable to lock database` | `lock` |
+| `Error relocating apk: <symbol>: symbol not found`, `Error loading shared library ... (needed by /sbin/apk)` (musl's loader failing to start apk itself; 32-bit Termux on kernel 3.18, as card #377) | `guest_libs` |
+
+apk goes on with the other packages after one fails, so in a big install the `ERROR:` line can be hundreds of lines before the end; the installer keeps apk's error lines (the last 8) next to the usual last 60 lines. A network failure is tried again after a pause: 2 runs for anything but the refresh (every package left waits out its own timeout, so one run on a dead network is long already), and for the refresh up to 4 of one kind when the failure is quick (a name lookup, an HTTP 5xx), 3 when the servers can't be connected to, and 5 runs in all.
+
+apk's `--timeout` (60 s by default) is the wait without progress for **each address of each source**. A refresh has two sources and `dl-cdn.alpinelinux.org` has four A records (and four AAAA), so one run on a network that resolves names and drops everything else took 8 minutes, and a connect failure ("Operation timed out", "could not connect to server") got four runs, in 2.1.5 too: over half an hour. Since 2.1.6 the installer's refresh starts with `apk --timeout 15` (`apkRefreshTimeout`). The option also counts a stall in the middle of a download and a slow first byte, so a short timeout by itself would fail slow links that 60 s let through; it is kept only while the network looks dead:
+
+- A run that fails after the server answered (an HTTP error, `I/O error` from a stalled download): the next runs have apk's own timeout.
+- A run that couldn't connect: the installer asks the sources' hosts for a TCP connection itself (`apkServersAnswer`, the installer's dialer, up to 15 s). One accepts: a slow link, and the next run has apk's own timeout. None does: one more run, with `--timeout 5` (`apkRetryTimeout`), and not even that when 200 s have passed since the refresh began by the time the first run has failed and the servers were asked (`apkRefreshBudget`).
+
+The short first run isn't counted when the link turned out to be there: the failure then gets the runs 2.1.5 gave it (four for a connect failure or a 5xx, two for one it has no name for), all with apk's own timeout. A slow link is so never worse off than on 2.1.5; a server that accepts connections and never delivers takes one short run longer to fail than it did.
+
+A dead network with four addresses: 120 s, the question (15 s), a 5 s pause, 40 s: 3 minutes. With eight addresses that all drop (IPv6 too): one run and the question, 4 minutes 15. The worst is six: 4 minutes 20. A network that comes and goes can take longer (a run with apk's own timeout in between). Measured with apk-tools 3.0.8 (the only apk the installer has shipped) against addresses that drop everything: one address 120 s by default, 40 s at `--timeout 20`, 10 s at 5; four addresses 120 s at 15, 40 s at 5. The option goes before the command. The refreshes without the retry code (`andronix pack add`, the built-in display's Xvfb, the app's sound) run apk as before.
+
+Timing tells them apart in old telemetry: musl waits 5 s for resolv.conf's servers, so a refresh with dead DNS takes 10 s (two sources); apk's connection timeout is 60 s for each address of each source (so 120 s with one address, 8 minutes with dl-cdn's four).
+
+**Name lookups.** musl has no NSS, so the session's DNS forwarder (card #141, `internal/app/dnsfwd.go`) can't serve Alpine, and resolv.conf takes addresses on port 53 only, which an Android app can't listen on (`ip_unprivileged_port_start` is 1024). Alpine therefore asks only resolv.conf's public servers (8.8.8.8, 1.1.1.1). On a network that doesn't answer those, while Android's own resolver works, every lookup inside Alpine fails.
+
+For the package servers the installer works around it (`internal/app/dnshosts.go`): when a package run fails with a DNS error, it looks the hosts of `/etc/apk/repositories` up through Android's resolver and writes them to the distro's `/etc/hosts` (IPv4 when there is any, at most 4 addresses per host), each line ending in `# andronix: package server, from Android's DNS, for this run only`, and tries again at once. The lines are removed when the install or update ends; what a killed run left is removed by the next run's first package command and at the next proot start (a login, a desktop) that finds no install or update of Alpine running (the distro's lock, `distrolock.go`: a login in another session must not take a live install's lines). The file keeps its permissions; a hosts file that is a link is left alone. A run saved this way has `error_kind` `network_dns_android_retried` in telemetry. `ANDRONIX_DNS=go` turns it off, as it does the forwarder; a build without Android's resolver (`NO_NDK`) doesn't do it either.
+
+Not covered: other names inside Alpine (a browser, `apk add` typed by the user) on such a network. That needs the network's own DNS servers in resolv.conf (the app can read them, the installer can't) or a getaddrinfo shim for musl.
+
 ## Quirks
 
 - `DISTRO_SHELL=/bin/bash` only exists after the base packages are in; a half-finished install that stopped before that can't `start` (Go side: fall back to `/bin/sh` when the shell is missing).

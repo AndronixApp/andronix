@@ -61,6 +61,39 @@ func TestXLineSerialCache(t *testing.T) {
 	}
 }
 
+func TestCursorSerialsBounded(t *testing.T) {
+	// The bound matches the app's CursorCache.MAX; the least recently used serial goes first,
+	// and a short form sent counts as a use (as the app's hit does).
+	if cursorSerialMax != 128 {
+		t.Fatalf("cursorSerialMax = %d, the app keeps 128", cursorSerialMax)
+	}
+	var c cursorSerials
+	if c.seen(1) {
+		t.Fatal("empty set has serial 1")
+	}
+	for s := uint32(1); s <= cursorSerialMax; s++ {
+		c.sent(s)
+	}
+	if !c.seen(1) || !c.seen(cursorSerialMax) || len(c.order) != cursorSerialMax {
+		t.Fatalf("after %d serials: seen(1)=%v seen(max)=%v len=%d", cursorSerialMax, c.seen(1), c.seen(cursorSerialMax), len(c.order))
+	}
+	c.sent(1) // the arrow's short form went out again: used
+	c.sent(cursorSerialMax + 1)
+	if !c.seen(1) {
+		t.Error("serial 1 was just used and still fell out")
+	}
+	if c.seen(2) {
+		t.Error("serial 2 was the least recently used and stayed")
+	}
+	if !c.seen(cursorSerialMax+1) || len(c.order) != cursorSerialMax {
+		t.Errorf("new serial seen=%v len=%d", c.seen(cursorSerialMax+1), len(c.order))
+	}
+	c = cursorSerials{} // a new connection
+	if c.seen(1) {
+		t.Error("a new connection remembers a serial")
+	}
+}
+
 func TestXLineBigCursorScaled(t *testing.T) {
 	// A 96x96 HiDPI cursor (hotspot 48,24) is scaled to 64x64, not dropped.
 	px := make([]uint32, 96*96)

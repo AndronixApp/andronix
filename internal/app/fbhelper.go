@@ -51,7 +51,12 @@ import (
 //	                                   the helper sends C too)
 //	               G                   the window geometry now (fbgeom.go;
 //	                                   the helper sends G and X on its own too)
+//	               P <0|1>             pause/resume damage reporting (fbcursor.go)
 //	               Q                   close
+//	helper -> app: V, Y                capabilities and pointer warps (fbcursor.go)
+//
+// The full protocol, with what old apps and old helpers do with new lines:
+// backend docs/viewer-plan/helper-protocol.md.
 //
 // When the helper dies its socket closes, and the app falls back to VNC.
 
@@ -69,9 +74,11 @@ type fbHelper struct {
 	fb       string // the -fbdir file, for the H line
 	rects    []xproto.Rectangle
 	wake     chan struct{}
+	pollWake chan struct{} // a client connected or resumed: poll the pointer again (fbcursor.go)
 	keys     *keymap
 	buttons  uint16
 	ptr      [2]int // the pointer's last position
+	moveSeq  uint64 // bumped by every M: a pointer poll that raced one is stale (fbcursor.go)
 	shiftKC  xproto.Keycode
 	shifted  map[uint32]bool // keysyms pressed with Shift held for them
 	keysDown map[uint32]xproto.Keycode
@@ -80,11 +87,20 @@ type fbHelper struct {
 	winSent  int           // the last W sent; -1 before the first
 	started  time.Time     // the helper's start (early resizes reload the desktop twice)
 	geom     *geomState    // nil: no G/X lines (fbgeom.go)
+	cursor   cursorBox     // the cursor image's box, for the area to repaint (fbcursor.go)
+	// clientCursor: Xvfb runs with -nocursor (ANDRONIX_CLIENT_CURSOR=1), the
+	// app draws the cursor from X lines: no cursor damage, no motion sleep.
+	clientCursor bool
+	paused       bool // P 0: damage accumulates but no D/F goes out
+	// queryPointer is X's pointer position (nil: xproto.QueryPointer; tests
+	// swap in their own).
+	queryPointer func() (p [2]int, ok bool)
 }
 
 // FBHelper runs the helper on display (":1") with the app's socket at
 // sock, until the X server goes away. ready is touched once it listens.
-func FBHelper(display, sock, fb, ready string) error {
+// clientCursor: Xvfb runs with -nocursor, the app draws the cursor itself.
+func FBHelper(display, sock, fb, ready string, clientCursor bool) error {
 	x, err := xgb.NewConnDisplay(display)
 	if err != nil {
 		return fmt.Errorf("connect %s: %w", display, err)
@@ -102,8 +118,8 @@ func FBHelper(display, sock, fb, ready string) error {
 		return fmt.Errorf("damage: %w", err)
 	}
 	scr := xproto.Setup(x).DefaultScreen(x)
-	h := &fbHelper{x: x, root: scr.Root, w: scr.WidthInPixels, h: scr.HeightInPixels, wake: make(chan struct{}, 1), fb: fb,
-		shifted: map[uint32]bool{}, keysDown: map[uint32]xproto.Keycode{}}
+	h := &fbHelper{x: x, root: scr.Root, w: scr.WidthInPixels, h: scr.HeightInPixels, wake: make(chan struct{}, 1), pollWake: make(chan struct{}, 1), fb: fb,
+		shifted: map[uint32]bool{}, keysDown: map[uint32]xproto.Keycode{}, clientCursor: clientCursor}
 	if h.keys, err = loadKeymap(x); err != nil {
 		return err
 	}
@@ -148,6 +164,7 @@ func FBHelper(display, sock, fb, ready string) error {
 	}
 	go h.accept(ln)
 	go h.flusher()
+	go h.pointerPoller()
 	for {
 		ev, xerr := x.WaitForEvent()
 		if ev == nil && xerr == nil {
@@ -184,13 +201,14 @@ func (h *fbHelper) accept(ln net.Listener) {
 			h.client.Close()
 		}
 		h.client = c
+		h.paused = false
 		h.rects = []xproto.Rectangle{{X: 0, Y: 0, Width: h.w, Height: h.h}} // a full first frame
 		w, hh := h.w, h.h
 		h.mu.Unlock()
 		hl, err := xwdHLine(h.fb, w, hh)
 		if err == nil {
 			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			_, err = c.Write([]byte(hl))
+			_, err = c.Write([]byte(hl + vLine(Version, h.clientCursor))) // H, then what this helper can do
 		}
 		h.wmu.Unlock()
 		if err != nil {
@@ -198,6 +216,7 @@ func (h *fbHelper) accept(ln net.Listener) {
 			continue
 		}
 		h.signal()
+		h.signalPoll()
 		go func() { // the count right after H (the app's first frame comes with it)
 			if h.winDirty != nil {
 				h.sendWindows(true)
@@ -217,16 +236,15 @@ func (h *fbHelper) signal() {
 	}
 }
 
-// addRect queues a damaged rectangle; many small ones become their
-// bounding box, so a busy screen never backs up the X connection.
+// addRect queues a damaged rectangle; past rectCap the queue is coalesced
+// to rectKeep rectangles (fbrects.go), so a busy screen never backs up the
+// X connection and a far-off clock tick doesn't box in a whole drag.
 func (h *fbHelper) addRect(r xproto.Rectangle) {
 	h.mu.Lock()
 	if h.client != nil {
-		if len(h.rects) >= 64 {
-			b := bounding(append(h.rects, r))
-			h.rects = append(h.rects[:0], b)
-		} else {
-			h.rects = append(h.rects, r)
+		h.rects = append(h.rects, r)
+		if len(h.rects) > rectCap {
+			h.rects = coalesce(h.rects, rectKeep)
 		}
 	}
 	h.mu.Unlock()
@@ -239,6 +257,11 @@ func (h *fbHelper) flusher() {
 	for range h.wake {
 		h.wmu.Lock()
 		h.mu.Lock()
+		if h.paused { // P 0: keep the queue (bounded by addRect) for P 1
+			h.mu.Unlock()
+			h.wmu.Unlock()
+			continue
+		}
 		rs, c := h.rects, h.client
 		h.rects = nil
 		h.mu.Unlock()
@@ -260,6 +283,17 @@ func (h *fbHelper) flusher() {
 		}
 		h.wmu.Unlock()
 	}
+}
+
+// xvfbRejected reports whether an X server's log says it didn't know flag
+// ("Unrecognized option: -nocursor", then its usage text).
+func xvfbRejected(log, flag string) bool {
+	for _, l := range strings.Split(log, "\n") {
+		if strings.Contains(l, "Unrecognized option") && strings.Contains(l, flag) {
+			return true
+		}
+	}
+	return false
 }
 
 func bounding(rs []xproto.Rectangle) xproto.Rectangle {
@@ -316,6 +350,8 @@ func (h *fbHelper) readInput(c net.Conn) {
 			}
 		case cmd == "G":
 			h.sendGeometry(true)
+		case cmd == "P" && len(f) == 1:
+			h.pause(c, f[0] == "0")
 		case cmd == "Q":
 			return
 		}
@@ -363,20 +399,62 @@ func (h *fbHelper) fake(typ byte, detail byte, x, y int16) {
 }
 
 // motion moves the pointer. Xvfb draws its cursor into the framebuffer
-// but reports no damage for it, so the areas around the old and the new
-// position are sent as damaged (64x64, enough for the usual cursors).
+// but reports no damage for it, so the areas the cursor covered at the
+// old and the new position are sent as damaged (fbcursor.go). With
+// -nocursor (the app draws the cursor) the move is one XTEST call.
 func (h *fbHelper) motion(x, y int) {
 	h.mu.Lock()
 	h.fake(xproto.MotionNotify, 0, int16(x), int16(y))
 	h.x.Sync()
-	old := h.ptr
-	h.ptr = [2]int{x, y}
+	old := h.setPtrLocked(x, y)
+	cb := h.cursor
 	h.mu.Unlock()
+	if h.clientCursor {
+		return
+	}
 	time.Sleep(2 * time.Millisecond) // let Xvfb redraw the cursor first
 	for _, p := range [][2]int{old, {x, y}} {
-		if r, ok := h.clip(p[0]-24, p[1]-24, 64, 64); ok {
+		if r, ok := h.clip(cursorRect(p, cb)); ok {
 			h.addRect(r)
 		}
+	}
+}
+
+// setPtrLocked records the app's pointer position (h.mu held) and returns
+// the previous one. Every call counts: a pointer poll whose X round trip
+// overlapped one is stale and dropped (checkPointer). The position is
+// clamped to the screen as X clamps it, so a poll never sees an
+// off-screen M as a move.
+func (h *fbHelper) setPtrLocked(x, y int) (old [2]int) {
+	old = h.ptr
+	h.ptr = [2]int{x, y}
+	h.clampPtrLocked()
+	h.moveSeq++
+	return old
+}
+
+// clampPtrLocked keeps h.ptr on the screen (h.mu held): after an M past
+// the edge or a resize that left it outside.
+func (h *fbHelper) clampPtrLocked() {
+	h.ptr[0] = min(max(h.ptr[0], 0), int(h.w)-1)
+	h.ptr[1] = min(max(h.ptr[1], 0), int(h.h)-1)
+}
+
+// pause is P 0 (on: hold D/F lines, the app's surface is gone) or P 1
+// (off: flush what piled up at once) from connection c. Only the current
+// client counts: a replaced connection's P 0, read after accept swapped
+// it out, must not black out the new one.
+func (h *fbHelper) pause(c net.Conn, on bool) {
+	h.mu.Lock()
+	if c != h.client {
+		h.mu.Unlock()
+		return
+	}
+	h.paused = on
+	h.mu.Unlock()
+	if !on {
+		h.signal()
+		h.signalPoll()
 	}
 }
 
@@ -483,6 +561,7 @@ func (h *fbHelper) resize(c net.Conn, w, hh int) {
 		}
 		h.mu.Lock()
 		h.w, h.h = uint16(w), uint16(hh)
+		h.clampPtrLocked()
 		h.mu.Unlock()
 		// Clients that resize their windows without painting the new
 		// area get an Expose: now, and again once they've handled the
@@ -659,6 +738,13 @@ func DisplayStart(args []string, maxSize string, safe bool) error {
 	if len(args) > 2 {
 		xargs = append(xargs, "-dpi", args[2])
 	}
+	// ANDRONIX_CLIENT_CURSOR=1 (the app draws the cursor from X lines):
+	// no software cursor in the framebuffer. Every xorg-server since 1.18
+	// has -nocursor; one that doesn't gets started again without it.
+	clientCursor := os.Getenv("ANDRONIX_CLIENT_CURSOR") == "1"
+	if clientCursor {
+		xargs = append(xargs, "-nocursor")
+	}
 	logf := fmt.Sprintf("/tmp/andronix-display-%d.log", num)
 	lg, err := os.Create(logf)
 	if err != nil {
@@ -678,13 +764,22 @@ func DisplayStart(args []string, maxSize string, safe bool) error {
 	// plus the log's cap.
 	var sw, sh int64
 	fmt.Sscanf(start, "%dx%d", &sw, &sh)
-	if out, err := startXServer("Xvfb", xargs, num, xstartup, lg, logf, up, sw*sh*4+xServerFileCap); err != nil {
+	out, err := startXServer("Xvfb", xargs, num, xstartup, lg, logf, up, sw*sh*4+xServerFileCap)
+	if err != nil && clientCursor && xvfbRejected(string(out), "-nocursor") {
+		fmt.Fprintf(lg, "andronix: this Xvfb has no -nocursor; starting it with its own cursor\n")
+		clientCursor = false
+		xargs = xargs[:len(xargs)-1]
+		os.Remove(fmt.Sprintf("/tmp/.X%d-lock", num))
+		os.Remove(fmt.Sprintf("/tmp/.X11-unix/X%d", num))
+		out, err = startXServer("Xvfb", xargs, num, xstartup, lg, logf, up, sw*sh*4+xServerFileCap)
+	}
+	if err != nil {
 		return ui.Errorf("the_display_didn_t_start", "The display didn't start", lastNonEmpty(string(out), 3), "Log: "+logf)
 	}
 	sendTrace("guest-session-started")
 	fmt.Printf("Xvfb :%d %s (up to %s), framebuffer in %s\n", num, args[0], start, dir)
 	return FBHelper(fmt.Sprintf(":%d", num), fmt.Sprintf("/tmp/.andronix-d/%d.sock", num),
-		filepath.Join(dir, "Xvfb_screen0"), fmt.Sprintf("/tmp/.andronix-d/%d.ready", num))
+		filepath.Join(dir, "Xvfb_screen0"), fmt.Sprintf("/tmp/.andronix-d/%d.ready", num), clientCursor)
 }
 
 // afterResize helps clients catch up with a resize the helper made, from

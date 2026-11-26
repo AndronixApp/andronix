@@ -23,7 +23,7 @@ import (
 // Version is set at build time (-ldflags "-X .../app.Version=...", from
 // VERSION or git describe in ci/build-go.sh); this default names the line
 // a plain go build is from.
-var Version = "2.1.5-rc1"
+var Version = "2.1.6-rc2"
 
 // VersionLabel is "v0.2.0" for releases, the git hash for dev builds.
 func VersionLabel() string {

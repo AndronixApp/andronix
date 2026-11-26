@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/AndronixApp/andronix-distros/internal/netx"
 	"net"
 	"os"
@@ -73,7 +74,7 @@ func TestMirrorFallback(t *testing.T) {
 	lg := NewLog("test")
 	defer lg.Close()
 	p := newPkgOps(&proot.Target{Rootfs: root}, fam, d, lg)
-	if !p.nextMirror(nopRep{}) {
+	if !p.nextMirror(context.Background(), nopRep{}) {
 		t.Fatal("no switch")
 	}
 	b, _ := os.ReadFile(filepath.Join(root, "etc/apt/sources.list.d/debian.sources"))
@@ -85,13 +86,22 @@ func TestMirrorFallback(t *testing.T) {
 	if q.cur[0] != 1 || q.cur[1] != 1 {
 		t.Errorf("a new run starts at %v", q.cur)
 	}
-	q.nextMirror(nopRep{})
-	if q.nextMirror(nopRep{}) {
-		t.Error("switched past the last mirror")
-	}
+	q.nextMirror(context.Background(), nopRep{})
 	b, _ = os.ReadFile(filepath.Join(root, "etc/apt/sources.list.d/debian.sources"))
 	if !strings.Contains(string(b), "tsinghua") {
 		t.Errorf("last mirror: %s", b)
+	}
+	// From the last mirror, a run that didn't start on Debian's own servers
+	// goes back to them (#399), and then has nowhere left to go.
+	if !q.nextMirror(context.Background(), nopRep{}) {
+		t.Fatal("no way back from the last mirror")
+	}
+	b, _ = os.ReadFile(filepath.Join(root, "etc/apt/sources.list.d/debian.sources"))
+	if string(b) != "URIs: http://deb.debian.org/debian\nURIs: http://deb.debian.org/debian-security\n" {
+		t.Errorf("back at the top:\n%s", b)
+	}
+	if q.nextMirror(context.Background(), nopRep{}) {
+		t.Error("went back to a mirror this run had left")
 	}
 }
 
@@ -118,6 +128,26 @@ func TestPkgErrClasses(t *testing.T) {
 	err = pkgErr("Couldn't reach the package servers", &pkgmgr.Failure{Kind: pkgmgr.KindDNS, Detail: "Temporary failure resolving ports.ubuntu.com", Err: errors.New("exit status 100")})
 	if !errors.As(err, &ue) || ue.Class != "package_manager" || ue.Kind != "network_dns" || ue.Detail == "" {
 		t.Errorf("dns: %+v", err)
+	}
+}
+
+// The interrupted-install error's wording (owner, 2.1.6). In the app it
+// names what the app has (its Uninstall button), not a "Your Linux" screen;
+// in Termux, where there is no app, the same advice with the command.
+func TestPkgErrInterruptedInstallCopy(t *testing.T) {
+	f := &pkgmgr.Failure{Kind: pkgmgr.KindPacmanDB, Detail: "failed to prepare transaction (invalid or corrupted package)", Err: errors.New("exit status 1")}
+	for host, fix := range map[string]string{
+		"standalone": "Uninstall this Linux in the Andronix app, then install it again. Keep the app open while it installs.",
+		"":           "Remove this distro with andronix remove, then install it again. Keep Termux open in front while it installs.",
+	} {
+		t.Setenv("ANDRONIX_HOST", host)
+		t.Setenv("ANDRONIX_DISTRO", "")
+		var ue *ui.UserError
+		if err := pkgErr("Couldn't update Arch Linux", f); !errors.As(err, &ue) {
+			t.Errorf("host %q: %v, want a user error", host, err)
+		} else if ue.Title != "An earlier install was stopped half-way" || ue.Fix != fix {
+			t.Errorf("host %q: title %q, fix %q", host, ue.Title, ue.Fix)
+		}
 	}
 }
 
@@ -642,6 +672,23 @@ func TestKernelSpoofFloorClearsEveryDistro(t *testing.T) {
 		if floor[0] < f[0] || (floor[0] == f[0] && floor[1] < f[1]) {
 			t.Errorf("%s (%s): spoof floor %d.%d is below the family min kernel %d.%d; skipping --kernel-release would break it",
 				id, d.Family, floor[0], floor[1], f[0], f[1])
+		}
+	}
+	// Old 32-bit phones are told 5.0, not 6.12 (support #5402): every distro
+	// with a 32-bit build must still pass its minimum-kernel check at 5.0.
+	var m32, n32 int
+	fmt.Sscanf(proot.SpoofedRelease("4.19.188", "arm"), "%d.%d", &m32, &n32)
+	if m32 != 5 || n32 != 0 {
+		t.Fatalf("old 32-bit stand-in is %d.%d, want 5.0", m32, n32)
+	}
+	for _, id := range conf.DistroIDs() {
+		d, _ := conf.LoadDistro(id)
+		if d == nil || !d.HasArch("arm") && !d.HasArch("i686") {
+			continue
+		}
+		if f := famFloor[d.Family]; m32 < f[0] || m32 == f[0] && n32 < f[1] {
+			t.Errorf("%s (%s) has a 32-bit build, and its family's min kernel %d.%d is above the 32-bit stand-in %d.%d",
+				id, d.Family, f[0], f[1], m32, n32)
 		}
 	}
 	if proot.SpoofKernelRelease("6.6.127-android15-8-ge56cf6b09cca-ab15511674-4k") {

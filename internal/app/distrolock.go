@@ -20,6 +20,12 @@ import (
 // (close-on-exec: proot and apt don't inherit it), so it goes away with
 // the process however it ends: a crashed or killed run never blocks the
 // next one. The file says which command holds it, for the message.
+//
+// So when this lock refuses a run, a live andronix holds it. Card #395
+// ("install already running" after a Stop in the app) was such a run, not
+// a stale lock: on Android 11 the app loses sight of the installer it
+// started, and the install goes on unseen. See "Android 11" in
+// docs/progress-json.md.
 
 // lockDistro takes d's lock for verb ("install", "update", "remove",
 // "restore"), or returns install_running when another andronix has it.
@@ -46,6 +52,33 @@ func lockDistro(d *conf.Distro, verb string) (unlock func(), err error) {
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
 	}, nil
+}
+
+// distroLockHeld reports whether an install, update, remove or restore of
+// the distro whose rootfs this is holds its lock right now (this process's
+// own included). False when the lock can't be told: a rootfs outside
+// ~/.andronix/distros (inside a distro, tests), no lock file yet. The probe
+// is a shared lock taken and dropped at once; a lockDistro of another
+// process in that instant is refused (install_running, naming the last
+// holder). The one caller asks only with a killed run's lines in /etc/hosts,
+// so that takes a killed Alpine run, then a login and an install started
+// within the same microseconds.
+func distroLockHeld(rootfs string) bool {
+	dir := filepath.Dir(filepath.Clean(rootfs))
+	p := GetPaths()
+	if filepath.Base(filepath.Clean(rootfs)) != "rootfs" || filepath.Dir(dir) != filepath.Clean(p.Distros) {
+		return false
+	}
+	f, err := os.Open(filepath.Join(p.Home, "locks", filepath.Base(dir)+".lock"))
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		return errors.Is(err, syscall.EWOULDBLOCK)
+	}
+	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return false
 }
 
 // distroBusy is the error for a distro another andronix is working on;

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -69,8 +70,34 @@ func ApplyProfile(root string, de *conf.Desktop, profile string) error {
 }
 
 // standaloneXfconf is the standalone app's layer: no compositing in
-// xfwm4 (S24 Ultra 170 -> 200 in glmark2, and smoother dragging).
-var standaloneXfconf = []string{"xfwm4:/general/use_compositing:bool:false"}
+// xfwm4 (S24 Ultra 170 -> 200 in glmark2, and smoother dragging), and
+// opaque window moves and resizes, whatever a lower layer says (the light
+// profile turns wireframe moves on for VNC). xfwm4 grabs the X server for
+// a wireframe move or resize, so the display helper's XTEST motion and
+// button release are never processed: the outline stops after a step or
+// two and the whole desktop freezes until the display is stopped (2.1.6-rc1
+// gate on a16; the same drag with box_move off moves fine). The layer also
+// puts the panel clock at minute precision (fixClockFormats): a seconds
+// clock is a repaint far from everything else on every tick.
+var standaloneXfconf = []string{
+	"xfwm4:/general/use_compositing:bool:false",
+	"xfwm4:/general/box_move:bool:false",
+	"xfwm4:/general/box_resize:bool:false",
+}
+
+// standaloneHomeVersion is what applyStandaloneHomes has done to a home
+// (the marker's first line); a home at an older version gets what was
+// added since, once. 1: compositing off (unnumbered marker). 2: the clock
+// at minute precision.
+const standaloneHomeVersion = 2
+
+// standaloneSince is the version each standaloneXfconf entry came in for
+// homes. Entries not here are layer-only: box_move/box_resize off stays out
+// of homes, so a home shared with VNC (where wireframe moves work) keeps
+// its own choice there.
+var standaloneSince = map[string]int{
+	"xfwm4:/general/use_compositing:bool:false": 1,
+}
 
 // ApplyStandaloneLayer writes /etc/xdg/andronix-standalone (used by the
 // session when ANDRONIX_HOST=standalone; see xstartup).
@@ -80,6 +107,15 @@ func ApplyStandaloneLayer(root string) error {
 	if err := writeXfconf(root, base, standaloneXfconf); err != nil {
 		return err
 	}
+	// The distro's own panel defaults (a system channel, or the panel's
+	// default.xml it copies on first start) with the clock at minute precision.
+	rel := "xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+	if doc, ok := readXfconfFile(filepath.Join(root, "etc/xdg", rel)); ok && fixClockFormats(doc) > 0 {
+		if err := writeXfconfDoc(filepath.Join(base, rel), doc, nil); err != nil {
+			return err
+		}
+	}
+	editXfconfFile(filepath.Join(root, xfcePanelFile), func(doc *xnode) bool { return fixClockFormats(doc) > 0 })
 	// XFCE's clients start together, without Thunar's daemon (sessionstart.go).
 	if err := writeSessionLayer(root, base, true); err != nil {
 		return err
@@ -117,11 +153,11 @@ func writeSafeLayer(root string, de *conf.Desktop) error {
 const standaloneMarker = ".config/andronix/standalone-defaults"
 
 // applyStandaloneHomes puts the standalone layer's settings into each
-// user's own xfconf files, once per home: a channel file in ~/.config wins
-// over every system layer, and xfconfd writes the whole channel there
-// (compositing on included) after a session without the layer, or one in
-// Termux before a backup moved here. After this one time, the user's own
-// choices stay.
+// user's own xfconf files, once per home (per standaloneHomeVersion): a
+// channel file in ~/.config wins over every system layer, and xfconfd
+// writes the whole channel there (compositing on included) after a
+// session without the layer, or one in Termux before a backup moved here.
+// After this one time, the user's own choices stay.
 func applyStandaloneHomes(root string) {
 	homes := []string{filepath.Join(root, "root")}
 	if ents, err := os.ReadDir(filepath.Join(root, "home")); err == nil {
@@ -132,20 +168,25 @@ func applyStandaloneHomes(root string) {
 		}
 	}
 	for _, h := range homes {
-		if _, err := os.Stat(filepath.Join(h, standaloneMarker)); err == nil {
+		have := standaloneHomeDone(filepath.Join(h, standaloneMarker))
+		if have >= standaloneHomeVersion {
 			continue
 		}
+		chdir := filepath.Join(h, ".config/xfce4/xfconf/xfce-perchannel-xml")
 		for _, e := range standaloneXfconf {
 			f := strings.SplitN(e, ":", 4)
-			if len(f) != 4 {
+			if len(f) != 4 || standaloneSince[e] <= have {
 				continue
 			}
-			setXfconfFile(filepath.Join(h, ".config/xfce4/xfconf/xfce-perchannel-xml", f[0]+".xml"), f[1], f[2], f[3])
+			setXfconfFile(filepath.Join(chdir, f[0]+".xml"), f[1], f[2], f[3])
+		}
+		if have < 2 {
+			editXfconfFile(filepath.Join(chdir, "xfce4-panel.xml"), func(doc *xnode) bool { return fixClockFormats(doc) > 0 })
 		}
 		if st, err := os.Stat(h); err == nil {
 			p := filepath.Join(h, standaloneMarker)
 			os.MkdirAll(filepath.Dir(p), 0o755)
-			os.WriteFile(p, []byte("compositing off (standalone app)\n"), 0o644)
+			os.WriteFile(p, []byte(fmt.Sprintf("%d\ncompositing off, minute clock (standalone app)\n", standaloneHomeVersion)), 0o644)
 			if s, ok := st.Sys().(*syscall.Stat_t); ok {
 				os.Lchown(filepath.Dir(p), int(s.Uid), int(s.Gid))
 				os.Lchown(p, int(s.Uid), int(s.Gid))
@@ -154,37 +195,119 @@ func applyStandaloneHomes(root string) {
 	}
 }
 
+// standaloneHomeDone is the version a home's marker records: 0 without
+// one, 1 for the unnumbered marker of the first release.
+func standaloneHomeDone(marker string) int {
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		return 0
+	}
+	first, _, _ := strings.Cut(string(b), "\n")
+	if v, err := strconv.Atoi(strings.TrimSpace(first)); err == nil && v > 0 {
+		return v
+	}
+	return 1
+}
+
 // setXfconfFile sets one property in a user's channel file, if the file
 // exists (without one, the system layers apply anyway).
 func setXfconfFile(p, prop, typ, val string) {
+	editXfconfFile(p, func(doc *xnode) bool {
+		doc.setProp(strings.Split(strings.Trim(prop, "/"), "/"), typ, val)
+		return true
+	})
+}
+
+// readXfconfFile parses a channel file; false if there is none or it
+// isn't one.
+func readXfconfFile(p string) (*xnode, bool) {
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return
+		return nil, false
 	}
 	var doc xnode
 	if xml.Unmarshal(b, &doc) != nil || doc.XMLName.Local != "channel" {
+		return nil, false
+	}
+	return &doc, true
+}
+
+// editXfconfFile applies edit to an existing channel file and writes it
+// back (atomically, keeping owner and mode) when edit returns true.
+func editXfconfFile(p string, edit func(*xnode) bool) {
+	doc, ok := readXfconfFile(p)
+	if !ok || !edit(doc) {
 		return
 	}
-	doc.setProp(strings.Split(strings.Trim(prop, "/"), "/"), typ, val)
+	st, _ := os.Stat(p)
+	writeXfconfDoc(p, doc, st)
+}
+
+// writeXfconfDoc writes a channel document to p through a temporary file;
+// with st (the file it replaces) the owner and mode are kept.
+func writeXfconfDoc(p string, doc *xnode, st os.FileInfo) error {
 	var buf bytes.Buffer
 	buf.WriteString(xml.Header)
 	enc := xml.NewEncoder(&buf)
 	enc.Indent("", "  ")
-	if enc.Encode(doc) != nil {
-		return
+	if err := enc.Encode(doc); err != nil {
+		return err
 	}
 	buf.WriteString("\n")
-	st, _ := os.Stat(p)
+	os.MkdirAll(filepath.Dir(p), 0o755)
 	tmp := p + ".andronix"
-	if os.WriteFile(tmp, buf.Bytes(), 0o644) == nil {
-		if st != nil {
-			if s, ok := st.Sys().(*syscall.Stat_t); ok {
-				os.Lchown(tmp, int(s.Uid), int(s.Gid))
-			}
-			os.Chmod(tmp, st.Mode().Perm())
-		}
-		os.Rename(tmp, p)
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
+		return err
 	}
+	if st != nil {
+		if s, ok := st.Sys().(*syscall.Stat_t); ok {
+			os.Lchown(tmp, int(s.Uid), int(s.Gid))
+		}
+		os.Chmod(tmp, st.Mode().Perm())
+	}
+	return os.Rename(tmp, p)
+}
+
+// minuteClockFormat is a strftime clock format without seconds: %S goes
+// (with the separator before it), %T, %X and %r become their hours and
+// minutes. false when s had no seconds.
+func minuteClockFormat(s string) (string, bool) {
+	out := s
+	for _, r := range [][2]string{{":%S", ""}, {".%S", ""}, {"%S", ""}, {"%T", "%H:%M"}, {"%X", "%H:%M"}, {"%r", "%I:%M %p"}, {"%s", "%H:%M"}} {
+		out = strings.ReplaceAll(out, r[0], r[1])
+	}
+	return out, out != s
+}
+
+// fixClockFormats puts every clock plugin's digital format in an
+// xfce4-panel channel at minute precision; it returns how many changed.
+// Plugins are /plugins/plugin-N = "clock" with digital-format (4.12-4.16)
+// or digital-time-format (4.18) under them.
+func fixClockFormats(doc *xnode) int {
+	n := 0
+	for i := range doc.Nodes {
+		plugins := &doc.Nodes[i]
+		if plugins.XMLName.Local != "property" || plugins.attr("name") != "plugins" {
+			continue
+		}
+		for j := range plugins.Nodes {
+			pl := &plugins.Nodes[j]
+			if pl.XMLName.Local != "property" || pl.attr("value") != "clock" {
+				continue
+			}
+			for k := range pl.Nodes {
+				f := &pl.Nodes[k]
+				if name := f.attr("name"); name != "digital-format" && name != "digital-time-format" {
+					continue
+				}
+				if v, changed := minuteClockFormat(f.attr("value")); changed {
+					f.setAttr("value", v)
+					n++
+				}
+			}
+		}
+	}
+	return n
 }
 
 func writeFile(p, s string) error {

@@ -121,6 +121,7 @@ func Update(ctx context.Context, o UpdateOpts) (err error) {
 		}
 		t := in.Target(true)
 		ops := newPkgOps(t, fam, d, lg)
+		defer ops.close() // when Update returns, after the steps ran
 		steps = append(steps,
 			ui.Step{Label: "Refreshing " + d.Label(), Run: func(ctx context.Context, r ui.Reporter) error {
 				rootfs.InstallSelf(in.Rootfs) // the in-distro helper matches this binary

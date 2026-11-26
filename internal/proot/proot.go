@@ -6,6 +6,7 @@ package proot
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/AndronixApp/andronix-distros/internal/sys"
 	"github.com/AndronixApp/andronix-distros/internal/termux"
@@ -175,7 +178,7 @@ func (t *Target) Args() []string {
 		}
 	}
 	if Has("--kernel-release") && !Minimal && spoofKernelRelease() {
-		a = append(a, "--kernel-release=6.12.0-andronix")
+		a = append(a, "--kernel-release="+SpoofedRelease(sys.KernelRelease(), sys.DetectArch()))
 	}
 	if t.User != "" && t.UID != "" {
 		a = append(a, "--change-id="+t.UID+":"+t.GID, "-w", t.Home)
@@ -403,7 +406,7 @@ func (t *Target) Env() []string {
 	if os.Getenv("ANDRONIX_DRI3") != "1" {
 		env = append(env, "LIBGL_DRI3_DISABLE=1")
 	}
-	for _, k := range []string{"COLORTERM", "NO_COLOR", "COLUMNS", "ANDRONIX_ASCII", "ANDRONIX_PLAIN", "ANDRONIX_HOST", "ANDRONIX_TRACE", "ANDRONIX_FOLD_FIX", "ANDRONIX_BLOCKED_DESKTOPS"} {
+	for _, k := range []string{"COLORTERM", "NO_COLOR", "COLUMNS", "ANDRONIX_ASCII", "ANDRONIX_PLAIN", "ANDRONIX_HOST", "ANDRONIX_TRACE", "ANDRONIX_FOLD_FIX", "ANDRONIX_CLIENT_CURSOR", "ANDRONIX_BLOCKED_DESKTOPS"} {
 		if v := os.Getenv(k); v != "" {
 			env = append(env, k+"="+v)
 		}
@@ -497,6 +500,12 @@ func (t *Target) Login(shell string, cmd []string) error {
 
 // Run runs a shell command inside the distro as root, streaming each
 // output line to onLine. stdin may be nil.
+//
+// When ctx is cancelled (Ctrl-C, the app's Stop) the command's processes
+// are ended first and proot last (stopSession), and Run returns ctx's
+// error. Once the command has ended, or was cancelled, Run reads what is
+// left of its output but doesn't wait for a process that got away with the
+// pipe open (outPipe).
 func (t *Target) Run(ctx context.Context, cmd string, stdin io.Reader, onLine func(string)) error {
 	root := *t
 	root.User = ""
@@ -504,34 +513,164 @@ func (t *Target) Run(ctx context.Context, cmd string, stdin io.Reader, onLine fu
 	if t.Local {
 		c = sys.CommandContext(ctx, "/bin/sh", "-c", cmd)
 	} else {
+		t.reapOrphans()
 		argv := append(root.Args(), root.Env()...)
 		argv = append(argv, "/bin/sh", "-c", cmd)
 		c = sys.CommandContext(ctx, argv[0], argv[1:]...)
 		c.Env = hostEnv()
+		if c.Err == nil {
+			// By pid (sys.Signal), never c.Process.Signal: that goes through
+			// a pidfd, which Android 11 answers with SIGSYS (card #395).
+			c.Cancel = func() error {
+				return stopSession(c.Process.Pid, func(sig syscall.Signal) error { return sys.Signal(c.Process, sig) })
+			}
+		}
 	}
+	// For stdin's copy (the output pipe is ours): a process that kept
+	// that pipe doesn't hold up Wait. With WaitDelay, os/exec itself calls
+	// Process.Kill (a pidfd again, see Cancel above) when Wait hasn't got
+	// the command's end waitDelay after Cancel returned: only a proot (or
+	// the local shell) that isn't gone that long after its SIGKILL, which
+	// a killed process is.
+	c.WaitDelay = waitDelay // pidfd-ok: exec's Kill needs the command unreaped 5 s after our SIGKILL
 	c.Stdin = stdin
 	t.session(os.Getpid()) // this process waits for proot
-	pr, pw := io.Pipe()
-	c.Stdout, c.Stderr = pw, pw
-	if err := c.Start(); err != nil {
+	pr, pw, err := os.Pipe()
+	if err != nil {
 		return err
 	}
+	defer pr.Close()
+	c.Stdout, c.Stderr = pw, pw
+	if err := c.Start(); err != nil {
+		pw.Close()
+		return err
+	}
+	pw.Close() // the command's processes have the only writing ends now
+	out := &outPipe{f: pr}
 	done := make(chan struct{})
 	go func() {
-		sc := bufio.NewScanner(pr)
+		sc := bufio.NewScanner(out)
 		sc.Buffer(make([]byte, 64<<10), 1<<20)
 		for sc.Scan() {
 			if onLine != nil {
 				onLine(sc.Text())
 			}
 		}
-		io.Copy(io.Discard, pr)
+		io.Copy(io.Discard, out)
 		close(done)
 	}()
-	err := c.Wait()
-	pw.Close()
+	err = c.Wait()
+	// proot killed (by our cancel, by Android, by a crash): end what it
+	// left without a tracer now, not in the next andronix. A retry in this
+	// process would run beside it, and the pipe would wait for it first.
+	swept := false
+	if !t.Local && (signaled(err) || errors.Is(err, exec.ErrWaitDelay)) {
+		t.sweepOrphans("this run left")
+		swept = true
+	}
+	out.ended()
 	<-done
+	if out.keptOpen() {
+		termux.Logf("proot: a process kept the output pipe open after the command ended: %s", firstLine(cmd))
+		if !t.Local && !swept {
+			t.sweepOrphans("this run left")
+		}
+	}
+	switch {
+	case err != nil && errors.Is(ctx.Err(), context.Canceled):
+		// Not "signal: killed": the caller asked for this.
+		return ctx.Err()
+	case errors.Is(err, exec.ErrWaitDelay):
+		// The command itself ended well; something it started kept stdin's
+		// pipe.
+		return nil
+	}
 	return err
+}
+
+// signaled reports whether err is a command ended by a signal.
+func signaled(err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ProcessState == nil {
+		return false
+	}
+	ws, ok := ee.ProcessState.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled()
+}
+
+// outPipe is the reading end of a command's output pipe. While the command
+// runs, a read waits as long as it takes. Once it has ended (ended), a read
+// waits waitDelay at most for more, all reads together wait drainMax at
+// most, and drainBytes at most are read: output that is already in the pipe
+// is read however slowly the caller takes it, and a process that kept the
+// pipe open (a daemon the command started, a process that outlived a killed
+// proot) is not waited for, whether it is silent, writes now and then, or
+// writes faster than we read. After that the pipe reads as ended.
+type outPipe struct {
+	f      *os.File
+	mu     sync.Mutex
+	over   bool          // the command has ended
+	waited time.Duration // spent waiting in reads since then
+	read   int           // bytes read since then
+	kept   bool          // gave up on a pipe that was still open
+}
+
+func (o *outPipe) Read(p []byte) (int, error) {
+	o.mu.Lock()
+	if o.over && !o.kept && o.read >= drainBytes {
+		o.kept = true
+	}
+	if o.kept {
+		o.mu.Unlock()
+		return 0, io.EOF
+	}
+	over := o.over
+	if over {
+		o.bound()
+	}
+	o.mu.Unlock()
+	start := time.Now()
+	n, err := o.f.Read(p)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if over {
+		o.waited += time.Since(start)
+		o.read += n
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		o.kept = true
+		return n, io.EOF
+	}
+	return n, err
+}
+
+// ended says the command has ended; it also bounds a read that is waiting.
+func (o *outPipe) ended() {
+	o.mu.Lock()
+	o.over = true
+	o.bound()
+	o.mu.Unlock()
+}
+
+// bound sets the next read's deadline (o.mu held). os.Pipe's ends take
+// deadlines on every system andronix runs on.
+func (o *outPipe) bound() {
+	o.f.SetReadDeadline(time.Now().Add(min(waitDelay, max(drainMax-o.waited, 0))))
+}
+
+func (o *outPipe) keptOpen() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.kept
+}
+
+// firstLine is the start of a command, for a log line.
+func firstLine(s string) string {
+	s, _, _ = strings.Cut(strings.TrimSpace(s), "\n")
+	if len(s) > 80 {
+		s = s[:80]
+	}
+	return s
 }
 
 // Interactive runs a command inside the distro on this terminal (for
@@ -693,6 +832,38 @@ func SpoofKernelRelease(release string) bool {
 		return major < KernelSpoofFloorMajor
 	}
 	return minor < KernelSpoofFloorMinor
+}
+
+// The releases --kernel-release reports. Both end in -andronix, which is
+// how a report tells proot's stand-in from the phone's kernel (guestKernel).
+const (
+	spoofRelease = "6.12.0-andronix"
+	// On a 32-bit userland whose real kernel is older than 5.1, 6.12 is a
+	// lie programs act on: Go 1.26's runtime on 32-bit Linux picks
+	// futex_time64 and timer_settime64 from uname alone (5.1 or newer, no
+	// fallback), the kernel answers ENOSYS, and every Go program in the
+	// distro dies at start ("futexwakeup ... returned -38", SIGSEGV at
+	// 0x1006) — our own /usr/local/bin/andronix first: the compat probe,
+	// setup-user, vnc, packs (support #5402, #3812). 5.0 is the newest
+	// release that's still true about those syscalls, and clears every
+	// minimum-kernel check of the distros with a 32-bit build.
+	spoofRelease32Old = "5.0.0-andronix"
+)
+
+// SpoofedRelease is the release --kernel-release reports on a phone with
+// this real kernel release and userland (see spoofRelease32Old). Pure.
+func SpoofedRelease(release string, arch sys.Arch) string {
+	if arch != "arm" && arch != "i686" {
+		return spoofRelease
+	}
+	var major, minor int
+	if n, _ := fmt.Sscanf(release, "%d.%d", &major, &minor); n < 2 {
+		return spoofRelease // unparseable: the old behaviour
+	}
+	if major < 5 || major == 5 && minor < 1 {
+		return spoofRelease32Old
+	}
+	return spoofRelease
 }
 
 // spoofKernelRelease decides it for this run. ANDRONIX_KERNEL_RELEASE_SPOOF

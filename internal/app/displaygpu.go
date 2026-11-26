@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/AndronixApp/andronix-distros/internal/proot"
+	"github.com/AndronixApp/andronix-distros/internal/sys"
 	"github.com/AndronixApp/andronix-distros/internal/ui"
 )
 
@@ -155,7 +156,7 @@ func runWithContext(ctx context.Context, c *exec.Cmd) ([]byte, error) {
 		return []byte(b.String()), err
 	case <-ctx.Done():
 		if c.Process != nil {
-			c.Process.Signal(os.Kill)
+			sys.Kill(c.Process)
 		}
 		<-done
 		return []byte(b.String()), ctx.Err()

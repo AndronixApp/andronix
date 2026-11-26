@@ -98,6 +98,12 @@ func pkgInstall(ctx context.Context, onLine func(string), pkgs ...string) error 
 			return nil
 		}
 		f = pkgmgr.Diagnose(tailOf(out, 60), err)
+		if f.Kind == pkgmgr.KindNotFound {
+			// A kind for distros (their lists are fetched again, their
+			// mirror moves); Termux's own packages keep "other" and the
+			// recovery below.
+			f.Kind = pkgmgr.KindOther
+		}
 		if unreachable != "" && strings.Contains(out, "Unable to locate package") {
 			// No lists because the server refused or dropped the
 			// connection (support #305): a network failure, not a

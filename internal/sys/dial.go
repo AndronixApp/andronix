@@ -69,6 +69,10 @@ func LookupIP(ctx context.Context, host string) (ips []net.IPAddr, how string, e
 	return ips, "go", err
 }
 
+// SystemDNS reports whether lookups go to Android's own resolver first:
+// it is linked in (a cgo build) and ANDRONIX_DNS=go isn't set.
+func SystemDNS() bool { return useSystemDNS }
+
 // LookupAndroid is Android's resolver only (Go's where it isn't linked
 // in), for the distro's forwarder: the guest's own resolv.conf is the
 // public-DNS fallback already.

@@ -36,6 +36,10 @@ type Family struct {
 	Configure func(root string) error
 	// PostInstall runs after every package transaction (may be "").
 	PostInstall string
+	// Repair runs after each successful Update (may be ""): it puts right
+	// what a package run that was killed half-way left behind, before the
+	// next transaction trips over it.
+	Repair string
 	// Has is a shell test that succeeds when package %s is available;
 	// Installed, when it is installed.
 	Has, Installed string
@@ -79,6 +83,103 @@ func useradd(group string) func(string, string) string {
 
 // pacman prints plain lines when stdout isn't a terminal; keep it so.
 const pac = "pacman --noconfirm --noprogressbar --color never "
+
+// pacmanKeyring makes this phone's pacman keyring unless it's already
+// usable. "Usable" is a key pacman trusts fully (validity f: a packager or
+// build key signed through the local master key), not "pubring.gpg
+// exists": an install stopped during pacman-key --init/--populate (the
+// user cancelled, Android closed the app) leaves a pubring.gpg with keys
+// nothing trusts, and every later run then skipped --populate and failed
+// each package with "invalid or corrupted package (PGP signature)"
+// (support #5349). Both pacman-key steps are safe to run again on a
+// half-made keyring: --init only makes a master key when there is none,
+// --populate re-imports and re-signs. No keyserver is involved.
+//
+// One fully trusted key isn't proof of a finished --populate either: it
+// signs the keys one at a time, and a run killed half-way leaves some
+// trusted and some not (review of #3; on x86_64 trust takes several master
+// keys plus ownertrust). So the keyring also needs the stamp written once
+// --populate has exited 0 (PacmanKeyringStamp). Keyrings made before the
+// stamp existed get one more --populate, offline, on their next update.
+//
+// An install from before the stamp has a finished keyring and no stamp, and
+// on a phone where gpg-agent won't start (support #119) that --populate
+// fails. So with a trusted key and only the stamp missing, a failed
+// --populate doesn't stop the update: the sync goes on with the keys the
+// install has, as 2.1.5 did, and the next update tries again (the stamp is
+// only written by a --populate that exited 0). With no trusted key a failed
+// keyring still stops it, and a half-signed one that --populate can finish
+// is finished as before.
+//
+// gpg is only asked about a keyring that has the stamp (as before) or a
+// trustdb.gpg (pacman-key --init makes it, after pubring.gpg): asked about
+// an empty directory (the retry code's keyringReset leaves one), gpg would
+// create pubring.kbx there, and the keys pacman-key then makes would go
+// into it instead of pubring.gpg.
+//
+// A gpg killed mid-write also leaves its lock files (pubring.gpg.lock,
+// .#lk*). gpg only drops a lock when it can tell the owner is gone; when it
+// can't (the pid is in use again, which on Android reads as "alive" for any
+// other app's process) it waits for good. So with no gpg program running,
+// the locks go first (.l2s.: what proot's --link2symlink keeps of them).
+const pacmanKeyring = `{ G=/etc/pacman.d/gnupg; b=; for c in /proc/[0-9]*/comm; do read -r n 2>/dev/null <"$c" && case $n in gpg|gpg-agent|gpgsm|dirmngr|keyboxd|pacman-key) b=1 ;; esac; done; ` +
+	`[ -n "$b" ] || rm -f "$G"/*.lock "$G"/.#lk* "$G"/.l2s..#lk*; ` +
+	`t=; { [ -e "$G"/` + keyringStampName + ` ] || [ -e "$G"/trustdb.gpg ]; } && ` + PacmanKeyringTrusted + ` && t=1; ` +
+	`{ [ -n "$t" ] && [ -e "$G"/` + keyringStampName + ` ]; } || ` + PacmanKeyringRebuild +
+	` || { [ -n "$t" ] && echo "` + keyringKeptNote + `"; }; }`
+
+// PacmanKeyringTrusted is a shell test (G is the keyring's directory): gpg
+// lists a key pacman trusts fully.
+const PacmanKeyringTrusted = `gpg --homedir "$G" --batch --no-permission-warning --list-keys --with-colons 2>/dev/null | grep -q '^pub:f:'`
+
+// keyringKeptNote is printed when --populate failed on a keyring that
+// already has trusted keys. It must not read as a failure to Diagnose, and
+// has no quote characters: it sits inside a shell string.
+const keyringKeptNote = "The package signing keys were not set up again; going on with the keys this install already trusts."
+
+// keyringStampName is the file in /etc/pacman.d/gnupg that says --populate
+// finished; PacmanKeyringStamp is its full path.
+const (
+	keyringStampName   = ".andronix-keyring-ok"
+	PacmanKeyringStamp = "/etc/pacman.d/gnupg/" + keyringStampName
+)
+
+// PacmanKeyringRebuild runs both pacman-key steps whatever the keyring
+// looks like (a package still failed its signature check), and stamps the
+// keyring finished only when both exit 0.
+const PacmanKeyringRebuild = "{ rm -f " + PacmanKeyringStamp + "; pacman-key --init && pacman-key --populate && touch " + PacmanKeyringStamp + "; }"
+
+// PacmanRepair reinstalls packages a killed pacman left half-installed.
+// pacman removes the old version's database entry, makes the new one's
+// directory, unpacks the files and only then writes desc and files: killed
+// in between, the entry has neither. The next run counts the package as
+// installed with half its files missing, and any transaction that touches
+// it stops with "could not fully load metadata for package ... failed to
+// prepare transaction (invalid or corrupted package)" (support #5412).
+// The names go to a list first, so a reinstall that fails (no network) is
+// tried again next time; names the repos no longer have are dropped.
+// A pacman running (the user's own, in another session) may be mid-unpack
+// right now, so then nothing is touched (review of #3).
+// --overwrite: the half-unpacked files belong to no package. No `exit`:
+// the retry code wraps commands (keyringAgentWrap) and runs on after them.
+const PacmanRepair = `L=/var/lib/pacman/local; T=/var/lib/pacman/andronix-reinstall
+b=; for c in /proc/[0-9]*/comm; do read -r n 2>/dev/null <"$c" && [ "$n" = pacman ] && b=1; done
+[ -n "$b" ] && echo "pacman is running; not touching its database"
+[ -n "$b" ] || for d in "$L"/*/; do
+  [ -d "$d" ] || continue
+  [ -s "$d/desc" ] && [ -e "$d/files" ] && continue
+  n=${d%/}; n=${n##*/}; n=${n%-*}; n=${n%-*}
+  echo "$n" >>"$T" && rm -rf "$d"
+done
+if [ -z "$b" ] && [ -s "$T" ]; then
+  p=; for n in $(sort -u "$T"); do pacman -Si "$n" >/dev/null 2>&1 && p="$p $n"; done
+  if [ -n "$p" ]; then
+    echo "Reinstalling half-installed packages:$p"
+    ` + pac + `-S --overwrite '*' $p && rm -f "$T"
+  else
+    rm -f "$T"
+  fi
+fi`
 
 // pacmanMajor reads the installed pacman's major version from its local db.
 func pacmanMajor(root string) int {
@@ -179,8 +280,8 @@ var families = map[string]*Family{
 		Remove:    func(p []string) string { return pac + "-Rns " + join(p) },
 		// A fresh rootfs has no keyring (and Manjaro's shared one is
 		// deleted in Configure): make this phone's own before the sync.
-		Update: "{ [ -s /etc/pacman.d/gnupg/pubring.gpg ] || { pacman-key --init && pacman-key --populate; }; } && " +
-			pac + "-Syy",
+		Update:     pacmanKeyring + " && " + pac + "-Syy",
+		Repair:     PacmanRepair,
 		Upgrade:    pac + "-Su",
 		Clean:      "rm -f /var/cache/pacman/pkg/*",
 		Install:    func(p []string) string { return pac + "-S --needed " + join(p) },

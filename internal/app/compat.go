@@ -138,12 +138,7 @@ func (c *compatRun) probe(ctx context.Context, t *proot.Target, lg *Logger) erro
 	res := compat.ParseLines(out.String())
 	lg.Printf("compat probe: %v %s", err, strings.TrimSpace(out.String()))
 	if len(res) == 0 {
-		if err != nil {
-			if f := pkgmgr.Diagnose(strings.Split(out.String(), "\n"), err); f.Kind == pkgmgr.KindProotExec {
-				return prootExecError(f.Detail, c.name, c.facts.Probe.Termux, sys.DetectArch())
-			}
-		}
-		return nil // the old checks stay in charge (proot's fallback)
+		return c.probeFailed(out.String(), err)
 	}
 	c.facts.Probe.Syscalls = res
 	c.facts.Probe.Save(GetPaths().Home)
@@ -152,6 +147,22 @@ func (c *compatRun) probe(ctx context.Context, t *proot.Target, lg *Logger) erro
 	telemetry.Send("compat", map[string]any{"probe": p.Summary(), "kernel": p.KernelMajorMinor(), "sdk": p.SDK, "rom": p.ROM,
 		"phantom": p.Phantom, "ram": p.RAMBucket(), "termux": p.Termux, "rules": strings.Join(c.plan.IDs, " "),
 		"distro": c.facts.Distro, "de": c.facts.DE})
+	return nil
+}
+
+// probeFailed is what a probe that measured nothing means for the install:
+// an error only when proot can't start any program in the distro (execve
+// fails), nil for everything else. A prober that crashes (support #5402:
+// the Go runtime dying at start with "futexwakeup ... returned -38" and a
+// SIGSEGV) or prints something else must never stop setup: the old checks
+// stay in charge (proot's fallback).
+func (c *compatRun) probeFailed(out string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if f := pkgmgr.Diagnose(strings.Split(out, "\n"), err); f.Kind == pkgmgr.KindProotExec {
+		return prootExecError(f.Detail, c.name, c.facts.Probe.Termux, sys.DetectArch())
+	}
 	return nil
 }
 

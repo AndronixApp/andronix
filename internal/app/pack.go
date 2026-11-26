@@ -25,9 +25,12 @@ import (
 
 const packState = "etc/andronix/packs"
 
+// guestMark is the file every installed distro has (a variable for tests).
+var guestMark = "/etc/andronix-release"
+
 // inGuest reports whether andronix runs inside an installed distro.
 func inGuest() bool {
-	_, err := os.Stat("/etc/andronix-release")
+	_, err := os.Stat(guestMark)
 	return err == nil
 }
 
@@ -38,6 +41,47 @@ type packPlace struct {
 	fam   *pkgmgr.Family
 	label string
 	cmd   string // how to run pack commands here, for messages
+	// ops is the install's retry code for this place's package commands
+	// (packOps), nil where pack runs them as it always has.
+	ops *pkgOps
+}
+
+// packOps gives pp the retry code install and update use, for the families
+// that need it here: Alpine, from Termux or the app. Its apk reports a
+// server it can't reach as a warning and exits 2, which read as "The package
+// manager stopped with an error.: exit status 2", and its musl asks only
+// resolv.conf's public DNS servers, so on a network that doesn't answer
+// those pack add failed where install and update get Android's addresses
+// (dnshosts.go; 2.1.6-rc2 gates). No mirror list goes with it (pack never
+// switched mirrors). pack holds no distro lock, so the ops are shared: the
+// /etc/hosts lines of an install or update that is running are left alone,
+// at the first command and at the end, and an error with no name isn't
+// tried again. The caller closes it (pkgOps.close) when the command ends.
+//
+// Inside the distro (sudo andronix pack add) nothing changes: Android's
+// resolver can't be asked from there, so the retries would only make the
+// same failure take a minute and a half instead of ten seconds.
+func packOps(pp *packPlace, lg *Logger) *pkgOps {
+	if pp.fam.ID != "apk" || inGuest() {
+		return nil
+	}
+	ops := newPkgOps(pp.t, pp.fam, nil, lg)
+	ops.shared = true
+	return ops
+}
+
+// packRefresh refreshes the package lists before packs are installed.
+func packRefresh(ctx context.Context, pp *packPlace, r ui.Reporter) error {
+	if pp.ops != nil {
+		if err := pp.ops.update(ctx, r); err != nil {
+			return pkgErr(refreshTitle, err)
+		}
+		return nil
+	}
+	if err := pp.t.Run(ctx, pp.fam.Update, nil, func(l string) { r.Line(l) }); err != nil {
+		return pkgErr(refreshTitle, err)
+	}
+	return nil
 }
 
 // splitPackArgs takes an optional distro off the front of args.
@@ -256,12 +300,12 @@ func PackAdd(ctx context.Context, args []string) error {
 	for _, p := range todo {
 		ids = append(ids, p.ID)
 	}
-	t, fam := pp.t, pp.fam
+	t := pp.t
+	if pp.ops = packOps(pp, lg); pp.ops != nil {
+		defer pp.ops.close() // when PackAdd returns, after the steps ran
+	}
 	steps := []ui.Step{{Label: "Refreshing package lists", Run: func(ctx context.Context, r ui.Reporter) error {
-		if err := t.Run(ctx, fam.Update, nil, func(l string) { r.Line(l) }); err != nil {
-			return pkgErr(refreshTitle, err)
-		}
-		return nil
+		return packRefresh(ctx, pp, r)
 	}}}
 	for _, p := range todo {
 		p := p
@@ -374,7 +418,13 @@ func packInstall(ctx context.Context, pp *packPlace, p *conf.Pack, r ui.Reporter
 		}
 	}
 	n := count(ctx, t, fam.SimInstall(pkgs), fam)
-	if err := pkgRun(ctx, t, fam, fam.Install(pkgs), n, r); err != nil {
+	var err error
+	if pp.ops != nil {
+		err = pp.ops.run(ctx, fam.Install(pkgs), n, r)
+	} else {
+		err = pkgRun(ctx, t, fam, fam.Install(pkgs), n, r)
+	}
+	if err != nil {
 		return pkgErr("Couldn't install "+p.Name, err)
 	}
 	t.Run(ctx, fam.Clean, nil, nil)

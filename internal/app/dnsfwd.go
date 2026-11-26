@@ -33,8 +33,9 @@ import (
 // A name Android says doesn't exist returns at once; with no forwarder
 // answering (none running, a stale file) the module is UNAVAIL and dns runs
 // as before. The forwarder exits when the session's process (pid) is gone.
-// musl distros (Alpine) have no NSS and keep resolv.conf only. Termux and
-// the standalone app alike (sys.OnAndroid).
+// musl distros (Alpine) have no NSS and keep resolv.conf only; their package
+// servers get Android's addresses when resolv.conf's don't answer
+// (dnshosts.go). Termux and the standalone app alike (sys.OnAndroid).
 
 const nssLine = "hosts: files andronix [NOTFOUND=return] dns"
 
@@ -46,6 +47,9 @@ var forwarders sync.Map // rootfs -> started, for this process
 // nsswitch line (again on every start: package upgrades can rewrite
 // nsswitch.conf), and a forwarder watching pid. Best effort, silent.
 func startSession(rootfs string, pid int) {
+	// Package-server addresses a killed install left in /etc/hosts
+	// (dnshosts.go): stale by now, unless this process is that install.
+	dropStalePkgHosts(rootfs)
 	if os.Getenv("ANDRONIX_DNS") == "go" || !sys.OnAndroid() {
 		return
 	}

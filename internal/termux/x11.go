@@ -191,7 +191,7 @@ func StartX11(n int, logf string) (int, error) {
 			return c.Process.Pid, nil
 		}
 	}
-	c.Process.Kill()
+	sys.Kill(c.Process)
 	b, _ := os.ReadFile(logf)
 	Logf("x11: no socket at %s after 10 s: %s", X11Socket(n), lastLines(string(b), 4))
 	return 0, fmt.Errorf("termux-x11 didn't open display :%d: %s", n, lastLines(string(b), 3))

@@ -6,6 +6,7 @@ Tested by port-b on 2026-09-25 in the Termux-like Docker box, aarch64. Manjaro u
 
 - `docker.io/manjarolinux/base:latest`; platforms arm64 and amd64. The arm64 image (built 2026-03-22) is 315 MB compressed, 1.35 GB unpacked; our `.tar.xz` export is 214 MB.
 - The image ships an **initialised** keyring in `/etc/pacman.d/gnupg` (241 keys, plus `private-keys-v1.d`: the local master key, identical for everyone who uses the image, and stale `S.gpg-agent*` sockets). Delete the directory host-side before first use and run `pacman-key --init && pacman-key --populate` like on Arch (keyrings: `archlinux archlinuxarm manjaro manjaro-arm`).
+- Keyring packages refreshed before the first upgrade (`DISTRO_PRE_UPGRADE`, whichever the repo has): `manjaro-keyring manjaro-arm-keyring archlinux-keyring archlinuxarm-keyring`. No keyserver is used, and the keyring is rebuilt when an earlier run stopped half-way through making it: see "Interrupted runs" in `arch.md`, which applies here unchanged.
 
 ## Repos are stale
 

@@ -124,12 +124,12 @@ func SelfCheck(asJSON bool) error {
 		// It stops at its exec (SIGTRAP): wait for that, then let it go.
 		var ws syscall.WaitStatus
 		if _, err := syscall.Wait4(c.Process.Pid, &ws, 0, nil); err != nil || !ws.Stopped() {
-			c.Process.Kill()
+			sys.Kill(c.Process)
 			c.Wait()
 			return fmt.Errorf("the traced child didn't stop (%v, %v)", err, ws)
 		}
 		if err := syscall.PtraceDetach(c.Process.Pid); err != nil {
-			c.Process.Kill()
+			sys.Kill(c.Process)
 			c.Wait()
 			return fmt.Errorf("ptrace detach: %w", err)
 		}

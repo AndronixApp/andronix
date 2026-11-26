@@ -20,7 +20,7 @@ Tested by port-b on 2026-09-25 in the Termux-like Docker box (`tests/Dockerfile`
   The removal needs no network and no keyring. Result: 138 MB `.tar.xz` (from 1.9 GB `/usr`, of which 960 MB firmware and 188 MB modules).
 - There is no OCI image for ARM, so **no registry fallback** on aarch64/arm: the CI tarball must be published. (Alternative: push our export to `ghcr.io/andronixapp/arch` and point the fallback there.)
 - Conf keys added for this (documented in DESIGN.md): `DISTRO_UPSTREAM_TARBALL_<arch>`, `DISTRO_UPSTREAM_REMOVE`.
-- The ALARM tarball ships an empty `/etc/machine-id` and **no keyring** (`/etc/pacman.d/gnupg` missing). pacman 7.1.0, glibc 2.43 (Aug 2026 build).
+- The ALARM tarball ships an empty `/etc/machine-id` and **no initialised keyring** (`/etc/pacman.d/gnupg` missing; the keyring *packages* are there, see "Keyring" below). pacman 7.1.0, glibc 2.43 (Aug 2026 build).
 
 ## Host-side fixups (before first pacman run)
 
@@ -38,9 +38,14 @@ DisableSandbox
 
 ```sh
 PAC="pacman --noconfirm --noprogressbar --color never"
-# keyring, once (about 10 s on the Mac; ~6 keys signed, 38 disabled)
-[ -s /etc/pacman.d/gnupg/pubring.gpg ] || { pacman-key --init && pacman-key --populate; }
+# keyring, until it works (about 10 s on the Mac; ~6 keys signed, 38 disabled)
+# (first: rm -f /etc/pacman.d/gnupg/*.lock /etc/pacman.d/gnupg/.#lk* when no gpg program runs)
+gpg --homedir /etc/pacman.d/gnupg --batch --no-permission-warning --list-keys --with-colons 2>/dev/null | grep -q '^pub:f:' \
+  || { pacman-key --init && pacman-key --populate; }
 $PAC -Syy                                   # refresh
+# reinstall packages a killed pacman left half-installed (see "Interrupted runs")
+# keyring packages first, then the upgrade (DISTRO_PRE_UPGRADE; best-effort, no keyserver)
+$PAC -Sy --needed archlinux-keyring archlinuxarm-keyring; pacman-key --populate
 pacman -Qu | grep -c .                      # upgrade count (NOT with --noprogressbar: "invalid option")
 $PAC -Su                                    # upgrade
 $PAC -Sp --needed --print-format %n PKGS | grep -vc '^:: '   # install count (groups expand)
@@ -48,7 +53,44 @@ $PAC -S --needed PKGS                       # install
 rm -f /var/cache/pacman/pkg/*               # clean
 ```
 - `pacman-key --populate` with no argument populates every keyring in `/usr/share/pacman/keyrings` (archlinuxarm here).
-- Don't use `-Sy PKG` (partial upgrade); refresh, `-Su`, then `-S`.
+- Don't use `-Sy PKG` (partial upgrade); refresh, `-Su`, then `-S`. **One exception, Arch's own:** the keyring packages go first (`pacman -Sy --needed archlinux-keyring archlinuxarm-keyring`, then `-Su`), so packages signed by keys newer than the image's keyring verify. It is best-effort and never fails the install.
+- **No keyservers.** Nothing here runs `pacman-key --refresh-keys` or `--recv-keys`: under proot on a phone it took up to three minutes whenever the mirror was slow and fixed nothing. If the image's keyring is too old to verify the new keyring package, the fix is a new image (`ci/build-rootfs.sh arch <arch>`).
+
+## Keyring (which packages, per CPU)
+
+Checked 2026-11-11 on our published images (`dl.andronix.app/rootfs/arch/rolling/`, both built 2026-09-26):
+
+| Image | pacman | Keyring packages in the image | Signs the repo's packages |
+|---|---|---|---|
+| aarch64 (`ArchLinuxARM-aarch64`) | 7.1.0 | `archlinux-keyring` 20260727-1, `archlinuxarm-keyring` 20240419-2 | Arch Linux ARM Build System `68B3537F39A313B3E574D06777193F152BDBE6A6` (in `archlinuxarm-keyring`; no expiry date) |
+| arm (`ArchLinuxARM-armv7`, not shipped) | same repo layout | same two packages | same key |
+| x86_64 (`archlinux:latest`, registry only, no tarball of ours) | Arch's current | `archlinux-keyring` only (no `archlinuxarm-keyring` in Arch's repos) | Arch packager keys, signed by the Arch master keys |
+
+- On ARM every package, `archlinux-keyring` included, is signed by the one Arch Linux ARM build key. `archlinuxarm-keyring` has not changed since April 2024, so the image's keyring verifies today's repo: a fresh image upgrades all 65 pending packages with the keyring it ships (tested 2026-11-11, arm64 container). The keyring is **not** stale.
+- `DISTRO_PRE_UPGRADE` asks `pacman -Si` for each name and only installs the ones the repo has, so one line serves all CPUs and Manjaro.
+
+## Interrupted runs (support #5349, #5412)
+
+Both of these are a run that was stopped half-way (the user cancelled, or Android closed the app) and then started again. Every later run failed the same way until the distro was removed.
+
+1. **Stopped during `pacman-key --init` / `--populate`** (the "Refreshing package lists" step). `pubring.gpg` then exists with a master key, or with imported keys nothing has signed. The old test (`[ -s pubring.gpg ]`) took that for a finished keyring and skipped `--populate` for good; `-Su` then downloaded everything and failed each package:
+   ```
+   error: nftables: signature from "Arch Linux ARM Build System <builder@archlinuxarm.org>" is unknown trust
+   :: File /var/cache/pacman/pkg/nftables-1:1.1.7-3-aarch64.pkg.tar.xz is corrupted (invalid or corrupted package (PGP signature)).
+   error: failed to commit transaction (invalid or corrupted package (PGP signature))
+   ```
+   Now the keyring counts as ready only when gpg lists a fully trusted key (`pub:f:`); otherwise both `pacman-key` steps run again. They are safe to repeat: `--init` only makes a master key when there is none, `--populate` re-imports and re-signs. A package that still fails its signature gets the same rebuild, once, before the retry.
+
+   One trusted key doesn't prove `--populate` finished (it signs the keys one at a time), so the keyring also needs the stamp `/etc/pacman.d/gnupg/.andronix-keyring-ok`, written only when both steps exit 0. An install made before the stamp (2.1.5 and older) has a finished keyring and no stamp, so its first refresh on 2.1.6 runs both steps once more, offline. On a phone where gpg-agent won't start (support #119) they fail; with a trusted key in the keyring the refresh then goes on to the sync with the keys the install has, prints that it did, writes no stamp, and the next refresh tries again. With no trusted key a failed keyring still stops the refresh. gpg is only asked for trusted keys when the keyring has the stamp or a `trustdb.gpg`: asked about an empty directory it would create `pubring.kbx`, and the keys would then go there instead of `pubring.gpg`. This holds for every caller of the family's `Update`, also the ones without the retry code (`andronix pack add`, the built-in display's Xvfb, the app's sound). The retry code's own keyring recovery (`keyringReset`, then gpg-agent started by us) no longer wipes a keyring that has trusted keys.
+
+   The killed gpg also leaves its lock files in `/etc/pacman.d/gnupg` (`pubring.gpg.lock`, `.#lk*`). gpg removes a stale lock only when it can tell the owner is gone (same host name, pid not in use). When it can't, it waits for good: seen in testing as `pacman -Su` sitting at "checking keyring" for 10 minutes after the container's host name changed; on a phone a reused pid would do the same. So the refresh deletes these locks first, unless a gpg program (`gpg`, `gpg-agent`, `dirmngr`, `keyboxd`, `pacman-key`) is running.
+2. **pacman killed while unpacking a package.** pacman removes the old version's entry in `/var/lib/pacman/local`, makes the new one's directory, unpacks, and only then writes `desc` and `files`. Killed in between, the entry has only `mtree` (4 of 14 kills at different moments of a 65-package upgrade left one). pacman then counts the package as installed with half its files missing, and a transaction that touches it stops:
+   ```
+   error: could not open file /var/lib/pacman/local/vim-runtime-9.2.0849-1/desc: No such file or directory
+   warning: could not fully load metadata for package vim-runtime-9.2.0849-1
+   error: failed to prepare transaction (invalid or corrupted package)
+   ```
+   After each refresh the installer looks for entries without `desc` or `files`, removes them and reinstalls those packages (`$PAC -S --overwrite '*' NAMES`; the names are kept in `/var/lib/pacman/andronix-reinstall` until that worked). The same repair runs once when a pacman run fails this way (kind `pacman_db`).
 
 ## Progress output (stdout not a tty)
 

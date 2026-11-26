@@ -5,8 +5,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/AndronixApp/andronix-distros/internal/sys"
 )
 
 // TmpDir's cleanup must keep every file of a live proot (another session
@@ -221,6 +224,49 @@ func TestSpoofKernelRelease(t *testing.T) {
 	} {
 		if got := SpoofKernelRelease(c.rel); got != c.want {
 			t.Errorf("SpoofKernelRelease(%q) = %v, want %v", c.rel, got, c.want)
+		}
+	}
+}
+
+// Support #5402, #3812: on a 32-bit userland with a real kernel before 5.1,
+// uname must not say 5.1 or newer. Go 1.26 picks futex_time64 from uname
+// alone there, and the in-distro andronix (and any other Go program) dies
+// at start. Everything else keeps the 6.12 stand-in.
+func TestSpoofedRelease(t *testing.T) {
+	for _, c := range []struct {
+		rel  string
+		arch sys.Arch
+		want string
+	}{
+		{"4.19.188-perf-00550-g163beabcf523", "arm", "5.0.0-andronix"}, // #5402, Xiaomi 2302EPCC4I
+		{"4.14.199-27418755-abA032FXXS9CZA2", "arm", "5.0.0-andronix"}, // #3812, Galaxy A03
+		{"3.18.140", "arm", "5.0.0-andronix"},
+		{"5.0.21", "arm", "5.0.0-andronix"},
+		{"4.19.188", "i686", "5.0.0-andronix"},
+		{"5.1.0", "arm", "6.12.0-andronix"}, // futex_time64 arrived in 5.1
+		{"5.4.254-android11", "arm", "6.12.0-andronix"},
+		{"5.15.78-android13", "i686", "6.12.0-andronix"},
+		{"4.19.188", "aarch64", "6.12.0-andronix"}, // 64-bit: no time64 variants to pick
+		{"4.4.302-perf+", "x86_64", "6.12.0-andronix"},
+		{"", "arm", "6.12.0-andronix"}, // unparseable: the old behaviour
+		{"weird", "arm", "6.12.0-andronix"},
+	} {
+		if got := SpoofedRelease(c.rel, c.arch); got != c.want {
+			t.Errorf("SpoofedRelease(%q, %s) = %q, want %q", c.rel, c.arch, got, c.want)
+		}
+	}
+}
+
+// The stand-in for old 32-bit phones must itself stay below 5.1 (or it
+// brings the crash back) and keep the -andronix mark reports look for.
+func TestSpoofRelease32OldIsBelowTime64(t *testing.T) {
+	var major, minor int
+	if n, _ := fmt.Sscanf(spoofRelease32Old, "%d.%d", &major, &minor); n < 2 || major > 5 || major == 5 && minor >= 1 {
+		t.Errorf("spoofRelease32Old = %q: must parse and be older than 5.1", spoofRelease32Old)
+	}
+	for _, r := range []string{spoofRelease, spoofRelease32Old} {
+		if !strings.HasSuffix(r, "-andronix") {
+			t.Errorf("%q must end in -andronix (guestKernel)", r)
 		}
 	}
 }

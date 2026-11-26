@@ -113,6 +113,11 @@ func (d *Distro) MirrorFallbacks() [][]string {
 	return out
 }
 
+// MirrorPrimaries is DISTRO_MIRROR_PRIMARY: the distro's own package
+// server, for a DISTRO_MIRROR_FALLBACK group where that isn't the first URL
+// (Kali, whose first is a server older installs were rewritten to).
+func (d *Distro) MirrorPrimaries() []string { return d.raw.List("DISTRO_MIRROR_PRIMARY") }
+
 // Xvfb is DISTRO_XVFB: the package with Xvfb (andronix display).
 func (d *Distro) Xvfb() string { return d.raw.Get("DISTRO_XVFB") }
 

@@ -57,10 +57,14 @@ func TestSafeLayer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`name="use_compositing" type="bool" value="false"`, `name="box_move" type="bool" value="true"`} {
+	// The light profile's wireframe moves are overridden: they freeze helper drags.
+	for _, want := range []string{`name="use_compositing" type="bool" value="false"`, `name="box_move" type="bool" value="false"`, `name="box_resize" type="bool" value="false"`} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("safe layer lacks %s:\n%s", want, b)
 		}
+	}
+	if strings.Contains(string(b), `name="box_move" type="bool" value="true"`) {
+		t.Errorf("safe layer still has wireframe moves:\n%s", b)
 	}
 	if strings.Join(safeKeys, ",") != "swrender,fresh_session,light" {
 		t.Errorf("SAFE keys changed: %v (the app maps them)", safeKeys)

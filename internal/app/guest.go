@@ -342,14 +342,23 @@ func startXServer(bin string, args []string, num int, xstartup string, lg *os.Fi
 	sock := fmt.Sprintf("/tmp/.X11-unix/X%d", num)
 	// Every 25 ms for up to 10 s: at 500 ms steps the socket "appeared"
 	// 0.506 s after the exec on every phone (sv2-startup), hiding the real time.
+	// A server that exits at option parsing (-nocursor on an old Xvfb)
+	// ends the wait at once instead of the full 10 s.
+	exited := false
 	for i := 0; i < 400; i++ {
 		if _, err := os.Stat(sock); err == nil {
+			break
+		}
+		if processExited(x.Process.Pid) {
+			exited = true
 			break
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	if _, err := os.Stat(sock); err != nil {
-		x.Process.Kill()
+		if !exited { // already reaped above: its pid may be another process's by now
+			sys.Kill(x.Process)
+		}
 		b, _ := os.ReadFile(logf)
 		return b, fmt.Errorf("%s didn't open display :%d", bin, num)
 	}
@@ -380,6 +389,14 @@ func startXServer(bin string, args []string, num int, xstartup string, lg *os.Fi
 		go capLog(slog, sessionLogCap) // for as long as this process runs (the standalone display's helper)
 	}
 	return nil, nil
+}
+
+// processExited reports whether child pid has ended (and reaps it: a
+// zombie still answers kill -0, so this asks wait4 without blocking).
+func processExited(pid int) bool {
+	var ws syscall.WaitStatus
+	wpid, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
+	return err == nil && wpid == pid
 }
 
 // sessionLogCap: the desktop session's log is cut to nothing past this.
@@ -487,7 +504,7 @@ func VNCStop(args []string) error {
 	if lock := "/tmp/.X" + num + "-lock"; err != nil && pidAlive(lock) {
 		b, _ := os.ReadFile(lock)
 		if pid, e := strconv.Atoi(strings.TrimSpace(string(b))); e == nil {
-			if p, e := os.FindProcess(pid); e == nil && p.Signal(syscall.SIGTERM) == nil {
+			if sys.SignalPid(pid, syscall.SIGTERM) == nil {
 				err = nil
 				time.Sleep(time.Second)
 			}
